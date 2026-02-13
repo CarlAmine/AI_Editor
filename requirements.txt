@@ -20,3 +20,16 @@ moviepy
 
 # --- UTILITIES ---
 typing-extensions
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python-headless
+paddleocr
+paddlepaddle
+easyocr
+shotstack-sdk
+python-dotenv
+google-api-python-client
+google-auth-oauthlib
+pandas
+scenedetect
