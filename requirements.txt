@@ -1,0 +1,22 @@
+# --- ANALYZER REQUIREMENTS ---
+opencv-python
+numpy
+pandas
+scenedetect
+paddleocr
+easyocr
+paddlepaddle
+scikit-image
+matplotlib
+
+# --- CHATBOT REQUIREMENTS ---
+requests
+python-dotenv
+
+# --- EDITOR REQUIREMENTS ---
+shotstack-sdk
+pillow
+moviepy
+
+# --- UTILITIES ---
+typing-extensions
