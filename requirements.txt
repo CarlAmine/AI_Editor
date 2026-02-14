@@ -1,36 +1,27 @@
 # --- ANALYZER REQUIREMENTS ---
-opencv-python
+easyocr
+matplotlib
 numpy
+paddleocr
+# paddlepaddle
 pandas
 scenedetect
-paddleocr
-easyocr
-paddlepaddle
 scikit-image
-matplotlib
+opencv-python-headless
 
 # --- CHATBOT REQUIREMENTS ---
-requests
 python-dotenv
+requests
 
 # --- EDITOR REQUIREMENTS ---
-shotstack-sdk
-pillow
 moviepy
+pillow
+shotstack-sdk
 
 # --- UTILITIES ---
-typing-extensions
 fastapi
-uvicorn[standard]
-python-multipart
-opencv-python-headless
-paddleocr
-easyocr
-shotstack-sdk
-python-dotenv
 google-api-python-client
 google-auth-oauthlib
-pandas
-scenedetect
-moviepy
-pillow
+python-multipart
+typing-extensions
+uvicorn[standard]
