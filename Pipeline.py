@@ -11,9 +11,11 @@ load_dotenv()
 # Configuration from .env
 shotstack_key = os.getenv("SHOTSTACK_KEY")
 deepseek_key = os.getenv("DEEPSEEK_KEY")
-folder_id = os.getenv("VIDEO_FOLDER") 
-sound = os.getenv("MUSIC_URL")
 gdrive_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") 
+
+# These are now retrieved to be passed as arguments later
+env_folder_id = os.getenv("VIDEO_FOLDER") 
+env_sound_url = os.getenv("MUSIC_URL")
 
 def get_drive_service():
     """Authenticates using the Service Account JSON file."""
@@ -36,18 +38,19 @@ def get_drive_assets(service, folder_id):
             links.append(direct_link)
     return links
 
-def Assemble_Pipeline(file_path, prompt):
+### UPDATED FUNCTION SIGNATURE ###
+def Assemble_Pipeline(file_path, prompt, folder_id, music_url):
     print("\n--- Step 1: Analyzing Video Content ---")
-    summary = analyze_video_content(file_path) # Runs local analysis
+    summary = analyze_video_content(file_path) 
     
     print("\n--- Step 2: Generating Requirements Report ---")
-    # Generates structured brief via DeepSeek
     report = generate_video_requirements_report(summary, [prompt], deepseek_key) 
     print(report)
 
     print("\n--- Step 3: Gathering Assets from Google Drive ---")
     try:
         service = get_drive_service()
+        # Uses folder_id passed via argument
         video_assets = get_drive_assets(service, folder_id)
         print(f" Found {len(video_assets)} videos in Drive.")
     except Exception as e:
@@ -57,13 +60,13 @@ def Assemble_Pipeline(file_path, prompt):
         return {"success": False, "error": "No videos found in the specified GDrive folder."}
 
     print("\n--- Step 4: Rendering Video ---")
-    # Assembles assets using Shotstack SDK
+    # Uses music_url passed via argument
     result = create_and_render_video(
         api_key=shotstack_key,
         video_urls=video_assets,
         project_title="Pipeline Automated Edit",
         overlay_text=[prompt[:30]], 
-        soundtrack_url=sound,
+        soundtrack_url=music_url,
         wait_for_render=True
     )
     return result
@@ -73,14 +76,18 @@ def main():
     print("Initializing the Editing Pipeline")
     print("========================================\n")
     
-    # Analyzer handles local files; input clean-up for Windows paths
     video_input = input("Enter local Video Path: ").strip().replace('"', '')
     user_prompt = input("Describe your editing requirements: ").strip()
 
     try:
-        pipeline_result = Assemble_Pipeline(video_input, user_prompt)
+        # Pass the .env variables into the function call here
+        pipeline_result = Assemble_Pipeline(
+            file_path=video_input, 
+            prompt=user_prompt, 
+            folder_id=env_folder_id, 
+            music_url=env_sound_url
+        )
         
-        # Fixed logic to prevent 'str' object has no attribute 'get' error
         if isinstance(pipeline_result, dict) and pipeline_result.get("success"):
             print(f"\nSUCCESS! Video URL: {pipeline_result.get('url')}")
         else:
