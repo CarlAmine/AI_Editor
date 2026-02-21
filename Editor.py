@@ -65,12 +65,14 @@ def create_and_render_video(
 
     # --- 3. Logic: Prepare Project Data ---
     print(f"Initializing Project: {project_title}")
-    
-    # Process Video Clips
-    # In a real pipeline, you might want to inspect metadata to get actual duration.
-    # Here we assume a default or allow the user to specify logic elsewhere.
-    # For this implementation, we default to 5s per clip unless logic is added to probe headers.
-    clips = [VideoClip(url=url, duration=5.0) for url in video_urls]
+
+    # NEW: Dynamically fetch durations instead of hardcoding 5.0
+    clips = []
+    for url in video_urls:
+        print(f"Probing metadata for: {url}...")
+        actual_duration = get_video_duration(api_key, url)
+        clips.append(VideoClip(url=url, duration=actual_duration))
+
     total_video_duration = sum(c.duration for c in clips)
 
     # Process Text Overlays
@@ -94,6 +96,23 @@ def create_and_render_video(
         transitions = ["slideLeft", "slideRight", "zoom", "wipeLeft", "dissolve"]
         return Transition(_in=transitions[index % len(transitions)])
 
+    
+    def get_video_duration(api_key: str, url: str) -> float:
+    """Fetches the actual duration of a remote video file using Shotstack Inspect."""
+    try:
+        # Shotstack Inspect API endpoint
+        probe_url = f"https://api.shotstack.io/stage/probe/{url}"
+        headers = {"x-api-key": api_key}
+        response = requests.get(probe_url, headers=headers)
+        
+        if response.status_code == 200:
+            metadata = response.json()
+            # Extract duration from the video stream metadata
+            return float(metadata['response']['metadata']['format']['duration'])
+    except Exception as e:
+        print(f"Could not probe {url}, falling back to 5.0s. Error: {e}")
+    
+    return 5.0 # Fallback default
     def _get_offset(position):
         if position == "top": return Offset(x=0.0, y=-0.7)
         if position == "bottom": return Offset(x=0.0, y=0.7)
