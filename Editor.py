@@ -98,7 +98,7 @@ def create_and_render_video(
 
     
     def get_video_duration(api_key: str, url: str) -> float:
-    """Fetches the actual duration of a remote video file using Shotstack Inspect."""
+        """Fetches the actual duration of a remote video file using Shotstack Inspect."""
         try:
             # Shotstack Inspect API endpoint
             probe_url = f"https://api.shotstack.io/stage/probe/{url}"
