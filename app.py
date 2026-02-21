@@ -3,10 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import os
 from Pipeline import Assemble_Pipeline
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# Enable CORS so Lovable can talk to this API
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -14,21 +17,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Default values from .env as fallbacks
+DEFAULT_FOLDER = os.getenv("VIDEO_FOLDER")
+DEFAULT_MUSIC = os.getenv("MUSIC_URL")
+
 @app.post("/process-video")
 async def process_video(
     prompt: str = Form(...), 
-    video: UploadFile = File(...)
+    video: UploadFile = File(...),
+    folder_id: str = Form(None), # Optional: UI can override .env
+    music_url: str = Form(None)  # Optional: UI can override .env
 ):
-    # 1. Save the uploaded video locally for Analyzer.py to read
+    # 1. Save the uploaded video locally
     temp_path = f"temp_{video.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(video.file, buffer)
     
+    # 2. Determine which assets to use (Request value OR .env default)
+    active_folder = folder_id or DEFAULT_FOLDER
+    active_music = music_url or DEFAULT_MUSIC
+
     try:
-        # 2. Run your existing pipeline logic
-        # Assemble_Pipeline uses Analyzer, Chatbot, and Editor internally
-        result = Assemble_Pipeline(temp_path, prompt)
+        # 3. Run updated pipeline logic with 4 arguments
+        result = Assemble_Pipeline(
+            file_path=temp_path, 
+            prompt=prompt, 
+            folder_id=active_folder, 
+            music_url=active_music
+        )
         return result
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+        
     finally:
+        # 4. Cleanup
         if os.path.exists(temp_path):
-            os.remove(temp_path) # Cleanup
+            os.remove(temp_path)
