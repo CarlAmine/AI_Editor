@@ -99,20 +99,20 @@ def create_and_render_video(
     
     def get_video_duration(api_key: str, url: str) -> float:
     """Fetches the actual duration of a remote video file using Shotstack Inspect."""
-    try:
-        # Shotstack Inspect API endpoint
-        probe_url = f"https://api.shotstack.io/stage/probe/{url}"
-        headers = {"x-api-key": api_key}
-        response = requests.get(probe_url, headers=headers)
+        try:
+            # Shotstack Inspect API endpoint
+            probe_url = f"https://api.shotstack.io/stage/probe/{url}"
+            headers = {"x-api-key": api_key}
+            response = requests.get(probe_url, headers=headers)
+            
+            if response.status_code == 200:
+                metadata = response.json()
+                # Extract duration from the video stream metadata
+                return float(metadata['response']['metadata']['format']['duration'])
+        except Exception as e:
+            print(f"Could not probe {url}, falling back to 5.0s. Error: {e}")
         
-        if response.status_code == 200:
-            metadata = response.json()
-            # Extract duration from the video stream metadata
-            return float(metadata['response']['metadata']['format']['duration'])
-    except Exception as e:
-        print(f"Could not probe {url}, falling back to 5.0s. Error: {e}")
-    
-    return 5.0 # Fallback default
+        return 5.0 # Fallback default
     def _get_offset(position):
         if position == "top": return Offset(x=0.0, y=-0.7)
         if position == "bottom": return Offset(x=0.0, y=0.7)
