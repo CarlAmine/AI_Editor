@@ -43,10 +43,34 @@ def Assemble_Pipeline(file_path, prompt, folder_id, music_url):
     print("\n--- Step 1: Analyzing Video Content ---")
     summary = analyze_video_content(file_path) 
     
-    print("\n--- Step 2: Generating Requirements Report ---")
-    report = generate_video_requirements_report(summary, [prompt], deepseek_key) 
-    print(report)
+    # print("\n--- Step 2: Generating Requirements Report ---")
+    # report = generate_video_requirements_report(summary, [prompt], deepseek_key) 
+    # print(report)
+    # State tracking
+    current_info = {
+        "video_topic": None,
+        "scene_labels": [],
+        "music_style": None,
+        "completed": False
+    }
+    
+    print("\nAI: I've analyzed your video! How would you like me to edit this?")
 
+    # --- THE CHAT LOOP ---
+    while not current_info.get("completed"):
+        user_text = input("You: ")
+        
+        # Get AI's reasoning and response
+        ai_response = chat_with_ai_editor(summary, user_text, current_info, deepseek_key)
+        
+        # Update our internal state
+        current_info = ai_response["data"]
+        
+        # Show AI message to user
+        print(f"AI: {ai_response['message']}")
+        
+        if current_info.get("completed"):
+            break
     print("\n--- Step 3: Gathering Assets from Google Drive ---")
     try:
         service = get_drive_service()
