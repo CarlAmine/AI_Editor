@@ -99,11 +99,10 @@
 
 #     print("Generating Final Report...")
 #     return generate_final_report(conversation_state)
-
 import json
 import requests
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 # --- Configuration & Constants ---
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -122,30 +121,27 @@ def process_ui_turn(
 ) -> Dict:
     """
     Processes a single interaction from the UI.
-    Returns: {
-        "updated_state": Dict, 
-        "next_message": str, 
-        "is_complete": bool,
-        "final_report": Optional[str]
-    }
     """
     
     # 1. Extraction: Update state based on user input
     extraction_prompt = (
         f"Extract video requirements from: '{user_input}'. "
-        f"Context: {analyzer_output}. "
-        f"Only update these keys: {REQUIRED_FIELDS}. "
-        "Return ONLY a JSON object with found fields."
+        f"Context from video analysis: {analyzer_output}. "
+        f"Current known info: {json.dumps(current_state)}. "
+        f"Update these specific keys: {REQUIRED_FIELDS}. "
+        "Return ONLY a JSON object with found fields. If a field isn't mentioned, don't include it."
     )
     
     extracted_data = _call_llm_json(extraction_prompt, api_key)
     
-    print(f"DEBUG: Extracted data: {extracted_data}") 
+    # Log for debugging in Render
+    print(f"DEBUG: Input: {user_input} | Extracted: {extracted_data}") 
     
     # Merge extracted data into current state
-    for key in REQUIRED_FIELDS:
-        if key in extracted_data and extracted_data[key]:
-            current_state[key] = extracted_data[key]
+    if isinstance(extracted_data, dict):
+        for key in REQUIRED_FIELDS:
+            if key in extracted_data and extracted_data[key]:
+                current_state[key] = extracted_data[key]
 
     # 2. Check for missing fields
     missing = [k for k in REQUIRED_FIELDS if current_state.get(k) is None]
@@ -155,7 +151,7 @@ def process_ui_turn(
         report = _generate_final_report(current_state, api_key)
         return {
             "updated_state": current_state,
-            "next_message": "Perfect! I've gathered everything I need.",
+            "next_message": "Perfect! I've gathered everything I need for your project brief.",
             "is_complete": True,
             "final_report": report
         }
@@ -164,7 +160,7 @@ def process_ui_turn(
     question_prompt = (
         f"We are missing: {missing}. "
         f"Current info: {json.dumps(current_state)}. "
-        "Ask the user a friendly, short question to get the next missing piece."
+        "Ask the user a friendly, short question to get the next missing piece of information."
     )
     
     next_question = _call_llm_text(question_prompt, api_key)
@@ -179,39 +175,63 @@ def process_ui_turn(
 # --- Internal LLM Helpers ---
 
 def _call_llm_json(prompt: str, api_key: str) -> Dict:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}", 
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "Video-Edit-Pipeline"
+    }
     payload = {
         "model": MODEL_NAME,
-        "messages": [{"role": "system", "content": "You are a data extractor. Output JSON."},
-                     {"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": "You are a data extractor. Output ONLY pure JSON."},
+            {"role": "user", "content": prompt}
+        ],
         "response_format": {"type": "json_object"},
         "temperature": 0
     }
     try:
         response = requests.post(API_URL, headers=headers, json=payload)
-        if "choices" not in resp_json:
-            print(f"!!! API Error Response: {resp_json}")
+        response.raise_for_status() # Raises error for 401, 402, 500, etc.
+        
+        resp_data = response.json()
+        
+        if "choices" not in resp_data:
+            print(f"!!! API Error Response: {resp_data}")
             return {}
-        return json.loads(response.json()["choices"][0]["message"]["content"])
+
+        content = resp_data["choices"][0]["message"]["content"]
+        
+        # Regex to ensure we only get the JSON block
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
             return json.loads(match.group(0))
         return json.loads(content)
+        
     except Exception as e:
-        print(f"Extraction Error: {e}")
+        print(f"Extraction Error Trace: {e}")
         return {}
 
 def _call_llm_text(prompt: str, api_key: str) -> str:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}", 
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": MODEL_NAME,
-        "messages": [{"role": "system", "content": "You are a helpful video producer."},
-                     {"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": "You are a helpful video producer assistant."},
+            {"role": "user", "content": prompt}
+        ],
         "temperature": 0.7
     }
-    response = requests.post(API_URL, headers=headers, json=payload)
-    return response.json()["choices"][0]["message"]["content"]
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Text Generation Error: {e}")
+        return "I'm sorry, I'm having trouble connecting to my brain right now. Could you try again?"
 
 def _generate_final_report(state: Dict, api_key: str) -> str:
-    # (Same as previous logic, calls LLM to summarize final state)
-    return _call_llm_text(f"Generate a professional video brief from: {json.dumps(state)}", api_key)
+    return _call_llm_text(f"Generate a professional video production brief from these requirements: {json.dumps(state)}", api_key)
