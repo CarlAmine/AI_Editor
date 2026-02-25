@@ -60,9 +60,8 @@ async def process_video(
 
 class ChatTurn(BaseModel):
     user_input: str
-    current_info: Optional[dict] = None
-    current_state: Optional[dict] = None
-    analyzer_output: Optional[str] = ""
+    current_state: dict = {} 
+    analyzer_output: str = ""
 
 @app.post("/chat")
 async def handle_chat(turn: ChatTurn):
