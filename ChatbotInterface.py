@@ -140,6 +140,8 @@ def process_ui_turn(
     
     extracted_data = _call_llm_json(extraction_prompt, api_key)
     
+    print(f"DEBUG: Extracted data: {extracted_data}") 
+    
     # Merge extracted data into current state
     for key in REQUIRED_FIELDS:
         if key in extracted_data and extracted_data[key]:
@@ -188,7 +190,12 @@ def _call_llm_json(prompt: str, api_key: str) -> Dict:
     try:
         response = requests.post(API_URL, headers=headers, json=payload)
         return json.loads(response.json()["choices"][0]["message"]["content"])
-    except:
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(content)
+    except Exception as e:
+        print(f"Extraction Error: {e}")
         return {}
 
 def _call_llm_text(prompt: str, api_key: str) -> str:
