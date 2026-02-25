@@ -189,6 +189,9 @@ def _call_llm_json(prompt: str, api_key: str) -> Dict:
     }
     try:
         response = requests.post(API_URL, headers=headers, json=payload)
+        if "choices" not in resp_json:
+            print(f"!!! API Error Response: {resp_json}")
+            return {}
         return json.loads(response.json()["choices"][0]["message"]["content"])
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
