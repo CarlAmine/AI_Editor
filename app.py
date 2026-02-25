@@ -5,6 +5,7 @@ import os
 from Pipeline import Assemble_Pipeline
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from typing import Optional
 load_dotenv()
 
 app = FastAPI()
@@ -58,8 +59,9 @@ async def process_video(
 
 class ChatTurn(BaseModel):
     user_input: str
-    current_state: dict
-    analyzer_output: str
+    current_info: Optional[dict] = None
+    current_state: Optional[dict] = None
+    analyzer_output: Optional[str] = ""
 
 @app.post("/chat")
 async def handle_chat(turn: ChatTurn):
