@@ -4,7 +4,7 @@ import shutil
 import os
 from Pipeline import Assemble_Pipeline
 from dotenv import load_dotenv
-
+from pydantic import BaseModel
 load_dotenv()
 
 app = FastAPI()
