@@ -6,6 +6,7 @@ from Pipeline import Assemble_Pipeline
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional
+from ChatbotInterface import process_ui_turn
 load_dotenv()
 
 app = FastAPI()
