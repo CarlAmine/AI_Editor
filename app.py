@@ -22,7 +22,7 @@ app.add_middleware(
 # Default values from .env as fallbacks
 DEFAULT_FOLDER = os.getenv("VIDEO_FOLDER")
 DEFAULT_MUSIC = os.getenv("MUSIC_URL")
-DEEPSEEK_API= os.getenv("DEEPSEEK_KEY")
+GROQ_API_KEY = os.getenv("GROQ")
 @app.post("/process-video")
 async def process_video(
     prompt: str = Form(...), 
@@ -70,6 +70,6 @@ async def handle_chat(turn: ChatTurn):
         turn.user_input, 
         turn.current_state, 
         turn.analyzer_output, 
-        DEEPSEEK_API
+        GROQ_API_KEY
     )
     return result # This sends the JSON back to your UI
