@@ -103,7 +103,7 @@ import json
 import re
 from groq import Groq
 from typing import Dict, List, Optional
-
+import os
 # --- Configuration ---
 # You can hardcode the key like your example, but os.getenv("GROQ_API_KEY") is safer!
 GROQ_API_KEY = os.getenv("GROQ")
