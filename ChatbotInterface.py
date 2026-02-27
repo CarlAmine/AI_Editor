@@ -106,7 +106,7 @@ from typing import Dict, List, Optional
 
 # --- Configuration & Constants ---
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.0-flash-lite-preview-02-05:free"
+MODEL_NAME = "deepseek/deepseek-chat"
 
 REQUIRED_FIELDS = [
     "video_topic", "target_audience", "platform", 
