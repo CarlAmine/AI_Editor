@@ -100,13 +100,15 @@
 #     print("Generating Final Report...")
 #     return generate_final_report(conversation_state)
 import json
-import requests
 import re
+from groq import Groq
 from typing import Dict, List, Optional
 
-# --- Configuration & Constants ---
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "deepseek/deepseek-chat"
+# --- Configuration ---
+# You can hardcode the key like your example, but os.getenv("GROQ_API_KEY") is safer!
+GROQ_API_KEY = os.getenv("GROQ")
+client = Groq(api_key=GROQ_API_KEY)
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 REQUIRED_FIELDS = [
     "video_topic", "target_audience", "platform", 
@@ -117,53 +119,69 @@ def process_ui_turn(
     user_input: str, 
     current_state: Dict, 
     analyzer_output: str, 
-    api_key: str
+    api_key: str = None # Kept for compatibility with your app.py call
 ) -> Dict:
-    """
-    Processes a single interaction from the UI.
-    """
     
-    # 1. Extraction: Update state based on user input
+    # 1. Extraction Logic
     extraction_prompt = (
         f"Extract video requirements from: '{user_input}'. "
-        f"Context from video analysis: {analyzer_output}. "
-        f"Current known info: {json.dumps(current_state)}. "
+        f"Context from analysis: {analyzer_output}. "
         f"Update these specific keys: {REQUIRED_FIELDS}. "
-        "Return ONLY a JSON object with found fields. If a field isn't mentioned, don't include it."
+        "Return ONLY a JSON object."
     )
     
-    extracted_data = _call_llm_json(extraction_prompt, api_key)
-    
-    # Log for debugging in Render
-    print(f"DEBUG: Input: {user_input} | Extracted: {extracted_data}") 
-    
-    # Merge extracted data into current state
-    if isinstance(extracted_data, dict):
-        for key in REQUIRED_FIELDS:
-            if key in extracted_data and extracted_data[key]:
-                current_state[key] = extracted_data[key]
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a data extractor. Output ONLY pure JSON."},
+                {"role": "user", "content": extraction_prompt},
+            ],
+            model=MODEL_NAME,
+            response_format={"type": "json_object"}, # This ensures Groq sends valid JSON
+            temperature=0,
+        )
+        extracted_data = json.loads(chat_completion.choices[0].message.content)
+    except Exception as e:
+        print(f"Groq Extraction Error: {e}")
+        extracted_data = {}
+
+    # Merge data
+    for key in REQUIRED_FIELDS:
+        if key in extracted_data and extracted_data[key]:
+            current_state[key] = extracted_data[key]
 
     # 2. Check for missing fields
     missing = [k for k in REQUIRED_FIELDS if current_state.get(k) is None]
 
     # 3. Handle Completion
     if not missing:
-        report = _generate_final_report(current_state, api_key)
+        report = _generate_final_report(current_state)
         return {
             "updated_state": current_state,
-            "next_message": "Perfect! I've gathered everything I need for your project brief.",
+            "next_message": "Perfect! I've gathered everything I need.",
             "is_complete": True,
             "final_report": report
         }
 
-    # 4. Generate next question if not complete
+    # 4. Generate next question
     question_prompt = (
-        f"We are missing: {missing}. "
-        f"Current info: {json.dumps(current_state)}. "
-        "Ask the user a friendly, short question to get the next missing piece of information."
+        f"We are missing: {missing}. Current info: {json.dumps(current_state)}. "
+        "Ask a short, friendly question to get the next missing piece."
     )
     
-    next_question = _call_llm_text(question_prompt, api_key)
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a helpful video producer."},
+                {"role": "user", "content": question_prompt},
+            ],
+            model=MODEL_NAME,
+            temperature=0.7,
+        )
+        next_question = chat_completion.choices[0].message.content
+    except Exception as e:
+        print(f"Groq Text Error: {e}")
+        next_question = "I'm sorry, I hit a snag. Could you repeat that?"
 
     return {
         "updated_state": current_state,
@@ -172,66 +190,15 @@ def process_ui_turn(
         "final_report": None
     }
 
-# --- Internal LLM Helpers ---
-
-def _call_llm_json(prompt: str, api_key: str) -> Dict:
-    headers = {
-        "Authorization": f"Bearer {api_key}", 
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost",
-        "X-Title": "Video-Edit-Pipeline"
-    }
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": "You are a data extractor. Output ONLY pure JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0
-    }
+def _generate_final_report(state: Dict) -> str:
     try:
-        response = requests.post(API_URL, headers=headers, json=payload)
-        response.raise_for_status() # Raises error for 401, 402, 500, etc.
-        
-        resp_data = response.json()
-        
-        if "choices" not in resp_data:
-            print(f"!!! API Error Response: {resp_data}")
-            return {}
-
-        content = resp_data["choices"][0]["message"]["content"]
-        
-        # Regex to ensure we only get the JSON block
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        return json.loads(content)
-        
-    except Exception as e:
-        print(f"Extraction Error Trace: {e}")
-        return {}
-
-def _call_llm_text(prompt: str, api_key: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {api_key}", 
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": "You are a helpful video producer assistant."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7
-    }
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"Text Generation Error: {e}")
-        return "I'm sorry, I'm having trouble connecting to my brain right now. Could you try again?"
-
-def _generate_final_report(state: Dict, api_key: str) -> str:
-    return _call_llm_text(f"Generate a professional video production brief from these requirements: {json.dumps(state)}", api_key)
+        completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a professional video editor."},
+                {"role": "user", "content": f"Create a brief from: {json.dumps(state)}"},
+            ],
+            model=MODEL_NAME,
+        )
+        return completion.choices[0].message.content
+    except:
+        return "Report generation failed."
