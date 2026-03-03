@@ -1,67 +1,62 @@
 [
   {
-    "timestamp": 0.0,
-    "text": "Nature",
-    "position": "bottom"
+    "timestamp": 3.066666666666667,
+    "text": "Most Dangerous",
+    "position": "top"
   },
   {
-    "timestamp": 1.8,
-    "text": "Mandy",
-    "position": "bottom"
+    "timestamp": 6.133333333333334,
+    "text": "10. Israel",
+    "position": "middle"
   },
   {
-    "timestamp": 3.6,
-    "text": "L@U",
-    "position": "bottom"
+    "timestamp": 9.2,
+    "text": "9. South Korea",
+    "position": "middle"
   },
   {
-    "timestamp": 5.4,
-    "text": "Meeples",
-    "position": "bottom"
+    "timestamp": 12.266666666666667,
+    "text": "8. Japan",
+    "position": "middle"
   },
   {
-    "timestamp": 7.2,
-    "text": "Stu",
-    "position": "bottom"
+    "timestamp": 15.333333333333334,
+    "text": "8. Japan",
+    "position": "middle"
   },
   {
-    "timestamp": 9.0,
-    "text": "Poco",
-    "position": "bottom"
+    "timestamp": 18.4,
+    "text": "7. Germany",
+    "position": "middle"
   },
   {
-    "timestamp": 10.8,
-    "text": "Janet",
-    "position": "bottom"
+    "timestamp": 21.466666666666665,
+    "text": "6. France",
+    "position": "middle"
   },
   {
-    "timestamp": 12.6,
-    "text": "Berry",
-    "position": "bottom"
+    "timestamp": 24.533333333333335,
+    "text": "5. UK",
+    "position": "middle"
   },
   {
-    "timestamp": 14.4,
-    "text": "Try",
-    "position": "bottom"
+    "timestamp": 27.6,
+    "text": "4. Russia",
+    "position": "middle"
   },
   {
-    "timestamp": 16.2,
-    "text": "Ollie",
-    "position": "bottom"
+    "timestamp": 30.666666666666668,
+    "text": "3. China",
+    "position": "middle"
   },
   {
-    "timestamp": 18.0,
-    "text": "Hank",
-    "position": "bottom"
+    "timestamp": 33.733333333333334,
+    "text": "2. India",
+    "position": "middle"
   },
   {
-    "timestamp": 19.8,
-    "text": "Brawlers",
-    "position": "bottom"
-  },
-  {
-    "timestamp": 21.6,
-    "text": "Brawlers",
-    "position": "bottom"
+    "timestamp": 36.8,
+    "text": "1. USA",
+    "position": "middle"
   }
 ]

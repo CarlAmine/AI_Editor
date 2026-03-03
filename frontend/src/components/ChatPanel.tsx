@@ -3,6 +3,7 @@ import React, { useState, FormEvent } from "react";
 type Props = {
   apiBase: string;
   analyzerOutput: string;
+  onStateUpdate?: (state: Record<string, unknown>) => void;
 };
 
 type ChatTurnRequest = {
@@ -24,13 +25,20 @@ type Message = {
   text: string;
 };
 
-export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput }) => {
+export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpdate }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [currentState, setCurrentState] = useState<Record<string, unknown>>({});
   const [isLoading, setIsLoading] = useState(false);
   const [finalReport, setFinalReport] = useState<string | null>(null);
   const [showState, setShowState] = useState(false);
+
+  const updateState = (newState: Record<string, unknown>) => {
+    setCurrentState(newState);
+    if (onStateUpdate) {
+      onStateUpdate(newState);
+    }
+  };
 
   const appendMessage = (from: "user" | "assistant", text: string) => {
     setMessages((prev) => [
@@ -64,7 +72,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput }) => {
       const data: ChatTurnResponse = await response.json();
 
       if (data.updated_state) {
-        setCurrentState(data.updated_state);
+        updateState(data.updated_state);
       }
 
       if (data.next_message) {

@@ -8,6 +8,7 @@ const apiBase =
 
 export const App: React.FC = () => {
   const [analyzerOutput, setAnalyzerOutput] = useState<string>("");
+  const [currentState, setCurrentState] = useState<Record<string, unknown>>({});
 
   return (
     <div className="app-root">
@@ -26,8 +27,16 @@ export const App: React.FC = () => {
 
       <main className="app-main">
         <section className="app-grid">
-          <VideoPipelinePanel apiBase={apiBase} onAnalyzerSummary={setAnalyzerOutput} />
-          <ChatPanel apiBase={apiBase} analyzerOutput={analyzerOutput} />
+          <VideoPipelinePanel 
+            apiBase={apiBase} 
+            onAnalyzerSummary={setAnalyzerOutput}
+            currentState={currentState}
+          />
+          <ChatPanel 
+            apiBase={apiBase} 
+            analyzerOutput={analyzerOutput}
+            onStateUpdate={setCurrentState}
+          />
         </section>
       </main>
 

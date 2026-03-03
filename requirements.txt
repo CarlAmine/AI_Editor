@@ -14,9 +14,11 @@ python-dotenv
 requests
 groq
 # --- EDITOR REQUIREMENTS ---
-moviepy
 pillow
 shotstack-sdk
+
+# --- VIDEO DOWNLOAD & CLIPPING ---
+yt-dlp
 
 # --- UTILITIES ---
 fastapi

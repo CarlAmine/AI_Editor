@@ -14,6 +14,8 @@ def generate_overlay_plan(
     analysis_results: Dict[str, Any],
     user_prompt: str,
     analysis_summary: Optional[str] = None,
+    tone: Optional[str] = None,
+    pacing: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Use the analyzer output + a short user request to build a list of
@@ -72,11 +74,22 @@ def generate_overlay_plan(
     if len(summary_snippet) > 1200:
         summary_snippet = summary_snippet[:1200] + "…"
 
+    # Build style hints from tone/pacing if provided
+    style_hints = ""
+    if tone or pacing:
+        style_hints = "\nStyle guidance from requirements:\n"
+        if tone:
+            style_hints += f"- Tone: {tone}\n"
+        if pacing:
+            style_hints += f"- Pacing: {pacing}\n"
+        style_hints += "Use this to guide caption wording and intensity.\n"
+
     user_message = (
         "You are planning on-screen captions for a video.\n"
         "You must ONLY place captions at timestamps that come from the list "
         "of keyframes I provide. Do not invent new timestamps.\n\n"
-        f"User request / style notes: {user_prompt!r}\n\n"
+        f"User request / style notes: {user_prompt!r}\n"
+        f"{style_hints}\n"
         "Optional analysis summary (do not assume it is complete):\n"
         f"{summary_snippet}\n\n"
         "Keyframes with text (JSON, in chronological order):\n"

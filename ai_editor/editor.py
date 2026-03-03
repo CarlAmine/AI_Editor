@@ -25,6 +25,7 @@ def create_and_render_video(
     project_title: str = "My Pipeline Video",
     overlay_text: List[str] = [],
     soundtrack_url: Optional[str] = None,
+    music_mode: str = "original",
     resolution: str = "1080x1920",
     wait_for_render: bool = True,
     overlay_plan: Optional[List[Dict[str, Any]]] = None,
@@ -49,20 +50,32 @@ def create_and_render_video(
     HOST = "https://api.shotstack.io/stage"  # Change to "production" if needed
 
     def get_video_duration(api_key: str, url: str) -> float:
-        """Fetches the actual duration of a remote video file using Shotstack Inspect."""
+        """Fetches the duration of a remote video file using OpenCV.
+
+        Opens the URL with cv2.VideoCapture and computes frames/fps.  If
+        probing fails we return a conservative 5‑second default so the
+        pipeline still works.
+        """
+        print("[duration probe] using OpenCV")
         try:
-            # Shotstack Inspect API endpoint
-            probe_url = f"https://api.shotstack.io/stage/probe/{url}"
-            headers = {"x-api-key": api_key}
-            response = requests.get(probe_url, headers=headers)
-            
-            if response.status_code == 200:
-                metadata = response.json()
-                # Extract duration from the video stream metadata
-                return float(metadata['response']['metadata']['format']['duration'])
+            import cv2
+            cap = cv2.VideoCapture(url)
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                cap.release()
+                if fps > 0 and frames > 0:
+                    duration = frames / fps
+                    print(f"✓ Duration (OpenCV): {duration:.2f}s")
+                    return float(duration)
+                else:
+                    print(f"OpenCV opened URL but returned fps={fps}, frames={frames}")
+            else:
+                print("OpenCV failed to open the URL")
         except Exception as e:
-            print(f"Could not probe {url}, falling back to 5.0s. Error: {e}")
-        
+            print(f"OpenCV probe error: {e}")
+
+        print(f"Could not determine duration, falling back to 5.0s for {url[:50]}...")
         return 5.0  # Fallback default
 
     # Default Assets (Fallback)
@@ -93,6 +106,7 @@ def create_and_render_video(
         clips.append(VideoClip(url=url, duration=actual_duration))
 
     total_video_duration = sum(c.duration for c in clips)
+    print(f"Total assembled video duration: {total_video_duration:.1f}s from {len(clips)} clips")
 
     # Process Text Overlays
     # Priority 1: Use an explicit overlay_plan (timestamps from analyzer + LLM).
@@ -101,13 +115,26 @@ def create_and_render_video(
 
     if overlay_plan:
         print(f"Using overlay_plan with {len(overlay_plan)} entries.")
+        
+        # Calculate the original video duration from overlay timestamps
+        # (the max timestamp indicates the source video length)
+        max_overlay_ts = max((float(item.get("timestamp", 0.0)) for item in overlay_plan if "timestamp" in item), default=total_video_duration)
+        
+        # If original duration differs from assembled duration, rescale timestamps proportionally
+        if max_overlay_ts > 0 and abs(max_overlay_ts - total_video_duration) > 0.5:
+            scale_factor = total_video_duration / max_overlay_ts
+            print(f"Rescaling overlay timestamps: {max_overlay_ts:.1f}s → {total_video_duration:.1f}s (factor: {scale_factor:.2f})")
+        else:
+            scale_factor = 1.0
+        
         for item in overlay_plan:
             try:
-                ts = float(item.get("timestamp", 0.0))
+                ts = float(item.get("timestamp", 0.0)) * scale_factor
             except (TypeError, ValueError):
                 continue
 
             if ts < 0 or ts > total_video_duration:
+                print(f"Skipping overlay at {ts:.1f}s (outside video duration)")
                 continue
 
             raw_text = item.get("text", "")
@@ -170,12 +197,18 @@ def create_and_render_video(
             if next_start is None:
                 next_start = total_video_duration
 
-            # Allow overlay to last until just before the next different timestamp
-            max_dur = max(0.1, next_start - o.start_time - 0.05)
-            # Clamp to remaining video length as well
-            max_dur = min(max_dur, max(0.1, total_video_duration - o.start_time))
-            if o.duration > max_dur:
-                o.duration = max_dur
+            if next_start == total_video_duration:
+                # last overlay – give it a sensible minimum duration (up to 3s or
+                # until video end, whichever is shorter) so it isn't virtually
+                # invisible at the very end.
+                max_dur = min(3.0, max(0.1, total_video_duration - o.start_time))
+            else:
+                # Allow overlay to last until just before the next different timestamp
+                max_dur = max(0.1, next_start - o.start_time - 0.05)
+                # Clamp to remaining video length as well
+                max_dur = min(max_dur, max(0.1, total_video_duration - o.start_time))
+            # Set duration to span from this overlay to the next (regardless of plan duration)
+            o.duration = max_dur
 
     # --- 4. Logic: Build Shotstack JSON Template ---
     
@@ -196,14 +229,11 @@ def create_and_render_video(
         return Offset(x=0.0, y=0.0)
 
     # Build Timeline
-    tracks = []
-    
-    # Track 1: Video
+    # prepare both video and text clip lists first
     video_clips_objs = []
     current_time = 0.0
     for i, clip in enumerate(clips):
         vid_asset = VideoAsset(src=clip.url, trim=0.0)
-        
         shotstack_clip = Clip(
             asset=vid_asset,
             start=current_time,
@@ -214,39 +244,64 @@ def create_and_render_video(
         )
         video_clips_objs.append(shotstack_clip)
         current_time += clip.duration
-    
-    tracks.append(Track(clips=video_clips_objs))
 
-    # Track 2: Text (if any)
+    text_clips_objs = []
     if text_overlays:
-        text_clips_objs = []
+        # ensure no extremely short durations
+        for o in text_overlays:
+            remaining = total_video_duration - o.start_time
+            if o.duration < 0.5 and remaining > 0.1:
+                o.duration = min(0.5, remaining)
         for overlay in text_overlays:
             title_asset = TitleAsset(
                 text=overlay.text,
                 style="minimal",
                 size="medium"
             )
-            
             t_clip = Clip(
                 asset=title_asset,
                 start=overlay.start_time,
                 length=overlay.duration,
                 offset=_get_offset(overlay.position),
-                transition=Transition(_in="fade")
+                transition=Transition(_in="fade", out="fade")
             )
             text_clips_objs.append(t_clip)
-        tracks.append(Track(clips=text_clips_objs))
 
-    # Soundtrack
-    music_src = soundtrack_url if soundtrack_url else DEFAULT_MUSIC
-    soundtrack = Soundtrack(src=music_src, effect="fadeOut", volume=0.3)
+    # build timeline tracks with text FIRST so it renders ABOVE video
+    tracks = []
+    if text_clips_objs:
+        tracks.append(Track(clips=text_clips_objs))
+    tracks.append(Track(clips=video_clips_objs))
+
+    # Soundtrack handling
+    soundtrack = None
+    if music_mode == "custom" and soundtrack_url:
+        # Use provided custom music
+        soundtrack = Soundtrack(src=soundtrack_url, effect="fadeOut", volume=0.5)
+        print(f"[editor] Using custom soundtrack: {soundtrack_url}")
+    elif music_mode == "original":
+        # Keep original audio from clips (don't add separate soundtrack)
+        print("[editor] Using original audio from clips (no overlay music)")
+        soundtrack = None
+    else:
+        # Default fallback to a standard track (shouldn't happen in normal flow)
+        soundtrack = Soundtrack(src=DEFAULT_MUSIC, effect="fadeOut", volume=0.3)
+        print("[editor] Using default soundtrack (fallback)")
 
     # Timeline Object
-    timeline = Timeline(
-        background="#000000",
-        soundtrack=soundtrack,
-        tracks=tracks
-    )
+    # Shotstack expects a Soundtrack object; if we intend to preserve original
+    # audio (no separate soundtrack) we should omit the `soundtrack` field.
+    if soundtrack is None:
+        timeline = Timeline(
+            background="#000000",
+            tracks=tracks
+        )
+    else:
+        timeline = Timeline(
+            background="#000000",
+            soundtrack=soundtrack,
+            tracks=tracks
+        )
 
     # Output Settings
     res_width = "1080"  # Shotstack uses simplified resolution strings mostly

@@ -1,102 +1,97 @@
 {
-  "user_prompt": "Make a video about nature for YT",
-  "summary_snippet": " VIDEO ANALYSIS SUMMARY\n========================================\nFile: temp_Recording 2026-01-06 113649.mp4\nDuration: 0:00:21.633333\nFPS: 30.00\n\nPACING: Fast (rapid cuts)\n   • Total Shots: 17\n   • Avg Shot Duration: 1.27s\n   • Cuts per Minute: 47.1\n\nEDITING STYLE:\n   • Dominant Transition: Hard Cut\n   • Transition Counts: {'Hard Cut': 16}\n\nDETECTED TEXT CONTENT:\n   • @ 0.0s: 'TOP 10' (Top); 'BEST BRAWLERS' (Bottom); '(RIGHT NOW)' (Bottom)\n   • @ 1.8s: '10 MANDY' (Top)\n   • @ 3.6s: '9 L@U' (Top)\n   • @ 5.4s: '85 MEEPLE' (Top)\n   • @ 7.2s: '7 STU' (Top)\n   • @ 9.0s: '6 POco' (Top)\n   • @ 10.8s: '63 JANET' (Top)\n   • @ 12.6s: '45 BERRY' (Top)\n   • @ 14.4s: '3. MR P' (Top); 'TRY' (Bottom)\n   • @ 16.2s: '2. OLLIE' (Top)\n   • @ 18.0s: '1. HANK' (Top)\n   • @ 19.8s: 'TOP 10' (Top); 'BEST BRA WLLERS' (Bottom)\n   • @ 21.6s: 'TOP 10' (Top); 'BEST BRAWLERS' (Bottom)",
+  "user_prompt": "Do a military ranking video",
+  "summary_snippet": " VIDEO ANALYSIS SUMMARY\n========================================\nFile: videos\\ec055d53\\primary.mp4\nDuration: 0:00:37\nFPS: 30.00\n\nPACING: Medium\n   • Total Shots: 11\n   • Avg Shot Duration: 3.36s\n   • Cuts per Minute: 17.8\n\nEDITING STYLE:\n   • Dominant Transition: Hard Cut\n   • Transition Counts: {'Hard Cut': 10}\n\nBLACK SEQUENCES: 1 detected\n   • At 29.4s (0.9s): Medium black\n\nDETECTED TEXT CONTENT:\n   • @ 3.1s: 'TOP 1' (Top); 'MOST' (Top); 'DANGEROUS' (Middle); 'ARMY' (Middle); 'IN' (Middle); 'THE' (Bottom); 'WORLD' (Bottom)\n   • @ 6.1s: '10. Israel' (Middle)\n   • @ 9.2s: '9.South korea' (Middle)\n   • @ 12.3s: '8 Japanese' (Middle)\n   • @ 15.3s: '8 Japanese' (Middle)\n   • @ 18.4s: '7.Germany' (Middle)\n   • @ 21.5s: '6.France' (Middle)\n   • @ 24.5s: '5 United Kingdom' (Middle); 'Ak' (Middle)\n   • @ 27.6s: '4.Russia' (Middle)\n   • @ 30.7s: '3.china' (Middle)\n   • @ 33.7s: '2India' (Middle)\n   • @ 36.8s: '1.United States' (Middle)",
   "overlays_hint": {
     "keyframes_with_text": [
       {
-        "timestamp": 0.0,
-        "detected_text": "'TOP 10' (Top); 'BEST BRAWLERS' (Bottom); '(RIGHT NOW)' (Bottom)",
+        "timestamp": 3.066666666666667,
+        "detected_text": "'TOP 1' (Top); 'MOST' (Top); 'DANGEROUS' (Middle); 'ARMY' (Middle); 'IN' (Middle); 'THE' (Bottom); 'WORLD' (Bottom)",
         "easyocr_details": [
-          "'TOP 10' (Top)",
-          "'BEST BRAWLERS' (Bottom)",
-          "'(RIGHT NOW)' (Bottom)"
+          "'TOP 1' (Top)",
+          "'MOST' (Top)",
+          "'DANGEROUS' (Middle)",
+          "'ARMY' (Middle)",
+          "'IN' (Middle)",
+          "'THE' (Bottom)",
+          "'WORLD' (Bottom)"
         ]
       },
       {
-        "timestamp": 1.8,
-        "detected_text": "'10 MANDY' (Top)",
+        "timestamp": 6.133333333333334,
+        "detected_text": "'10. Israel' (Middle)",
         "easyocr_details": [
-          "'10 MANDY' (Top)"
+          "'10. Israel' (Middle)"
         ]
       },
       {
-        "timestamp": 3.6,
-        "detected_text": "'9 L@U' (Top)",
+        "timestamp": 9.2,
+        "detected_text": "'9.South korea' (Middle)",
         "easyocr_details": [
-          "'9 L@U' (Top)"
+          "'9.South korea' (Middle)"
         ]
       },
       {
-        "timestamp": 5.4,
-        "detected_text": "'85 MEEPLE' (Top)",
+        "timestamp": 12.266666666666667,
+        "detected_text": "'8 Japanese' (Middle)",
         "easyocr_details": [
-          "'85 MEEPLE' (Top)"
+          "'8 Japanese' (Middle)"
         ]
       },
       {
-        "timestamp": 7.2,
-        "detected_text": "'7 STU' (Top)",
+        "timestamp": 15.333333333333334,
+        "detected_text": "'8 Japanese' (Middle)",
         "easyocr_details": [
-          "'7 STU' (Top)"
+          "'8 Japanese' (Middle)"
         ]
       },
       {
-        "timestamp": 9.0,
-        "detected_text": "'6 POco' (Top)",
+        "timestamp": 18.4,
+        "detected_text": "'7.Germany' (Middle)",
         "easyocr_details": [
-          "'6 POco' (Top)"
+          "'7.Germany' (Middle)"
         ]
       },
       {
-        "timestamp": 10.8,
-        "detected_text": "'63 JANET' (Top)",
+        "timestamp": 21.466666666666665,
+        "detected_text": "'6.France' (Middle)",
         "easyocr_details": [
-          "'63 JANET' (Top)"
+          "'6.France' (Middle)"
         ]
       },
       {
-        "timestamp": 12.6,
-        "detected_text": "'45 BERRY' (Top)",
+        "timestamp": 24.533333333333335,
+        "detected_text": "'5 United Kingdom' (Middle); 'Ak' (Middle)",
         "easyocr_details": [
-          "'45 BERRY' (Top)"
+          "'5 United Kingdom' (Middle)",
+          "'Ak' (Middle)"
         ]
       },
       {
-        "timestamp": 14.4,
-        "detected_text": "'3. MR P' (Top); 'TRY' (Bottom)",
+        "timestamp": 27.6,
+        "detected_text": "'4.Russia' (Middle)",
         "easyocr_details": [
-          "'3. MR P' (Top)",
-          "'TRY' (Bottom)"
+          "'4.Russia' (Middle)"
         ]
       },
       {
-        "timestamp": 16.2,
-        "detected_text": "'2. OLLIE' (Top)",
+        "timestamp": 30.666666666666668,
+        "detected_text": "'3.china' (Middle)",
         "easyocr_details": [
-          "'2. OLLIE' (Top)"
+          "'3.china' (Middle)"
         ]
       },
       {
-        "timestamp": 18.0,
-        "detected_text": "'1. HANK' (Top)",
+        "timestamp": 33.733333333333334,
+        "detected_text": "'2India' (Middle)",
         "easyocr_details": [
-          "'1. HANK' (Top)"
+          "'2India' (Middle)"
         ]
       },
       {
-        "timestamp": 19.8,
-        "detected_text": "'TOP 10' (Top); 'BEST BRA WLLERS' (Bottom)",
+        "timestamp": 36.8,
+        "detected_text": "'1.United States' (Middle)",
         "easyocr_details": [
-          "'TOP 10' (Top)",
-          "'BEST BRA WLLERS' (Bottom)"
-        ]
-      },
-      {
-        "timestamp": 21.6,
-        "detected_text": "'TOP 10' (Top); 'BEST BRAWLERS' (Bottom)",
-        "easyocr_details": [
-          "'TOP 10' (Top)",
-          "'BEST BRAWLERS' (Bottom)"
+          "'1.United States' (Middle)"
         ]
       }
     ]
