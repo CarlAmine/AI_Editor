@@ -24,6 +24,7 @@ env/
 analysis_debug.*
 overlay_debug*
 overlay_plan_debug*
+fix_*.py
 
 # Node / Frontend
 frontend/node_modules/
