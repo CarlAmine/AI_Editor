@@ -1,20 +1,46 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 import shutil
 import os
-from Pipeline import Assemble_Pipeline
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional
-from ChatbotInterface import process_ui_turn
+
+from ai_editor.pipeline import Assemble_Pipeline
+from ai_editor.chatbot_interface import process_ui_turn
+
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(
+    title="AI Editor",
+    description="Video analysis and automated editing pipeline with conversational brief builder.",
+    version="1.0.0",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+)
+
+# Optional static frontend (only if a 'static' directory exists)
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+HAS_STATIC = os.path.isdir(STATIC_DIR)
+
+if HAS_STATIC:
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect root path to the web UI if present, otherwise to API docs."""
+    if HAS_STATIC:
+        return RedirectResponse(url="/static/index.html")
+    return RedirectResponse(url="/api/docs")
+
 
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
