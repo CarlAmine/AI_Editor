@@ -52,17 +52,16 @@ AI_Editor/
 │           ├── VideoPipelinePanel.tsx
 │           └── ChatPanel.tsx
 │
-├── docs/                     # Extended documentation
-│   ├── API_EXAMPLES.md
+├── docs/                     # Documentation
 │   ├── SETUP_GUIDE.md
-│   ├── DEPLOYMENT_CHECKLIST.md
+│   ├── API_EXAMPLES.md
+│   ├── DEPLOYMENT.md
 │   ├── TROUBLESHOOTING.md
-│   ├── MIGRATION_GUIDE.md
-│   └── YOUTUBE_CLIPPER_DOCS.md
+│   └── MIGRATION_GUIDE.md
 │
 └── tests/                    # Test scripts and examples
     ├── youtube_clipper_test.py
-    └── YOUTUBE_CLIPPER_EXAMPLES.py
+    └── youtube_clipper_examples.py
 ```
 
 ---
@@ -75,7 +74,6 @@ AI_Editor/
 - Node.js 18+
 - [FFmpeg](https://ffmpeg.org/download.html) installed and on your PATH
 
-**Install FFmpeg:**
 ```bash
 # macOS
 brew install ffmpeg
@@ -100,7 +98,7 @@ cd AI_Editor
 cp .env.example .env
 ```
 
-Open `.env` and fill in your keys:
+Edit `.env` and fill in your API keys:
 
 ```env
 SHOTSTACK_KEY=your_shotstack_api_key
@@ -123,7 +121,7 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5173`.  
+The app will be available at `http://localhost:5173`.
 Interactive API docs: `http://localhost:8000/api/docs`
 
 ---
@@ -143,16 +141,10 @@ Interactive API docs: `http://localhost:8000/api/docs`
         { "start": 10.5, "end": 30.0 },
         { "start": 45.0, "end": 60.0 }
       ]
-    },
-    {
-      "label": 2,
-      "url": "https://www.tiktok.com/@user/video/123456",
-      "segments": null
     }
   ],
   "prompt": "Fast-paced TikTok style edit with bold captions",
   "music_mode": "original",
-  "custom_music_url": null,
   "requirements_state": {
     "tone": "energetic",
     "pacing": "fast",
@@ -162,6 +154,7 @@ Interactive API docs: `http://localhost:8000/api/docs`
 ```
 
 **Response:**
+
 ```json
 {
   "success": true,
@@ -170,8 +163,6 @@ Interactive API docs: `http://localhost:8000/api/docs`
 }
 ```
 
-> For more API examples, see [`docs/API_EXAMPLES.md`](docs/API_EXAMPLES.md).
-
 ---
 
 ## Pipeline Overview
@@ -179,11 +170,11 @@ Interactive API docs: `http://localhost:8000/api/docs`
 ```
 User Input
   ├── Primary URL (analysis)
-  ├── Sources (ordered clips with segments)
+  ├── Sources (ordered clips + segments)
   ├── Editing prompt
   └── Audio mode
         ↓
-Assemble_Pipeline()
+assemble_pipeline()
   ├── [1] Download primary video
   ├── [2] Analyze content
   ├── [3] Generate editing requirements
@@ -215,10 +206,9 @@ docker run -p 8000:8000 --env-file .env ai-editor
 |----------|-------------|
 | [Setup Guide](docs/SETUP_GUIDE.md) | Detailed installation instructions |
 | [API Examples](docs/API_EXAMPLES.md) | Full request/response examples |
-| [Deployment Checklist](docs/DEPLOYMENT_CHECKLIST.md) | Production deployment steps |
+| [Deployment](docs/DEPLOYMENT.md) | Production deployment steps |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common issues and fixes |
 | [Migration Guide](docs/MIGRATION_GUIDE.md) | Migrating from the old file-upload workflow |
-| [YouTube Clipper Docs](docs/YOUTUBE_CLIPPER_DOCS.md) | Deep-dive on the clipper module |
 
 ---
 
