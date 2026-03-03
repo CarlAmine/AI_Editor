@@ -1,4 +1,43 @@
-
+# Environment
 .env
+*.env
 service-account.json
 
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Debug / temp files
+*_debug.json
+*_debug.txt
+analysis_debug.*
+overlay_debug*
+overlay_plan_debug*
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
