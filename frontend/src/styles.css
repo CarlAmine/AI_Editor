@@ -603,3 +603,20 @@ body {
   font-size: 0.8rem;
   color: #6b7280;
 }
+
+.youtube-upload-card {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.65);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.approval-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}

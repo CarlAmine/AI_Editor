@@ -1,44 +1,54 @@
-# Environment
+# Environment / secrets
 .env
-*.env
+.env.*
+*.pem
+*.key
 service-account.json
+service_account.json
+google-service-account.json
+credentials.json
+youtube-client-secret.json
+youtube-token.json
+secrets/
+tmp/credentials/
 
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
-*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
 dist/
 build/
+*.egg-info/
 .eggs/
-*.egg
-.venv/
-venv/
-env/
 
-# Debug / temp files
+# Local pipeline artifacts
+tmp/
+analysis_debug.json
+analysis_summary_debug.txt
+overlay_debug_payload.json
+overlay_plan_debug.json
 *_debug.json
 *_debug.txt
-analysis_debug.*
-overlay_debug*
-overlay_plan_debug*
-fix_*.py
+*.log
+logs/
 
-# Node / Frontend
+# Frontend generated files
 frontend/node_modules/
 frontend/dist/
 frontend/.env
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-logs/

@@ -1,0 +1,48 @@
+{
+  "tracks": [
+    {
+      "name": "video",
+      "clips": [
+        {
+          "asset": {
+            "type": "video",
+            "src": "https://example.com/video.mp4",
+            "trim": 0.0
+          },
+          "start": 0.0,
+          "length": 8.4,
+          "fit": "cover",
+          "position": "center",
+          "transition": {
+            "in": "fade"
+          }
+        }
+      ]
+    },
+    {
+      "name": "overlay",
+      "clips": [
+        {
+          "asset": {
+            "type": "html",
+            "html": "<div style=\"font-weight:500;\">Overlay Text<br/>For Entire Clip</div>",
+            "css": "div{font-size:52px;line-height:1.2;font-family:'Space Grotesk',sans-serif;color:#fff;text-align:center;}",
+            "width": 680,
+            "background": {
+              "color": "#000000",
+              "opacity": 0.32,
+              "radius": 18
+            },
+            "position": "center"
+          },
+          "start": 0.0,
+          "length": 8.4,
+          "offset": {
+            "x": 0.0,
+            "y": -0.2
+          }
+        }
+      ]
+    }
+  ]
+}

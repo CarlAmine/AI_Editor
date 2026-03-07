@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
+import json
 
 
 class VideoDownloadError(Exception):
@@ -21,6 +22,49 @@ class VideoDownloadError(Exception):
 class VideoClapError(Exception):
     """Raised when video clipping fails."""
     pass
+
+
+def _probe_media(path: str) -> Dict:
+    """
+    Probe media streams/format using ffprobe.
+
+    Returns:
+        Dict: {
+            "has_video": bool,
+            "has_audio": bool,
+            "streams": list,
+            "format": dict
+        }
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout or "{}")
+        streams = data.get("streams", []) or []
+        has_video = any(str(s.get("codec_type", "")).lower() == "video" for s in streams)
+        has_audio = any(str(s.get("codec_type", "")).lower() == "audio" for s in streams)
+        return {
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "streams": streams,
+            "format": data.get("format", {}) or {},
+        }
+    except FileNotFoundError as e:
+        raise VideoDownloadError("ffprobe not found. Install from: https://ffmpeg.org/download.html") from e
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr)
+        raise VideoDownloadError(f"ffprobe failed for {path}: {stderr}")
+    except json.JSONDecodeError as e:
+        raise VideoDownloadError(f"ffprobe returned invalid JSON for {path}: {e}")
 
 
 def download_video(url: str, output_dir: str, filename: Optional[str] = None) -> str:
@@ -48,7 +92,9 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None) ->
 
         cmd = [
             "yt-dlp",
-            "-f", "best",  # Best available quality
+            "-f", "bv*+ba/b",  # Prefer best video+audio, fallback to best combined
+            "--merge-output-format",
+            "mp4",
             "-o", output_template,
             url,
         ]
@@ -69,8 +115,17 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None) ->
         if not os.path.exists(filepath):
             raise VideoDownloadError(f"Downloaded file not found: {filepath}")
 
+        probe = _probe_media(filepath)
+        if not probe["has_video"]:
+            raise VideoDownloadError(f"Downloaded file has no video stream: {filepath}")
+        if not probe["has_audio"]:
+            raise VideoDownloadError(
+                "Downloaded file has no audio stream after yt-dlp merge. "
+                "Try a different source URL or format."
+            )
+
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f"✓ Downloaded: {filepath} ({file_size_mb:.1f} MB)")
+        print(f"✓ Downloaded: {filepath} ({file_size_mb:.1f} MB) | has_audio={probe['has_audio']}")
 
         return filepath
 
@@ -108,8 +163,10 @@ def extract_audio(video_path: str, output_dir: str, audio_filename: str = "audio
         cmd = [
             "ffmpeg",
             "-i", video_path,
-            "-q:a", "0",  # Highest audio quality
-            "-map", "a",  # Extract audio stream only
+            "-vn",  # Disable video output
+            "-map", "0:a:0?",  # First audio stream if present; don't fail if missing
+            "-c:a", "libmp3lame",
+            "-q:a", "2",  # High quality VBR
             "-y",  # Overwrite output file
             audio_path,
         ]
@@ -117,8 +174,10 @@ def extract_audio(video_path: str, output_dir: str, audio_filename: str = "audio
         print(f"[downloader] Extracting audio to: {audio_path}")
         subprocess.run(cmd, capture_output=True, check=True)
 
-        if not os.path.exists(audio_path):
-            raise VideoClapError("Audio extraction failed")
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            raise VideoClapError(
+                "Audio extraction failed: source has no usable audio stream."
+            )
 
         print(f"✓ Audio extracted: {audio_path}")
         return audio_path
@@ -166,6 +225,7 @@ def clip_video(
             "-t", str(duration),
             "-c:v", "libx264",
             "-c:a", "aac",
+            "-b:a", "192k",
             "-y",  # Overwrite output
             output_path,
         ]
@@ -176,8 +236,12 @@ def clip_video(
         if not os.path.exists(output_path):
             raise VideoClapError("Clip file not created")
 
+        probe = _probe_media(output_path)
         file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"✓ Clip created: {output_path} ({file_size_mb:.1f} MB, {duration:.1f}s)")
+        print(
+            f"✓ Clip created: {output_path} ({file_size_mb:.1f} MB, {duration:.1f}s) "
+            f"| has_audio={probe['has_audio']}"
+        )
 
         return output_path
 

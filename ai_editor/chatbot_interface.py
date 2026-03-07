@@ -1,165 +1,152 @@
-# Legacy OpenRouter-based implementation is kept commented out for reference.
-# The active implementation uses Groq for extraction and brief generation.
-
 import json
-import re
-from groq import Groq
-from typing import Dict, List, Optional
 import os
+import re
+from typing import Dict, List
 
-# --- Configuration ---
-# You can hardcode the key like your example, but os.getenv("GROQ_API_KEY") is safer!
+from groq import Groq
+
 GROQ_API_KEY = os.getenv("GROQ")
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 MODEL_NAME = "llama-3.3-70b-versatile"
 
-# Collected fields that power the "current_state" JSON shown in the UI.
-# Keep these relatively stable; only extend or rename with care.
 REQUIRED_FIELDS = [
-    # Core description
-    "video_topic",           # What the video is about
-    "target_audience",       # Who it is for
-    "platform",              # e.g. YouTube, TikTok, Instagram Reels
-
-    # Structure & length
-    "duration_seconds",      # Target runtime in seconds (number, or null)
-    "aspect_ratio",          # e.g. 16:9, 9:16, 1:1
-    "orientation",           # e.g. vertical, horizontal, square
-
-    # Creative style
-    "tone",                  # e.g. playful, serious, cinematic
-    "pacing",                # e.g. fast cuts, slow and calm
-    "style_reference",       # Optional reference show/creator/style
-
-    # Business / messaging
-    "call_to_action",        # e.g. sign up, subscribe, visit website
-    "branding",              # Brand name, colors, logo usage
-    "subtitles",             # e.g. yes/no, language, style
-
-    # Practical details
-    "deadline",              # When the video is needed
-    "budget",                # Optional budget notes, currency as text
+    "video_topic",
+    "target_audience",
+    "platform",
+    "duration_seconds",
+    "aspect_ratio",
+    "orientation",
+    "tone",
+    "pacing",
+    "style_reference",
+    "call_to_action",
+    "branding",
+    "subtitles",
+    "deadline",
+    "budget",
+    "intent_mode",
+    "refit_mode",
 ]
+
+DEFAULT_STATE = {
+    "video_topic": "General promotional/edit video",
+    "target_audience": "General audience",
+    "platform": "YouTube",
+    "duration_seconds": 60,
+    "aspect_ratio": "16:9",
+    "orientation": "horizontal",
+    "tone": "engaging",
+    "pacing": "medium",
+    "style_reference": "",
+    "call_to_action": "",
+    "branding": "",
+    "subtitles": "yes",
+    "deadline": "",
+    "budget": "",
+    "intent_mode": "video",
+    "refit_mode": "crop",
+    "edit_requests": [],
+    "user_requests": [],
+}
+
+
+def _normalize_state(current_state: Dict) -> Dict:
+    state = dict(DEFAULT_STATE)
+    if current_state:
+        state.update(current_state)
+    if not isinstance(state.get("edit_requests"), list):
+        state["edit_requests"] = []
+    if not isinstance(state.get("user_requests"), list):
+        state["user_requests"] = []
+    return state
+
+
+def _extract_action_requests(text: str) -> List[str]:
+    text_low = text.lower()
+    actions = []
+
+    patterns = [
+        (r"(remove|cut|delete)\s+(.+)", "remove"),
+        (r"(trim)\s+(.+)", "trim"),
+        (r"(add)\s+(.+)", "add"),
+        (r"(replace)\s+(.+)", "replace"),
+    ]
+    for pattern, action in patterns:
+        m = re.search(pattern, text_low)
+        if m:
+            actions.append(f"{action}: {m.group(2).strip()}")
+
+    if not actions and any(k in text_low for k in ["remove", "cut", "trim", "delete", "add", "replace"]):
+        actions.append(f"edit: {text.strip()}")
+    return actions
 
 
 def process_ui_turn(
     user_input: str,
     current_state: Dict,
     analyzer_output: str,
-    api_key: str = None,  # Kept for compatibility with your app.py call
+    api_key: str = None,
 ) -> Dict:
-    # 1. Extraction Logic
-    extraction_prompt = (
-        "You will extract structured video requirements from a short user message.\n"
-        "Use ONLY information that is explicitly and clearly stated by the user "
-        "or in the analysis context. If something is not clearly specified, "
-        "you MUST set that field to null instead of guessing.\n\n"
-        "Field semantics:\n"
-        "- video_topic: short description of what the video is about.\n"
-        "- target_audience: who this is for.\n"
-        "- platform: main publishing platform (e.g. YouTube, TikTok).\n"
-        "- duration_seconds: numeric target runtime in seconds (e.g. 60, 90). "
-        "If user only says '1 minute', convert to 60.\n"
-        "- aspect_ratio: aspect ratio string like '16:9' or '9:16'.\n"
-        "- orientation: 'vertical', 'horizontal', or 'square'.\n"
-        "- tone: adjectives describing tone (e.g. 'playful', 'serious').\n"
-        "- pacing: description of pacing (e.g. 'fast cuts', 'slow and calm').\n"
-        "- style_reference: any reference shows, creators, brands, or examples.\n"
-        "- call_to_action: the main viewer action to encourage.\n"
-        "- branding: brand name and important brand notes.\n"
-        "- subtitles: subtitle preference (yes/no, language, style).\n"
-        "- deadline: when the video is needed.\n"
-        "- budget: any budget notes (string; you do not need to parse currency).\n\n"
-        f"User message: {user_input!r}\n"
-        f"Analysis context (may be empty): {analyzer_output}\n\n"
-        f"Return a JSON object with exactly these keys: {REQUIRED_FIELDS}.\n"
-        "For each key:\n"
-        "- If the value is clearly mentioned, copy it (and for duration_seconds, use a number in seconds).\n"
-        "- If it is not mentioned, or you are unsure, set it to null.\n"
-        "Do NOT invent brands, platforms, durations, deadlines, budgets, or other details.\n"
-    )
-    
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a STRICT data extractor. "
-                        "Output ONLY valid JSON, and NEVER hallucinate or guess values. "
-                        "Use null when information is missing."
-                    ),
-                },
-                {"role": "user", "content": extraction_prompt},
-            ],
-            model=MODEL_NAME,
-            response_format={"type": "json_object"},  # Ensures Groq sends valid JSON
-            temperature=0,
-        )
-        extracted_data = json.loads(chat_completion.choices[0].message.content)
-    except Exception as e:
-        print(f"Groq Extraction Error: {e}")
-        extracted_data = {}
+    state = _normalize_state(current_state)
 
-    # Merge data
+    # Always keep raw user request history.
+    state["user_requests"].append(user_input.strip())
+    for req in _extract_action_requests(user_input):
+        if req not in state["edit_requests"]:
+            state["edit_requests"].append(req)
+
+    extracted_data = {}
+    if client:
+        extraction_prompt = (
+            "Extract and normalize video preferences from the user message.\n"
+            "Use defaults if unclear; do not block on missing info.\n"
+            "Return a JSON object with keys:\n"
+            f"{REQUIRED_FIELDS}\n"
+            "Allowed intent_mode: video|shorts. Allowed refit_mode: crop|pad.\n"
+            "If a value is unknown, return null.\n\n"
+            f"Current state: {json.dumps(state, ensure_ascii=False)}\n"
+            f"Analyzer context: {analyzer_output}\n"
+            f"User message: {user_input}\n"
+        )
+        try:
+            completion = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You extract user preferences for a video editing assistant. Output JSON only.",
+                    },
+                    {"role": "user", "content": extraction_prompt},
+                ],
+                model=MODEL_NAME,
+                response_format={"type": "json_object"},
+                temperature=0.2,
+            )
+            extracted_data = json.loads(completion.choices[0].message.content)
+        except Exception as e:
+            print(f"Groq Extraction Error: {e}")
+
     for key in REQUIRED_FIELDS:
-        if key in extracted_data and extracted_data[key]:
-            current_state[key] = extracted_data[key]
+        val = extracted_data.get(key)
+        if val is not None and val != "":
+            state[key] = val
 
-    # 2. Check for missing fields
-    missing = [k for k in REQUIRED_FIELDS if current_state.get(k) is None]
+    # Normalize constrained values
+    if str(state.get("intent_mode", "")).lower() not in {"video", "shorts"}:
+        state["intent_mode"] = "video"
+    if str(state.get("refit_mode", "")).lower() not in {"crop", "pad"}:
+        state["refit_mode"] = "crop"
 
-    # 3. Handle Completion
-    if not missing:
-        report = _generate_final_report(current_state)
-        return {
-            "updated_state": current_state,
-            "next_message": "Perfect! I've gathered everything I need.",
-            "is_complete": True,
-            "final_report": report,
-        }
-
-    # 4. Generate next question
-    question_prompt = (
-        f"We are missing: {missing}. Current info: {json.dumps(current_state)}. "
-        "Ask a short, friendly question to get the next missing piece."
+    next_message = (
+        "Got it. I registered your request and updated the editing plan. "
+        "You can keep adding changes like remove/cut/trim/add, and I will keep tracking them."
     )
-    
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are a helpful video producer."},
-                {"role": "user", "content": question_prompt},
-            ],
-            model=MODEL_NAME,
-            temperature=0.7,
-        )
-        next_question = chat_completion.choices[0].message.content
-    except Exception as e:
-        print(f"Groq Text Error: {e}")
-        next_question = "I'm sorry, I hit a snag. Could you repeat that?"
+    if state["edit_requests"]:
+        latest = state["edit_requests"][-1]
+        next_message += f" Latest edit request: {latest}."
 
     return {
-        "updated_state": current_state,
-        "next_message": next_question,
+        "updated_state": state,
+        "next_message": next_message,
         "is_complete": False,
         "final_report": None,
     }
-
-
-def _generate_final_report(state: Dict) -> str:
-    try:
-        completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are a professional video editor."},
-                {
-                    "role": "user",
-                    "content": f"Create a brief from: {json.dumps(state)}",
-                },
-            ],
-            model=MODEL_NAME,
-        )
-        return completion.choices[0].message.content
-    except Exception:
-        return "Report generation failed."
-

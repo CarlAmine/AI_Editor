@@ -10,14 +10,11 @@ import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
 
-load_dotenv()
+from .google_auth import build_drive_service, format_google_auth_error, GoogleCredentialError
 
-# Configuration from .env
-gdrive_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+load_dotenv()
 
 
 class YouTubeClipper:
@@ -31,11 +28,12 @@ class YouTubeClipper:
     @staticmethod
     def _get_drive_service():
         """Authenticates using the Service Account JSON file."""
-        creds = service_account.Credentials.from_service_account_file(
-            gdrive_creds_path,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        return build("drive", "v3", credentials=creds)
+        try:
+            return build_drive_service(scopes=["https://www.googleapis.com/auth/drive"])
+        except GoogleCredentialError:
+            raise
+        except Exception as e:
+            raise GoogleCredentialError(format_google_auth_error(e)) from e
 
     @staticmethod
     def _parse_timestamp(timestamp_str: str) -> float:
