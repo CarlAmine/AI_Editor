@@ -46,34 +46,42 @@ It is **not a simple wrapper** around an LLM. It integrates:
 
 ```mermaid
 graph TD
-    User([User / Browser]) -->|Chat brief + source clips| FE[React Frontend]
-    FE -->|REST API calls| API[FastAPI Backend — app.py]
+    User(["User / Browser"])
+    FE["React Frontend\nVite + REST"]
+    API["FastAPI Backend\napp.py"]
+    CHAT["Chatbot Interface\nGroq LLM"]
+    BRIEF["Edit Brief JSON"]
+    ANA["Analyzer\nEasyOCR · PaddleOCR · SceneDetect"]
+    PLAN["Edit Plan JSON"]
+    RUNNER["Pipeline Runner\npipeline/runner.py"]
+    DL["Downloader\nyt-dlp · Google Drive"]
+    EDITOR["Editor Builder\nShotstack Timeline"]
+    OVERLAY["Overlay Planner"]
+    SHORTS["Shorts Converter"]
+    SHOTSTACK["Shotstack Render API"]
+    ARTIFACTS["Artifact Storage\ntmp/jobs/job_id/"]
+    UPLOAD["YouTube Uploader\nGoogle OAuth"]
+    GDRIVE["Google Drive"]
 
-    API --> CHAT[Chatbot Interface\nGroq LLM]
-    CHAT --> BRIEF[Edit Brief]
-
-    API --> ANA[Analyzer\nEasyOCR · PaddleOCR · SceneDetect]
-    ANA --> PLAN[Edit Plan JSON]
-
-    API --> RUNNER[Pipeline Runner\npipeline/runner.py]
+    User -->|"chat brief + clips"| FE
+    FE -->|"REST calls"| API
+    API --> CHAT
+    CHAT --> BRIEF
+    API --> ANA
+    ANA --> PLAN
     BRIEF --> RUNNER
     PLAN --> RUNNER
-
-    RUNNER --> STAGES{Stage Execution}
-    STAGES --> DL[Downloader\nyt-dlp · Google Drive]
-    STAGES --> EDITOR[Editor Builder\nShotstack Timeline]
-    STAGES --> OVERLAY[Overlay Planner]
-    STAGES --> SHORTS[Shorts Converter]
-
-    EDITOR -->|Render job| SHOTSTACK[Shotstack Render API]
-    SHOTSTACK -->|Rendered video URL| ARTIFACTS[Artifact Storage\ntmp/jobs/job_id/]
-
-    SHORTCUTS --> UPLOAD[YouTube Uploader\nGoogle OAuth]
+    API --> RUNNER
+    RUNNER --> DL
+    RUNNER --> EDITOR
+    RUNNER --> OVERLAY
+    RUNNER --> SHORTS
+    DL --> GDRIVE
+    EDITOR -->|"render job"| SHOTSTACK
+    SHOTSTACK -->|"video URL"| ARTIFACTS
+    SHORTS --> UPLOAD
     ARTIFACTS --> FE
     UPLOAD --> FE
-
-    DL --> GDRIVE[Google Drive]
-    DL --> YTDLP[YouTube / URL]
 ```
 
 ### Request Flow
@@ -83,6 +91,8 @@ graph TD
 3. **Pipeline runner** executes ordered stages: asset download → edit assembly → overlay planning → render submission.
 4. **Shotstack** renders the timeline; the backend polls for completion and stores the artifact.
 5. **Optional post-processing** converts the render to a 9:16 Short and uploads to YouTube.
+
+See [docs/architecture.md](docs/architecture.md) for a full module breakdown.
 
 ---
 
@@ -131,12 +141,14 @@ AI_Editor/
 ├── frontend/                 # React UI (Vite)
 │
 ├── docs/                     # Documentation
-│   ├── assets/               # Screenshots, demo GIF, architecture image
+│   ├── assets/               # Screenshots and demo GIF
+│   ├── releases/             # Release note drafts
 │   ├── API_EXAMPLES.md
 │   ├── DEPLOYMENT.md
 │   ├── PROJECT_STRUCTURE.md
 │   ├── SETUP_GUIDE.md
 │   ├── TROUBLESHOOTING.md
+│   ├── architecture.md
 │   └── pipeline_state.md
 │
 └── tests/
@@ -177,7 +189,7 @@ cp .env.example .env
 ```bash
 python app.py
 # API available at http://localhost:8000
-# Docs at http://localhost:8000/docs
+# Interactive docs at http://localhost:8000/docs
 ```
 
 ### 4 — Run the frontend
@@ -285,19 +297,16 @@ Test coverage:
 
 ## Performance & Benchmarks
 
-> 🚧 **Benchmarking section — to be populated with measured values.**
+> 🚧 Benchmarking data to be added. Run the pipeline on representative inputs and open a PR to fill in the table.
 
 | Metric | Value | Notes |
 |---|---|---|
-| Average job duration | TODO | End-to-end, reference → rendered artifact |
-| Shotstack render turnaround | TODO | Dependent on clip count and resolution |
-| OCR extraction latency | TODO | Per frame, GPU vs CPU |
-| Scene detection latency | TODO | Per minute of video |
-| Shorts conversion time | TODO | Post-render |
-| Pipeline success rate | TODO | Under normal load |
-| Max supported video length | TODO | Tested input duration |
-
-To contribute benchmark data, run the pipeline on representative inputs and open a PR updating this table.
+| Average job duration | — | End-to-end, reference → rendered artifact |
+| Shotstack render turnaround | — | Dependent on clip count and resolution |
+| OCR extraction latency | — | Per frame, GPU vs CPU |
+| Scene detection latency | — | Per minute of video |
+| Shorts conversion time | — | Post-render |
+| Pipeline success rate | — | Under normal load |
 
 ---
 
@@ -315,31 +324,26 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for workarounds.
 
 ## Roadmap
 
-### Short-term
-- [ ] Add structured logging and per-stage timing metrics
-- [ ] Improve Shotstack polling with exponential back-off
-- [ ] Add asset validation before pipeline start (format, duration, resolution checks)
+**Short-term**
+- [ ] Structured logging and per-stage timing metrics
+- [ ] Shotstack polling with exponential back-off
+- [ ] Asset validation before pipeline start
 - [ ] Expand test coverage to pipeline runner stages
-- [ ] Add CI workflow (GitHub Actions)
+- [ ] CI workflow (GitHub Actions)
 
-### Medium-term
-- [ ] Replace PaddleOCR with a lighter OCR backend option
+**Medium-term**
+- [ ] Lighter OCR backend option
 - [ ] Richer timeline editing UI (drag-and-drop, waveform preview)
-- [ ] Support additional rendering backends (Creatomate, Remotion)
-- [ ] Smarter shot selection using visual similarity scoring
-- [ ] Automated caption generation (Whisper integration)
+- [ ] Additional rendering backends (Creatomate, Remotion)
+- [ ] Smarter shot selection via visual similarity scoring
+- [ ] Automated caption generation (Whisper)
 - [ ] Task queue (Celery / RQ) for concurrent job isolation
-- [ ] Collaboration features (shared job links, comment threads)
 
 ---
 
 ## Deployment
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full deployment instructions including:
-- Docker-based local and server deployment
-- Environment variable management
-- Reverse proxy setup (nginx)
-- Shotstack production key configuration
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker-based deployment, reverse proxy setup, and production key configuration.
 
 ---
 
