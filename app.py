@@ -1,11 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 import shutil
 import os
 import re
 import json
+import time
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional, List
@@ -15,6 +16,12 @@ from ai_editor.pipeline import Assemble_Pipeline
 from ai_editor.chatbot_interface import process_ui_turn
 from ai_editor.youtube_clipper import YouTubeClipper
 from ai_editor.youtube_uploader import YouTubeUploader, YouTubeUploadError
+from ai_editor.google_auth import (
+    build_drive_service_oauth,
+    GoogleCredentialError,
+    resolve_drive_oauth_client_secret_path,
+    resolve_drive_token_path,
+)
 
 load_dotenv()
 
@@ -36,6 +43,8 @@ if HAS_STATIC:
 TMP_JOBS_DIR = os.path.join(os.path.dirname(__file__), "tmp", "jobs")
 os.makedirs(TMP_JOBS_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=TMP_JOBS_DIR), name="files")
+ROOT_DIR = os.path.dirname(__file__)
+DRIVE_OAUTH_PENDING = {}
 
 
 def _state_file_path(project_id: str) -> str:
@@ -91,6 +100,7 @@ class VideoSource(BaseModel):
     """Source video specification."""
     label: int
     url: str
+    start: Optional[float] = None
     segments: Optional[List[VideoSegment]] = None
 
 
@@ -102,6 +112,7 @@ class ProcessVideoURLRequest(BaseModel):
     music_mode: str = "original"  # "original" or "custom"
     custom_music_url: Optional[str] = None
     google_drive_link: Optional[str] = None
+    edit_mode: Optional[str] = None
     job_id: Optional[str] = None
     requirements_state: Optional[dict] = {}
 
@@ -179,16 +190,21 @@ async def process_video_url(request: ProcessVideoURLRequest):
             sources_list.append({
                 "label": source.label,
                 "url": source.url,
+                "start": source.start,
                 "segments": segments,
             })
         
+        requirements_state = dict(request.requirements_state or {})
+        if request.edit_mode and not requirements_state.get("edit_mode"):
+            requirements_state["edit_mode"] = request.edit_mode
+
         result = Assemble_Pipeline(
             primary_url=request.primary_url,
             sources=sources_list,
             prompt=request.prompt,
             music_mode=request.music_mode,
             custom_music_url=request.custom_music_url,
-            requirements_state=request.requirements_state or {},
+            requirements_state=requirements_state,
             job_id=request.job_id,
             gdrive_folder_id=folder_id,
         )
@@ -199,6 +215,85 @@ async def process_video_url(request: ProcessVideoURLRequest):
         import traceback
         traceback.print_exc()
         return {"success": False, "error": str(e)}
+
+
+@app.get("/google-drive/oauth/start")
+async def google_drive_oauth_start():
+    """Start OAuth login flow for Google Drive using server-configured client secret."""
+    try:
+        from google_auth_oauthlib.flow import Flow
+
+        client_secret_path = resolve_drive_oauth_client_secret_path()
+        redirect_uri = os.getenv("DRIVE_OAUTH_REDIRECT_URI", "http://localhost:10000/google-drive/oauth/callback")
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        flow = Flow.from_client_secrets_file(str(client_secret_path), scopes=scopes)
+        flow.redirect_uri = redirect_uri
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        DRIVE_OAUTH_PENDING[state] = {
+            "created_at": time.time(),
+            "redirect_uri": redirect_uri,
+            "code_verifier": getattr(flow, "code_verifier", None),
+        }
+        return {
+            "success": True,
+            "auth_url": auth_url,
+        }
+    except GoogleCredentialError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to start Google Drive OAuth: {str(e)}"}
+
+
+@app.get("/google-drive/oauth/callback")
+async def google_drive_oauth_callback(code: str, state: str):
+    """OAuth callback endpoint used by Google to exchange code for tokens."""
+    try:
+        from google_auth_oauthlib.flow import Flow
+
+        pending = DRIVE_OAUTH_PENDING.pop(state, None)
+        if not pending:
+            return HTMLResponse("<h3>Google Drive OAuth failed: invalid/expired state.</h3>", status_code=400)
+
+        client_secret_path = resolve_drive_oauth_client_secret_path()
+        token_path = resolve_drive_token_path()
+        os.environ["DRIVE_AUTH_MODE"] = "oauth_user"
+        os.environ["DRIVE_CLIENT_SECRET_FILE"] = str(client_secret_path)
+        os.environ["DRIVE_TOKEN_FILE"] = str(token_path)
+
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        flow = Flow.from_client_secrets_file(str(client_secret_path), scopes=scopes, state=state)
+        flow.redirect_uri = pending["redirect_uri"]
+        if pending.get("code_verifier"):
+            flow.code_verifier = pending["code_verifier"]
+        flow.fetch_token(code=code)
+        token_path.write_text(flow.credentials.to_json(), encoding="utf-8")
+
+        html = """
+        <html><body>
+          <h3>Google Drive connected successfully.</h3>
+          <p>You can close this tab and continue in AI Editor.</p>
+          <script>window.close();</script>
+        </body></html>
+        """
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"<h3>Google Drive OAuth failed: {str(e)}</h3>", status_code=400)
+
+
+@app.get("/google-drive/oauth/status")
+async def google_drive_oauth_status():
+    """Check whether a Drive OAuth token is connected and usable."""
+    try:
+        drive = build_drive_service_oauth(scopes=["https://www.googleapis.com/auth/drive"])
+        about = drive.about().get(fields="user").execute()
+        user_email = (about.get("user") or {}).get("emailAddress", "")
+        return {"connected": True, "email": user_email}
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
 
 
 # Legacy endpoint (kept for compatibility)

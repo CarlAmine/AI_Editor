@@ -14,6 +14,9 @@ class DriveStorageAdapter(StorageAdapter):
 
     def __init__(self):
         self.drive = build_drive_service(scopes=["https://www.googleapis.com/auth/drive"])
+        self.upload_folder_id = os.getenv("DRIVE_UPLOAD_FOLDER_ID")
+        self.upload_folder_name = os.getenv("DRIVE_UPLOAD_FOLDER_NAME", "AI-Editor-Shotstack-Assets")
+        self.upload_folder_parent_id = os.getenv("DRIVE_UPLOAD_FOLDER_PARENT_ID")
 
     @staticmethod
     def _direct_url(file_id: str) -> str:
@@ -25,6 +28,7 @@ class DriveStorageAdapter(StorageAdapter):
                 fileId=file_id,
                 body={"type": "anyone", "role": "reader"},
                 fields="id",
+                supportsAllDrives=True,
             ).execute()
         except Exception:
             pass
@@ -32,8 +36,14 @@ class DriveStorageAdapter(StorageAdapter):
     def list_videos(self, ref) -> List[AssetRef]:
         folder_id = str(ref)
         q = f"'{folder_id}' in parents and (mimeType contains 'video' or mimeType contains 'video/')"
-        resp = self.drive.files().list(q=q, fields="files(id,name,mimeType,webViewLink,webContentLink)").execute()
-        files = resp.get("files", [])
+        resp = self.drive.files().list(
+            q=q,
+            orderBy="name",
+            fields="files(id,name,mimeType,webViewLink,webContentLink)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = sorted(resp.get("files", []), key=lambda f: str(f.get("name") or "").lower())
         return [
             AssetRef(id=f["id"], name=f.get("name") or f"drive_{i+1}.mp4", backend=self.backend_name, raw=f)
             for i, f in enumerate(files)
@@ -41,7 +51,7 @@ class DriveStorageAdapter(StorageAdapter):
 
     def download(self, asset_ref: AssetRef, dst_path: str) -> str:
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-        request = self.drive.files().get_media(fileId=asset_ref.id)
+        request = self.drive.files().get_media(fileId=asset_ref.id, supportsAllDrives=True)
         with io.FileIO(dst_path, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, request)
             done = False
@@ -50,8 +60,45 @@ class DriveStorageAdapter(StorageAdapter):
         self._ensure_public(asset_ref.id)
         return dst_path
 
+    def _ensure_upload_folder(self) -> str:
+        if self.upload_folder_id:
+            return self.upload_folder_id
+
+        escaped = self.upload_folder_name.replace("'", "\\'")
+        q_parts = [
+            f"name = '{escaped}'",
+            "mimeType = 'application/vnd.google-apps.folder'",
+            "trashed = false",
+        ]
+        if self.upload_folder_parent_id:
+            q_parts.append(f"'{self.upload_folder_parent_id}' in parents")
+        query = " and ".join(q_parts)
+
+        resp = self.drive.files().list(
+            q=query,
+            pageSize=1,
+            fields="files(id,name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = resp.get("files", [])
+        if files:
+            self.upload_folder_id = files[0]["id"]
+            return self.upload_folder_id
+
+        body = {"name": self.upload_folder_name, "mimeType": "application/vnd.google-apps.folder"}
+        if self.upload_folder_parent_id:
+            body["parents"] = [self.upload_folder_parent_id]
+        created = self.drive.files().create(
+            body=body,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        self.upload_folder_id = created["id"]
+        return self.upload_folder_id
+
     def upload(self, local_path: str, dst_ref=None) -> AssetRef:
-        folder_id = str(dst_ref) if dst_ref else None
+        folder_id = str(dst_ref) if dst_ref else self._ensure_upload_folder()
         body = {"name": os.path.basename(local_path)}
         if folder_id:
             body["parents"] = [folder_id]
@@ -60,6 +107,7 @@ class DriveStorageAdapter(StorageAdapter):
             body=body,
             media_body=media,
             fields="id,name,mimeType,webViewLink,webContentLink",
+            supportsAllDrives=True,
         ).execute(num_retries=3)
         self._ensure_public(res["id"])
         return AssetRef(id=res["id"], name=res.get("name") or os.path.basename(local_path), backend=self.backend_name, raw=res)

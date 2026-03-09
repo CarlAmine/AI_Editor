@@ -10,6 +10,8 @@ def _normalize_detected_text(value: Any) -> str:
     if value is None:
         return ""
     txt = " ".join(str(value).split()).strip()
+    txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"\s*\|\s*", " | ", txt)
     txt = txt.strip("\"' ")
     txt = re.sub(r"\s*;\s*", " | ", txt)
     return txt
@@ -56,6 +58,7 @@ def _split_segment_by_scenes(segment: Dict[str, Any], scenes: List[Dict[str, Any
 def build_text_segments(
     analysis: Dict[str, Any],
     video_end: Optional[float] = None,
+    split_by_scenes: bool = True,
 ) -> Dict[str, Any]:
     warnings: List[Dict[str, Any]] = []
     keyframes = analysis.get("keyframes") or []
@@ -117,11 +120,12 @@ def build_text_segments(
             }
         )
 
-    # Split across scene boundaries.
-    split_segments: List[Dict[str, Any]] = []
-    for seg in segments:
-        split_segments.extend(_split_segment_by_scenes(seg, scenes))
-    segments = split_segments
+    if split_by_scenes:
+        # Split across scene boundaries.
+        split_segments: List[Dict[str, Any]] = []
+        for seg in segments:
+            split_segments.extend(_split_segment_by_scenes(seg, scenes))
+        segments = split_segments
 
     # Merge/extend very short segments.
     merged_count = 0
@@ -344,8 +348,11 @@ def build_overlay_plan(
     montage_mode: bool = False,
 ) -> Dict[str, Any]:
     warnings: List[Dict[str, Any]] = []
+    edit_mode = str(requirements.get("edit_mode", "scene")).lower().strip()
+    if edit_mode not in {"scene", "ocr"}:
+        edit_mode = "scene"
     script = _parse_overlay_script(requirements)
-    use_ocr = _wants_ocr_text(requirements) or not script
+    use_ocr = edit_mode == "ocr" or _wants_ocr_text(requirements) or not script
     overlays: List[Dict[str, Any]] = []
     segments: List[Dict[str, Any]] = []
 
@@ -377,7 +384,11 @@ def build_overlay_plan(
             }
         )
     else:
-        seg_data = build_text_segments(analysis, video_end=render_duration)
+        seg_data = build_text_segments(
+            analysis,
+            video_end=render_duration,
+            split_by_scenes=(edit_mode != "ocr"),
+        )
         segments = seg_data.get("segments", [])
         warnings.extend(seg_data.get("warnings", []))
     if segments:
@@ -414,7 +425,7 @@ def build_overlay_plan(
         "analysis_duration": analysis_duration,
         "render_duration": render_duration,
         "overlay_script": script,
-        "timing_mode": "clip_anchored" if montage_mode else ("ocr_keyframe" if use_ocr else "clip_anchored"),
+        "timing_mode": "ocr_timeline" if edit_mode == "ocr" else ("clip_anchored" if montage_mode else ("ocr_keyframe" if use_ocr else "clip_anchored")),
         "montage_mode": montage_mode,
     }
 
@@ -429,6 +440,7 @@ def build_timeline_plan(
         "scene_durations": scene_durations,
         "source_durations": source_durations,
         "intent_mode": requirements.get("intent_mode", "video"),
+        "edit_mode": requirements.get("edit_mode", "scene"),
     }
 
 
@@ -458,6 +470,9 @@ def build_render_spec(
             output_mode = "crop_to_9x16"
     if output_mode not in {"native_9x16", "crop_to_9x16"}:
         output_mode = "crop_to_9x16"
+    edit_mode = str(requirements.get("edit_mode", "scene")).lower().strip()
+    if edit_mode not in {"scene", "ocr"}:
+        edit_mode = "scene"
 
     if intent == "shorts" and output_mode == "crop_to_9x16":
         resolution = "1920x1080"
@@ -480,6 +495,7 @@ def build_render_spec(
         "overlay_plan": overlay_plan.get("overlays", []),
         "overlay_script": overlay_plan.get("overlay_script"),
         "timing_mode": overlay_plan.get("timing_mode", "ocr_keyframe"),
+        "edit_mode": edit_mode,
         "montage_mode": bool(overlay_plan.get("montage_mode", False)),
         "music_mode": audio_plan.get("music_mode", "original"),
         "soundtrack_url": audio_plan.get("soundtrack_url"),

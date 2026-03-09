@@ -49,3 +49,57 @@ def test_ocr_used_when_no_script():
     texts = [x.get("text", "") for x in plan["overlays"]]
     assert any("TOP 10" in t for t in texts)
     assert plan.get("timing_mode") == "ocr_keyframe"
+
+
+def test_edit_mode_ocr_uses_ocr_timeline_without_scene_split():
+    analysis = {
+        "scenes": [
+            {"start_time": 0.0, "end_time": 4.9},
+            {"start_time": 5.2, "end_time": 10.0},
+        ],
+        "keyframes": [
+            {"timestamp": 0.0, "detected_text": "HELLO"},
+            {"timestamp": 8.0, "detected_text": "WORLD"},
+        ],
+    }
+    plan = build_overlay_plan(
+        analysis=analysis,
+        requirements={"edit_mode": "ocr", "edit_requests": [], "user_requests": []},
+        summary="",
+        render_duration=10.0,
+        analysis_duration=10.0,
+        montage_mode=False,
+    )
+    assert plan.get("timing_mode") == "ocr_timeline"
+    segments = plan.get("text_segments") or []
+    assert len(segments) == 2
+    assert abs(float(segments[0]["start"]) - 0.0) < 1e-6
+    assert abs(float(segments[0]["end"]) - 8.0) < 1e-6
+
+
+def test_edit_mode_scene_keeps_scene_split_behavior():
+    analysis = {
+        "scenes": [
+            {"start_time": 0.0, "end_time": 4.9},
+            {"start_time": 5.2, "end_time": 10.0},
+        ],
+        "keyframes": [
+            {"timestamp": 0.0, "detected_text": "HELLO"},
+            {"timestamp": 8.0, "detected_text": "WORLD"},
+        ],
+    }
+    plan = build_overlay_plan(
+        analysis=analysis,
+        requirements={"edit_mode": "scene", "edit_requests": [], "user_requests": []},
+        summary="",
+        render_duration=10.0,
+        analysis_duration=10.0,
+        montage_mode=False,
+    )
+    segments = plan.get("text_segments") or []
+    # Scene mode keeps existing scene-boundary splitting.
+    assert len(segments) == 3
+    assert abs(float(segments[0]["start"]) - 0.0) < 1e-6
+    assert abs(float(segments[0]["end"]) - 4.9) < 1e-6
+    assert abs(float(segments[1]["start"]) - 5.2) < 1e-6
+    assert abs(float(segments[1]["end"]) - 8.0) < 1e-6

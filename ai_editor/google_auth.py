@@ -11,6 +11,12 @@ DEFAULT_CREDENTIAL_FILENAMES = [
     "google-service-account.json",
 ]
 
+DEFAULT_DRIVE_OAUTH_CLIENT_FILENAMES = [
+    "drive-oauth-client-secret.json",
+    "drive-client-secret.json",
+    "client_secret.json",
+]
+
 
 class GoogleCredentialError(Exception):
     """Raised when Google credential resolution/validation fails."""
@@ -48,6 +54,31 @@ def resolve_google_credentials_path() -> Path:
         "Google credentials not configured. Set GOOGLE_APPLICATION_CREDENTIALS in .env "
         f"or place a service-account key in repo root named one of: {expected}"
     )
+
+
+def resolve_drive_oauth_client_secret_path() -> Path:
+    env_path = os.getenv("DRIVE_CLIENT_SECRET_FILE")
+    if env_path:
+        resolved = Path(env_path).expanduser().resolve()
+        if not resolved.exists():
+            raise GoogleCredentialError(f"DRIVE_CLIENT_SECRET_FILE points to a missing file: {resolved}")
+        return resolved
+
+    root = _repo_root()
+    for name in DEFAULT_DRIVE_OAUTH_CLIENT_FILENAMES:
+        candidate = root / name
+        if candidate.exists():
+            return candidate.resolve()
+
+    expected = ", ".join(DEFAULT_DRIVE_OAUTH_CLIENT_FILENAMES)
+    raise GoogleCredentialError(
+        "Drive OAuth client secret not found. Set DRIVE_CLIENT_SECRET_FILE or add one of: "
+        f"{expected}. Create OAuth Client ID (Desktop app) in Google Cloud Console."
+    )
+
+
+def resolve_drive_token_path() -> Path:
+    return Path(os.getenv("DRIVE_TOKEN_FILE", str(_repo_root() / "drive-token.json"))).expanduser().resolve()
 
 
 def validate_service_account_json(credentials_path: Path) -> dict:
@@ -91,10 +122,23 @@ def validate_service_account_json(credentials_path: Path) -> dict:
 
 
 def build_drive_service(scopes: Optional[List[str]] = None):
-    """
-    Build Google Drive service with validated service-account credentials.
-    Raises GoogleCredentialError for actionable setup problems.
-    """
+    """Build Google Drive service using OAuth user flow by default."""
+    return _build_drive_service_by_mode(scopes=scopes, auth_mode=None)
+
+
+def _build_drive_service_by_mode(scopes: Optional[List[str]] = None, auth_mode: Optional[str] = None):
+    scopes = scopes or ["https://www.googleapis.com/auth/drive.readonly"]
+    mode = (auth_mode or os.getenv("DRIVE_AUTH_MODE", "oauth_user")).strip().lower()
+    if mode in {"oauth", "oauth_user", "user"}:
+        return build_drive_service_oauth(scopes=scopes)
+    if mode in {"service_account", "service-account", "sa"}:
+        return build_drive_service_service_account(scopes=scopes)
+    raise GoogleCredentialError(
+        f"Invalid DRIVE_AUTH_MODE='{mode}'. Expected oauth_user or service_account."
+    )
+
+
+def build_drive_service_service_account(scopes: Optional[List[str]] = None):
     scopes = scopes or ["https://www.googleapis.com/auth/drive.readonly"]
     credentials_path = resolve_google_credentials_path()
     validate_service_account_json(credentials_path)
@@ -116,6 +160,38 @@ def build_drive_service(scopes: Optional[List[str]] = None):
         return build("drive", "v3", credentials=creds)
     except Exception as e:
         raise GoogleCredentialError(format_google_auth_error(e)) from e
+
+
+def build_drive_service_oauth(scopes: Optional[List[str]] = None):
+    scopes = scopes or ["https://www.googleapis.com/auth/drive.readonly"]
+    token_file = resolve_drive_token_path()
+
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+    except ModuleNotFoundError as e:
+        raise GoogleCredentialError(
+            "Google OAuth dependencies are missing. Install with: "
+            "pip install google-auth-oauthlib google-api-python-client"
+        ) from e
+
+    creds = None
+    if token_file.exists():
+        creds = Credentials.from_authorized_user_file(str(token_file), scopes)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token_file.write_text(creds.to_json(), encoding="utf-8")
+        else:
+            resolve_drive_oauth_client_secret_path()
+            raise GoogleCredentialError(
+                "Drive OAuth not connected. Click 'Connect Google Drive' in the UI and finish login."
+            )
+
+    print(f"[google-auth] Using Drive OAuth user token at {token_file}")
+    return build("drive", "v3", credentials=creds)
 
 
 def format_google_auth_error(exc: Exception) -> str:

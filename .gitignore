@@ -7,6 +7,10 @@ service-account.json
 service_account.json
 google-service-account.json
 credentials.json
+drive-oauth-client-secret.json
+drive-client-secret.json
+drive-token.json
+token.json
 youtube-client-secret.json
 youtube-token.json
 secrets/

@@ -85,7 +85,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
     } catch (err: any) {
       appendMessage(
         "assistant",
-        err?.message || "Something went wrong talking to the chat endpoint."
+        err?.message || "Something went wrong while contacting the chat endpoint."
       );
     } finally {
       setIsLoading(false);
@@ -95,7 +95,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2 className="panel-title">2. Brief With the Producer</h2>
+        <h2 className="panel-title">2. Brief the Assistant</h2>
         <p className="panel-caption">
           Refine the creative brief through a short conversation. The assistant
           tracks requirements and produces a final written brief.
@@ -107,7 +107,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
           <div className="chat-empty">
             <p>
               Start by telling the assistant what kind of video you&apos;re
-              creating — for example:
+              creating, for example:
             </p>
             <ul>
               <li>
@@ -137,7 +137,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
         {isLoading && (
           <div className="chat-bubble">
             <span className="chat-author">Assistant</span>
-            <p className="chat-text">Thinking…</p>
+            <p className="chat-text">Thinking...</p>
           </div>
         )}
       </div>
@@ -145,7 +145,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
       <form className="chat-input-row" onSubmit={handleSubmit}>
         <input
           className="field-input chat-input"
-          placeholder="Type your next message…"
+          placeholder="Type your next message..."
           value={input}
           onChange={(e) => setInput(e.target.value)}
         />
@@ -160,7 +160,7 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
           className="btn btn-ghost"
           onClick={() => setShowState((v) => !v)}
         >
-          {showState ? "Hide collected fields" : "Show collected fields"}
+          {showState ? "Hide Collected Fields" : "Show Collected Fields"}
         </button>
         {showState && (
           <pre className="state-preview">
@@ -178,4 +178,3 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
     </section>
   );
 };
-

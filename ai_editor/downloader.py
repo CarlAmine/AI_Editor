@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
 import json
+from urllib.parse import urlparse
 
 
 class VideoDownloadError(Exception):
@@ -22,6 +23,132 @@ class VideoDownloadError(Exception):
 class VideoClapError(Exception):
     """Raised when video clipping fails."""
     pass
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(str(url)).netloc or "").lower()
+    except Exception:
+        return False
+    return any(
+        h in host
+        for h in [
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "www.youtu.be",
+        ]
+    )
+
+
+def _format_hms(seconds: float) -> str:
+    total = max(0.0, float(seconds))
+    h = int(total // 3600)
+    m = int((total % 3600) // 60)
+    s = total - (h * 3600 + m * 60)
+    # Keep millisecond precision so cuts can be accurate.
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _find_download_output(expected_path: str) -> str:
+    if os.path.exists(expected_path):
+        return expected_path
+    base, _ext = os.path.splitext(expected_path)
+    parent = os.path.dirname(expected_path) or "."
+    prefix = os.path.basename(base)
+    candidates = [
+        os.path.join(parent, name)
+        for name in os.listdir(parent)
+        if name.startswith(prefix + ".")
+    ]
+    if not candidates:
+        raise VideoDownloadError(f"Downloaded clip not found: {expected_path}")
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
+def _run_yt_dlp_command(cmd: List[str]) -> Optional[str]:
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return None
+    except subprocess.CalledProcessError as e:
+        return e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr)
+    except FileNotFoundError as e:
+        raise VideoDownloadError("yt-dlp not found. Install with: pip install yt-dlp") from e
+
+
+def download_video_section(
+    url: str,
+    output_dir: str,
+    filename: str,
+    start_time: float,
+    end_time: float,
+) -> str:
+    """
+    Download only the requested section from a YouTube URL using yt-dlp/ffmpeg seek.
+    Falls back to caller-managed logic if this fails.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    duration = float(end_time) - float(start_time)
+    if duration <= 0:
+        raise VideoDownloadError("End time must be greater than start time for section download.")
+
+    output_path = os.path.join(output_dir, filename)
+    section = f"*{_format_hms(start_time)}-{_format_hms(end_time)}"
+    section_mode = str(os.getenv("YTDLP_SECTION_MODE", "fast")).strip().lower()
+    print(
+        f"[downloader] Section download via yt-dlp: {url} "
+        f"{start_time:.3f}s-{end_time:.3f}s -> {output_path}"
+    )
+
+    attempts = []
+    if section_mode != "accurate":
+        attempts.append((
+            "fast",
+            [
+                "yt-dlp",
+                "--no-playlist",
+                "-f", "b[ext=mp4]/b",
+                "--download-sections", section,
+                "-o", output_path,
+                url,
+            ],
+        ))
+    attempts.append((
+        "accurate",
+        [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--download-sections", section,
+            "--force-keyframes-at-cuts",
+            "-o", output_path,
+            url,
+        ],
+    ))
+
+    last_error = None
+    for mode_name, cmd in attempts:
+        print(f"[downloader] Trying {mode_name} section mode")
+        last_error = _run_yt_dlp_command(cmd)
+        if last_error is None:
+            break
+        print(f"[downloader] {mode_name} section mode failed, falling back")
+    if last_error is not None:
+        raise VideoDownloadError(f"yt-dlp section download failed: {last_error}")
+
+    resolved_path = _find_download_output(output_path)
+    probe = _probe_media(resolved_path)
+    if not probe["has_video"]:
+        raise VideoDownloadError(f"Section clip has no video stream: {resolved_path}")
+    file_size_mb = os.path.getsize(resolved_path) / (1024 * 1024)
+    print(
+        f"✓ Section clip created: {resolved_path} ({file_size_mb:.1f} MB, {duration:.1f}s) "
+        f"| has_audio={probe['has_audio']}"
+    )
+    return resolved_path
 
 
 def _probe_media(path: str) -> Dict:
@@ -92,6 +219,7 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None) ->
 
         cmd = [
             "yt-dlp",
+            "--no-playlist",
             "-f", "bv*+ba/b",  # Prefer best video+audio, fallback to best combined
             "--merge-output-format",
             "mp4",
@@ -305,22 +433,20 @@ def download_and_clip(
                     "clips": [],
                 }
 
-            # Download video once per unique URL
-            if url not in downloaded_videos:
-                try:
-                    video_path = download_video(url, output_dir, f"download_{label}.mp4")
-                    downloaded_videos[url] = video_path
-                except VideoDownloadError as e:
-                    return {
-                        "success": False,
-                        "error": f"Failed to download {url}: {str(e)}",
-                        "clips": [],
-                    }
-
-            video_path = downloaded_videos[url]
-
             # If no segments specified, use the whole video
             if not segments:
+                # Download video once per unique URL
+                if url not in downloaded_videos:
+                    try:
+                        video_path = download_video(url, output_dir, f"download_{label}.mp4")
+                        downloaded_videos[url] = video_path
+                    except VideoDownloadError as e:
+                        return {
+                            "success": False,
+                            "error": f"Failed to download {url}: {str(e)}",
+                            "clips": [],
+                        }
+                video_path = downloaded_videos[url]
                 clips.append({
                     "label": label,
                     "segment": 0,
@@ -346,7 +472,38 @@ def download_and_clip(
                     clip_path = os.path.join(output_dir, clip_filename)
 
                     try:
-                        clipped_path = clip_video(video_path, clip_path, start, end)
+                        if _is_youtube_url(url):
+                            # Fast path: directly ask yt-dlp/ffmpeg to download only the time range.
+                            clipped_path = download_video_section(
+                                url=url,
+                                output_dir=output_dir,
+                                filename=clip_filename,
+                                start_time=float(start),
+                                end_time=float(end),
+                            )
+                        else:
+                            raise VideoDownloadError("non-youtube")
+                    except VideoDownloadError:
+                        # Fallback path: full download once + local ffmpeg clipping.
+                        if url not in downloaded_videos:
+                            try:
+                                video_path = download_video(url, output_dir, f"download_{label}.mp4")
+                                downloaded_videos[url] = video_path
+                            except VideoDownloadError as e:
+                                return {
+                                    "success": False,
+                                    "error": f"Failed to download {url}: {str(e)}",
+                                    "clips": [],
+                                }
+                        video_path = downloaded_videos[url]
+                        try:
+                            clipped_path = clip_video(video_path, clip_path, start, end)
+                        except VideoClapError as e:
+                            return {
+                                "success": False,
+                                "error": f"Failed to clip segment {segment_idx} of label {label}: {str(e)}",
+                                "clips": [],
+                            }
                     except VideoClapError as e:
                         return {
                             "success": False,

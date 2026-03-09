@@ -1,4 +1,4 @@
-import React, { useState, FormEvent, ChangeEvent } from "react";
+import React, { useState, FormEvent } from "react";
 
 type Props = {
   apiBase: string;
@@ -43,6 +43,8 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   onAnalyzerSummary,
   currentState = {},
 }) => {
+  const normalizeSourceUrl = (value: string): string => value.trim().toLowerCase();
+
   const [primaryUrl, setPrimaryUrl] = useState("");
   const [sources, setSources] = useState<VideoSource[]>([]);
   const [newSourceUrl, setNewSourceUrl] = useState("");
@@ -62,6 +64,9 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   const [isUploadingYouTube, setIsUploadingYouTube] = useState(false);
   const [youtubeUploadResult, setYoutubeUploadResult] = useState<YouTubeUploadResult | null>(null);
   const [bulkSourceSpec, setBulkSourceSpec] = useState("");
+  const [isConnectingDriveOauth, setIsConnectingDriveOauth] = useState(false);
+  const [driveOauthEmail, setDriveOauthEmail] = useState<string | null>(null);
+  const [driveOauthMessage, setDriveOauthMessage] = useState<string | null>(null);
 
   // Add a new source to the list
   const handleAddSource = () => {
@@ -145,11 +150,32 @@ export const VideoPipelinePanel: React.FC<Props> = ({
     setResult(null);
     setYoutubeUploadResult(null);
 
+    const parsedBulkSources = parseBulkSources(bulkSourceSpec);
+    const bulkUrlsWithSegments = new Set(
+      parsedBulkSources
+        .filter((source) => (source.segments?.length || 0) > 0)
+        .map((source) => normalizeSourceUrl(source.url))
+    );
+    const filteredManualSources = sources.filter((source) => {
+      const hasSegments = (source.segments?.length || 0) > 0;
+      if (hasSegments) {
+        return true;
+      }
+      return !bulkUrlsWithSegments.has(normalizeSourceUrl(source.url));
+    });
+    const combinedSources = [
+      ...filteredManualSources,
+      ...parsedBulkSources.map((s, idx) => ({
+        ...s,
+        label: filteredManualSources.length + idx + 1,
+      })),
+    ];
+
     if (!primaryUrl.trim()) {
       setError("Please provide the primary video URL for analysis.");
       return;
     }
-    if (sources.length === 0 && !googleDriveLink.trim()) {
+    if (combinedSources.length === 0 && !googleDriveLink.trim()) {
       setError("Please add at least one source video or provide a Google Drive folder link.");
       return;
     }
@@ -162,15 +188,6 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       setError("Please provide a custom music URL or select 'Use original audio'.");
       return;
     }
-
-    const parsedBulkSources = parseBulkSources(bulkSourceSpec);
-    const combinedSources = [
-      ...sources,
-      ...parsedBulkSources.map((s, idx) => ({
-        ...s,
-        label: sources.length + idx + 1,
-      })),
-    ];
 
     const payload = {
       primary_url: primaryUrl.trim(),
@@ -281,6 +298,65 @@ export const VideoPipelinePanel: React.FC<Props> = ({
     }
   };
 
+  const handleConnectDriveOauth = async () => {
+    setError(null);
+    setDriveOauthMessage(null);
+    setDriveOauthEmail(null);
+    setIsConnectingDriveOauth(true);
+    try {
+      const response = await fetch(`${apiBase}/google-drive/oauth/start`, {
+        method: "GET",
+      });
+      const data = await response.json();
+      if (!response.ok || data.success === false) {
+        setError(data.error || "Failed to start Google Drive OAuth.");
+        return;
+      }
+      if (!data.auth_url) {
+        setError("No Google OAuth URL was returned by backend.");
+        return;
+      }
+      const popup = window.open(data.auth_url, "_blank", "width=520,height=720");
+      if (!popup) {
+        setError("Popup blocked. Please allow popups and try again.");
+        return;
+      }
+      setDriveOauthMessage("Google sign-in opened. Finish login, then connection status will update.");
+      for (let i = 0; i < 45; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const statusRes = await fetch(`${apiBase}/google-drive/oauth/status`);
+        const statusData = await statusRes.json();
+        if (statusData.connected) {
+          setDriveOauthEmail(statusData.email || null);
+          setDriveOauthMessage("Google Drive connected successfully.");
+          return;
+        }
+      }
+      setDriveOauthMessage("Login not completed yet. You can click 'Check Google Drive Status'.");
+    } catch (err: any) {
+      setError(err?.message || "Network error while starting Google Drive OAuth.");
+    } finally {
+      setIsConnectingDriveOauth(false);
+    }
+  };
+
+  const handleCheckDriveOauthStatus = async () => {
+    setError(null);
+    try {
+      const response = await fetch(`${apiBase}/google-drive/oauth/status`);
+      const data = await response.json();
+      if (data.connected) {
+        setDriveOauthEmail(data.email || null);
+        setDriveOauthMessage("Google Drive connected successfully.");
+      } else {
+        setDriveOauthEmail(null);
+        setDriveOauthMessage("Google Drive is not connected yet.");
+      }
+    } catch (err: any) {
+      setError(err?.message || "Network error while checking Google Drive OAuth status.");
+    }
+  };
+
   const parseBulkSources = (input: string): VideoSource[] => {
     const lines = input
       .split(/\r?\n/)
@@ -340,10 +416,10 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2 className="panel-title">1. Auto‑Edit Your Video</h2>
+        <h2 className="panel-title">1. Build Your Edit</h2>
         <p className="panel-caption">
-          Provide YouTube/TikTok URLs, curate clips with timestamps, and render
-          a polished edit.
+          Add the reference video, define source footage, and render a polished
+          edit from one workspace.
         </p>
       </header>
 
@@ -351,7 +427,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         {/* Primary URL for analysis */}
         <label className="field">
           <span className="field-label">
-            Primary Video URL (for analysis)
+            Reference Video URL
           </span>
           <input
             type="text"
@@ -367,23 +443,23 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
         {/* Source Videos Section */}
         <fieldset className="field-fieldset">
-          <legend className="field-legend">Source Videos</legend>
+          <legend className="field-legend">Source Footage</legend>
 
           {/* Add new source */}
           <div className="field">
-            <span className="field-label">Add Source Video</span>
+            <span className="field-label">Add a Single Source</span>
             <div className="field-group">
               <input
                 type="text"
                 className="field-input"
-                placeholder="Video URL"
+                placeholder="Source video URL"
                 value={newSourceUrl}
                 onChange={(e) => setNewSourceUrl(e.target.value)}
               />
               <input
                 type="text"
                 className="field-input"
-                placeholder="Segments (e.g. 10-20, 30-45)"
+                placeholder="Segments (for example: 10-20, 30-45)"
                 value={newSourceSegments}
                 onChange={(e) => setNewSourceSegments(e.target.value)}
               />
@@ -396,15 +472,15 @@ export const VideoPipelinePanel: React.FC<Props> = ({
               </button>
             </div>
             <p className="field-hint">
-              Leave segments empty to use the entire video. Format: start-end in
-              seconds (comma-separated).
+              Leave segments empty to use the entire source. Use `start-end` in
+              seconds, separated by commas.
             </p>
           </div>
 
           {/* List of sources */}
           {sources.length > 0 && (
             <div className="sources-list">
-              <p className="field-label">Ordered Sources (Final Render Order):</p>
+              <p className="field-label">Ordered Sources</p>
               {sources.map((source, idx) => (
                 <div key={idx} className="source-item">
                   <div className="source-info">
@@ -436,7 +512,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
                       className="button button-mini"
                       title="Move up"
                     >
-                      ↑
+                      Up
                     </button>
                     <button
                       type="button"
@@ -445,7 +521,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
                       className="button button-mini"
                       title="Move down"
                     >
-                      ↓
+                      Down
                     </button>
                     <button
                       type="button"
@@ -453,7 +529,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
                       className="button button-mini button-danger"
                       title="Remove"
                     >
-                      ✕
+                      Remove
                     </button>
                   </div>
                 </div>
@@ -463,7 +539,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         </fieldset>
 
         <label className="field">
-          <span className="field-label">Batch YouTube Sources</span>
+          <span className="field-label">Bulk Source Import</span>
           <textarea
             className="field-input field-textarea"
             placeholder={`https://www.youtube.com/watch?v=abcDEF - 10-20, 35-45\nhttps://youtu.be/xyz123 - 0:15-0:45`}
@@ -472,8 +548,39 @@ export const VideoPipelinePanel: React.FC<Props> = ({
             onChange={(e) => setBulkSourceSpec(e.target.value)}
           />
           <p className="field-hint">
-            One entry per line. Format: <code>URL - start-end, start-end</code> (timestamps in seconds or HH:MM:SS).
+            One source per line. Format: <code>URL - start-end, start-end</code>.
+            Timestamps can be in seconds or <code>HH:MM:SS</code>.
           </p>
+        </label>
+
+        <label className="field">
+          <span className="field-label">Google Drive Connection</span>
+          <div className="field-group">
+            <button
+              type="button"
+              className="button button-secondary"
+              disabled={isConnectingDriveOauth}
+              onClick={handleConnectDriveOauth}
+            >
+              {isConnectingDriveOauth ? "Connecting..." : "Connect Google Drive"}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={handleCheckDriveOauthStatus}
+            >
+              Check Google Drive Status
+            </button>
+          </div>
+          <p className="field-hint">
+            Connect your Google account if you want to load source files from Drive.
+          </p>
+          {driveOauthMessage && (
+            <p className="field-hint">
+              {driveOauthMessage}
+              {driveOauthEmail ? ` Connected as: ${driveOauthEmail}` : ""}
+            </p>
+          )}
         </label>
 
         <label className="field">
@@ -489,13 +596,14 @@ export const VideoPipelinePanel: React.FC<Props> = ({
             }}
           />
           <p className="field-hint">
-            Optional alternative to source URLs. If provided, videos will be loaded from that Drive folder.
+            Optional alternative to source URLs. If provided, source videos will
+            be loaded from this folder.
           </p>
         </label>
 
-        {/* Editing Description */}
+        {/* Edit Brief */}
         <label className="field">
-          <span className="field-label">Editing Description</span>
+          <span className="field-label">Edit Brief</span>
           <textarea
             className="field-input field-textarea"
             placeholder="e.g. Create a 30s vertical highlight reel with upbeat pacing and bold captions."
@@ -565,14 +673,14 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         <div className={`alert ${result.success ? "alert-success" : "alert-error"}`}>
           {result.success ? (
             <>
-              <strong>✓ Success!</strong> Your video is ready:{" "}
+              <strong>Success:</strong> Your video is ready:{" "}
               <a href={result.preview_url || result.url} target="_blank" rel="noopener noreferrer">
                 {result.preview_url || result.url}
               </a>
             </>
           ) : (
             <>
-              <strong>✗ Error:</strong> {result.error}
+              <strong>Error:</strong> {result.error}
             </>
           )}
         </div>
@@ -586,9 +694,9 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
       {result?.success && (result.preview_url || result.url) && (
         <div className="youtube-upload-card">
-          <h3 className="panel-title">2. Approve & Upload to YouTube</h3>
+          <h3 className="panel-title">2. Review and Upload</h3>
           <p className="field-hint">
-            Review the rendered video, then approve and upload.
+            Review the rendered video, then approve it before sending it to YouTube.
           </p>
           <a
             href={result.preview_url || result.url}
@@ -648,12 +756,12 @@ export const VideoPipelinePanel: React.FC<Props> = ({
             disabled={isUploadingYouTube || !isApprovedForYouTube}
             onClick={handleUploadToYouTube}
           >
-            {isUploadingYouTube ? "Uploading to YouTube..." : "Upload Approved Video to YouTube"}
+            {isUploadingYouTube ? "Uploading to YouTube..." : "Upload to YouTube"}
           </button>
 
           {youtubeUploadResult?.success && youtubeUploadResult.youtube_url && (
             <div className="alert alert-success">
-              <strong>Uploaded!</strong>{" "}
+              <strong>Uploaded:</strong>{" "}
               <a href={youtubeUploadResult.youtube_url} target="_blank" rel="noopener noreferrer">
                 {youtubeUploadResult.youtube_url}
               </a>
@@ -664,4 +772,5 @@ export const VideoPipelinePanel: React.FC<Props> = ({
     </section>
   );
 };
+
 

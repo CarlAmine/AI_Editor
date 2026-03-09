@@ -17,23 +17,23 @@ export const App: React.FC = () => {
           <h1 className="app-title">AI Editor Studio</h1>
           <p className="app-subtitle">
             Analyze raw footage, capture requirements, and render polished edits
-            — all from one interface.
+            from one interface.
           </p>
         </div>
         <div className="app-badge-row">
-          <span className="app-badge">FastAPI · React · Groq · Shotstack</span>
+          <span className="app-badge">FastAPI | React | Groq | Shotstack</span>
         </div>
       </header>
 
       <main className="app-main">
         <section className="app-grid">
-          <VideoPipelinePanel 
-            apiBase={apiBase} 
+          <VideoPipelinePanel
+            apiBase={apiBase}
             onAnalyzerSummary={setAnalyzerOutput}
             currentState={currentState}
           />
-          <ChatPanel 
-            apiBase={apiBase} 
+          <ChatPanel
+            apiBase={apiBase}
             analyzerOutput={analyzerOutput}
             onStateUpdate={setCurrentState}
           />
@@ -48,4 +48,3 @@ export const App: React.FC = () => {
 };
 
 export default App;
-

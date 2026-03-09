@@ -361,6 +361,7 @@ def create_and_render_video(
     debug_text_visibility: bool = False,
     debug_render_spec_path: Optional[str] = None,
     debug_overlay_timing_path: Optional[str] = None,
+    debug_shotstack_payload_path: Optional[str] = None,
 ) -> Dict:
     """
     Pipeline function to assemble clips, add text/music, and render a video using Shotstack.
@@ -419,6 +420,7 @@ def create_and_render_video(
         url: str
         duration: float = 5.0
         start_time: float = 0.0
+        trim_start: float = 0.0
 
     @dataclass
     class TextOverlay:
@@ -515,7 +517,8 @@ def create_and_render_video(
     print(f"Initializing Project: {project_title}")
 
     use_reference_mimic = str(generation_mode).lower() == "reference_mimic_mode"
-    if use_reference_mimic and not canonical_timeline:
+    use_canonical_timeline = bool(canonical_timeline)
+    if use_reference_mimic and not use_canonical_timeline:
         return {
             "success": False,
             "error": "reference_mimic_mode requires canonical_timeline; refusing heuristic timing fallback.",
@@ -523,16 +526,24 @@ def create_and_render_video(
 
     # NEW: Dynamically fetch durations unless strict timeline is provided.
     clips = []
-    if use_reference_mimic and canonical_timeline:
+    if use_canonical_timeline and canonical_timeline:
         for row in canonical_timeline:
             src = str(row.get("video_src", "")).strip()
             dur = float(row.get("duration", 0.0))
+            trim_start = float(row.get("trim", 0.0) or 0.0)
             if not src or dur <= 0:
                 return {
                     "success": False,
                     "error": f"Invalid canonical_timeline row (missing src/duration): {row}",
                 }
-            clips.append(VideoClip(url=src, duration=dur, start_time=float(row.get("start", 0.0))))
+            clips.append(
+                VideoClip(
+                    url=src,
+                    duration=dur,
+                    start_time=float(row.get("start", 0.0)),
+                    trim_start=max(0.0, trim_start),
+                )
+            )
         clips.sort(key=lambda c: float(c.start_time))
     else:
         for i, url in enumerate(video_urls):
@@ -545,7 +556,7 @@ def create_and_render_video(
             actual_duration = get_video_duration(api_key, probe_url)
             clips.append(VideoClip(url=url, duration=actual_duration))
 
-    if use_reference_mimic and clips:
+    if use_canonical_timeline and clips:
         total_video_duration = max(float(c.start_time) + float(c.duration) for c in clips)
     else:
         total_video_duration = sum(c.duration for c in clips)
@@ -558,14 +569,21 @@ def create_and_render_video(
     # Priority 2: Fall back to evenly-spaced overlays based on overlay_text.
     text_overlays: List[TextOverlay] = []
 
-    if use_reference_mimic and overlay_timing:
-        for item in sorted(overlay_timing, key=lambda o: float(o.get("start", 0.0))):
-            start = float(item.get("start", 0.0))
-            end = float(item.get("end", start))
-            text = str(item.get("text", "")).strip() or " "
-            duration = max(0.0, end - start)
+    if use_canonical_timeline and canonical_timeline:
+        # Strict canonical policy: overlay timing must match canonical timeline exactly.
+        # Ignore heuristic/legacy timing sources (overlay_timing/overlay_plan) in this mode.
+        overlay_texts = [str(row.get("text", "")).strip() for row in canonical_timeline]
+        if not any(overlay_texts) and overlay_timing:
+            for i, item in enumerate(sorted(overlay_timing, key=lambda o: float(o.get("start", 0.0)))):
+                if i >= len(overlay_texts):
+                    break
+                overlay_texts[i] = str(item.get("text", "")).strip()
+        for i, row in enumerate(canonical_timeline):
+            start = float(row.get("start", 0.0))
+            duration = float(row.get("duration", row.get("length", 0.0)))
             if duration <= 0:
                 continue
+            text = overlay_texts[i] if i < len(overlay_texts) and overlay_texts[i] else " "
             text_overlays.append(
                 TextOverlay(
                     text=text,
@@ -687,22 +705,20 @@ def create_and_render_video(
     video_clip_specs = []
     current_time = 0.0
     for i, clip in enumerate(clips):
-        start_time = float(clip.start_time) if use_reference_mimic else float(current_time)
+        start_time = float(clip.start_time) if use_canonical_timeline else float(current_time)
         video_clip_specs.append(
             {
-                "asset": {"type": "video", "src": clip.url, "trim": 0.0},
+                "asset": {"type": "video", "src": clip.url, "trim": float(clip.trim_start)},
                 "start": start_time,
                 "length": float(clip.duration),
                 "fit": "cover",
                 "position": "center",
-                "transition": None if use_reference_mimic else _get_transition(i, len(clips)),
+                "transition": None if use_canonical_timeline else _get_transition(i, len(clips)),
             }
         )
-        if mute_source_audio:
-            video_clip_specs[-1]["volume"] = 0.0
         current_time += float(clip.duration)
 
-    if use_reference_mimic and canonical_timeline and not text_overlays:
+    if use_canonical_timeline and canonical_timeline and not text_overlays:
         for row in canonical_timeline:
             text = str(row.get("text", "")).strip() or " "
             start = float(row.get("text_start", row.get("start", 0.0)))
@@ -719,7 +735,7 @@ def create_and_render_video(
                     transition=None,
                 )
             )
-    elif timing_mode == "clip_anchored":
+    elif timing_mode == "clip_anchored" and not use_canonical_timeline:
         script_texts: List[str] = []
         if isinstance(overlay_script, dict):
             title = str(overlay_script.get("title", "")).strip()
@@ -733,7 +749,7 @@ def create_and_render_video(
 
     if text_overlays:
         text_overlays.sort(key=lambda o: o.start_time)
-    if overlay_full_clip and text_overlays and not use_reference_mimic:
+    if overlay_full_clip and text_overlays and not use_canonical_timeline:
         for overlay, vid_spec in zip(text_overlays, video_clip_specs):
             overlay.start_time = vid_spec["start"]
             overlay.duration = vid_spec["length"]
@@ -757,7 +773,7 @@ def create_and_render_video(
                 "length": overlay.duration,
                 "offset": _get_offset(overlay.position),
             }
-            if overlay.transition and float(overlay.duration) >= 2.0 and not use_reference_mimic:
+            if overlay.transition and float(overlay.duration) >= 2.0 and not use_canonical_timeline:
                 clip["transition"] = overlay.transition
             text_clip_specs.append(clip)
 
@@ -772,20 +788,20 @@ def create_and_render_video(
     warnings = []
     warnings.extend(planning_warnings)
     warnings.extend(normalize_tracks(edit_spec))
-    if not use_reference_mimic:
+    if not use_canonical_timeline:
         warnings.extend(normalize_text_clips(edit_spec, debug_text_mode=debug_text_visibility))
     warnings.extend(validate_edit(edit_spec))
     warnings.extend(_ensure_overlay_html_assets(edit_spec))
 
-    if use_reference_mimic and canonical_timeline:
+    if use_canonical_timeline and canonical_timeline:
         tol = 1e-6
         expected = sorted(canonical_timeline, key=lambda r: float(r.get("start", 0.0)))
         if len(video_clip_specs) != len(expected):
             return {
                 "success": False,
                 "error": (
-                    f"Reference mimic validation failed: rendered clip count={len(video_clip_specs)} "
-                    f"does not match canonical scenes={len(expected)}"
+                    f"Canonical timeline validation failed: rendered clip count={len(video_clip_specs)} "
+                    f"does not match canonical rows={len(expected)}"
                 ),
                 "warnings": warnings,
             }
@@ -798,7 +814,7 @@ def create_and_render_video(
                 return {
                     "success": False,
                     "error": (
-                        f"Reference mimic validation failed at clip {i}: start={cs:.9f} "
+                        f"Canonical timeline validation failed at clip {i}: start={cs:.9f} "
                         f"expected={rs:.9f}"
                     ),
                     "warnings": warnings,
@@ -807,18 +823,18 @@ def create_and_render_video(
                 return {
                     "success": False,
                     "error": (
-                        f"Reference mimic validation failed at clip {i}: length={cl:.9f} "
+                        f"Canonical timeline validation failed at clip {i}: length={cl:.9f} "
                         f"expected={rl:.9f}"
                     ),
                     "warnings": warnings,
                 }
 
-    if use_reference_mimic:
+    if use_canonical_timeline:
         mimic_errors = validate_reference_mimic_alignment(edit_spec)
         if mimic_errors:
             return {
                 "success": False,
-                "error": "Reference mimic timing validation failed: " + "; ".join(mimic_errors),
+                "error": "Canonical timing validation failed: " + "; ".join(mimic_errors),
                 "warnings": warnings,
             }
 
@@ -945,8 +961,6 @@ def create_and_render_video(
                 clip_kwargs["fit"] = c.get("fit")
             if c.get("position") is not None:
                 clip_kwargs["position"] = c.get("position")
-            if c.get("volume") is not None:
-                clip_kwargs["volume"] = float(c.get("volume"))
             if sdk_offset is not None:
                 clip_kwargs["offset"] = sdk_offset
             if sdk_transition is not None:
@@ -961,7 +975,10 @@ def create_and_render_video(
     soundtrack = None
     if soundtrack_url and music_mode in {"custom", "original"}:
         effect = "fadeOut" if music_mode == "custom" else None
-        soundtrack = Soundtrack(src=soundtrack_url, effect=effect, volume=0.5)
+        soundtrack_kwargs = {"src": soundtrack_url, "volume": 0.5}
+        if effect is not None:
+            soundtrack_kwargs["effect"] = effect
+        soundtrack = Soundtrack(**soundtrack_kwargs)
         if music_mode == "original":
             print("[editor] Using reference audio bed from analyzed video")
         else:
@@ -1015,6 +1032,22 @@ def create_and_render_video(
         config.api_key['DeveloperKey'] = api_key
         
         with shotstack.ApiClient(config) as api_client:
+            if mute_source_audio:
+                warnings.append(
+                    {
+                        "code": "MUTE_SOURCE_AUDIO_UNSUPPORTED",
+                        "message": "Per-video clip source-audio muting is not emitted because Shotstack clip schema rejects 'volume' here.",
+                        "detail": None,
+                    }
+                )
+            if debug_shotstack_payload_path:
+                try:
+                    payload = api_client.sanitize_for_serialization(edit_object)
+                    with open(debug_shotstack_payload_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"Could not write Shotstack payload debug JSON: {e}")
+
             api_instance = edit_api.EditApi(api_client)
             
             print("Submitting render job to Shotstack...")

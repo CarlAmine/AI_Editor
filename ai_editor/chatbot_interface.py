@@ -26,6 +26,8 @@ REQUIRED_FIELDS = [
     "budget",
     "intent_mode",
     "refit_mode",
+    "generation_mode",
+    "edit_mode",
 ]
 
 DEFAULT_STATE = {
@@ -45,6 +47,8 @@ DEFAULT_STATE = {
     "budget": "",
     "intent_mode": "video",
     "refit_mode": "crop",
+    "generation_mode": "reference_mimic_mode",
+    "edit_mode": "scene",
     "edit_requests": [],
     "user_requests": [],
 }
@@ -81,6 +85,43 @@ def _extract_action_requests(text: str) -> List[str]:
     return actions
 
 
+def _extract_generation_mode(text: str) -> str:
+    text_low = text.lower()
+    if any(k in text_low for k in ["reference mimic", "mimic mode", "match reference", "copy reference timing"]):
+        return "reference_mimic_mode"
+    if any(k in text_low for k in ["free generation", "free mode", "non mimic", "not mimic"]):
+        return "free_generation_mode"
+    return ""
+
+
+def _extract_edit_mode(text: str) -> str:
+    text_low = text.lower()
+    if any(
+        k in text_low
+        for k in [
+            "ocr mode",
+            "ocr-based",
+            "ocr based",
+            "text timeline",
+            "follow text",
+            "use ocr",
+        ]
+    ):
+        return "ocr"
+    if any(
+        k in text_low
+        for k in [
+            "scene mode",
+            "scene-based",
+            "scene based",
+            "use scenes",
+            "scene timeline",
+        ]
+    ):
+        return "scene"
+    return ""
+
+
 def process_ui_turn(
     user_input: str,
     current_state: Dict,
@@ -103,6 +144,8 @@ def process_ui_turn(
             "Return a JSON object with keys:\n"
             f"{REQUIRED_FIELDS}\n"
             "Allowed intent_mode: video|shorts. Allowed refit_mode: crop|pad.\n"
+            "Allowed generation_mode: reference_mimic_mode|free_generation_mode.\n"
+            "Allowed edit_mode: scene|ocr.\n"
             "If a value is unknown, return null.\n\n"
             f"Current state: {json.dumps(state, ensure_ascii=False)}\n"
             f"Analyzer context: {analyzer_output}\n"
@@ -130,11 +173,25 @@ def process_ui_turn(
         if val is not None and val != "":
             state[key] = val
 
+    explicit_generation_mode = _extract_generation_mode(user_input)
+    if explicit_generation_mode:
+        state["generation_mode"] = explicit_generation_mode
+    explicit_edit_mode = _extract_edit_mode(user_input)
+    if explicit_edit_mode:
+        state["edit_mode"] = explicit_edit_mode
+
     # Normalize constrained values
     if str(state.get("intent_mode", "")).lower() not in {"video", "shorts"}:
         state["intent_mode"] = "video"
     if str(state.get("refit_mode", "")).lower() not in {"crop", "pad"}:
         state["refit_mode"] = "crop"
+    if str(state.get("generation_mode", "")).lower() not in {
+        "reference_mimic_mode",
+        "free_generation_mode",
+    }:
+        state["generation_mode"] = "reference_mimic_mode"
+    if str(state.get("edit_mode", "")).lower() not in {"scene", "ocr"}:
+        state["edit_mode"] = "scene"
 
     next_message = (
         "Got it. I registered your request and updated the editing plan. "

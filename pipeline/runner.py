@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -8,7 +9,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from ai_editor.analyzer import analyze_video_content_with_results
-from ai_editor.downloader import VideoClapError, VideoDownloadError, clip_video, download_and_clip, download_video, extract_audio
+from ai_editor.downloader import (
+    VideoClapError,
+    VideoDownloadError,
+    clip_video,
+    download_and_clip,
+    download_video,
+    download_video_section,
+    extract_audio,
+)
 from ai_editor.editor import create_and_render_video
 
 from .artifacts import ArtifactRegistry
@@ -66,7 +75,11 @@ def _is_http_url(value: Any) -> bool:
 
 
 def _default_drive_folder() -> Optional[str]:
-    return os.getenv("DRIVE_DEFAULT_FOLDER_ID") or os.getenv("VIDEO_FOLDER")
+    return (
+        os.getenv("DRIVE_UPLOAD_FOLDER_ID")
+        or os.getenv("DRIVE_DEFAULT_FOLDER_ID")
+        or os.getenv("VIDEO_FOLDER")
+    )
 
 
 def _upload_assets_for_shotstack(job_id: str, local_paths: List[str]) -> List[Dict[str, Any]]:
@@ -144,6 +157,74 @@ def _probe_duration(path: str) -> float:
         return 0.0
 
 
+def _probe_duration_any(path_or_url: str) -> float:
+    if not path_or_url:
+        return 0.0
+    d = _probe_duration(path_or_url)
+    if d > 0:
+        return d
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path_or_url),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return float((proc.stdout or "0").strip() or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _is_direct_shotstack_source_url(url: str) -> bool:
+    if not _is_http_url(url):
+        return False
+    u = str(url).lower().strip()
+    if "drive.google.com/uc?" in u:
+        return True
+    if any(u.endswith(ext) for ext in [".mp4", ".mov", ".m4v", ".webm", ".mkv"]):
+        return True
+    return False
+
+
+def _extract_start_override(source: Dict[str, Any]) -> float:
+    try:
+        if source.get("start") is not None:
+            return max(0.0, float(source.get("start")))
+    except (TypeError, ValueError):
+        pass
+    segments = source.get("segments") or []
+    if isinstance(segments, list) and segments:
+        first = segments[0] or {}
+        try:
+            if first.get("start") is not None:
+                return max(0.0, float(first.get("start")))
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _extract_bounded_segment(source: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    segments = source.get("segments") or []
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = segments[0] or {}
+    try:
+        start = float(first.get("start"))
+        end = float(first.get("end"))
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    return max(0.0, start), max(0.0, end)
+
+
 def _download_file(url: str, out_path: str) -> None:
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
@@ -207,34 +288,36 @@ def _align_sources(raw_paths: List[str], scene_durations: List[float], out_dir: 
         )
     os.makedirs(out_dir, exist_ok=True)
     aligned = []
-    si = 0
-    soff = 0.0
     for i, td in enumerate(scene_durations, start=1):
-        if si >= len(src):
-            break
-        cur = src[si]
-        rem = max(0.0, cur["dur"] - soff)
-        if rem <= 0.05:
-            si += 1
-            soff = 0.0
-            continue
-        take = min(td, rem)
-        if take <= 0.05:
-            continue
+        source_idx = i - 1
+        if source_idx >= len(src):
+            return [], (
+                f"Not enough source clips for strict index alignment: need source {i} for scene {i}."
+            )
+        cur = src[source_idx]
+        if cur["dur"] <= 0.05:
+            return [], f"Source {i} has invalid duration ({cur['dur']:.2f}s)."
         dst = os.path.join(out_dir, f"aligned_{i:03d}.mp4")
-        clip_video(cur["path"], dst, soff, soff + take)
+        # Keep aligned clip duration identical to raw source duration for index i.
+        shutil.copy2(cur["path"], dst)
         aligned.append(dst)
-        soff += take
-        if soff >= cur["dur"] - 0.05:
-            si += 1
-            soff = 0.0
     return aligned, None
+
+
+def _sorted_indexed_artifact_keys(items: Dict[str, Any], prefix: str) -> List[str]:
+    keys = []
+    for key in items:
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix):]
+        if suffix.isdigit():
+            keys.append(key)
+    return sorted(keys, key=lambda k: int(k[len(prefix):]))
 
 
 def _build_reference_timeline(
     analysis: Dict[str, Any],
-    source_paths: List[str],
-    work_dir: str,
+    sources: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     scenes = analysis.get("scenes") or []
     if not scenes:
@@ -242,29 +325,33 @@ def _build_reference_timeline(
     durations = [float(s.get("duration", 0.0)) for s in scenes]
     if any(d <= 0 for d in durations):
         raise RuntimeError("Reference mimic mode requires positive analyzed scene durations.")
-    os.makedirs(work_dir, exist_ok=True)
-    source_info = []
-    for p in source_paths:
-        d = _probe_duration(p)
-        if d > 0:
-            source_info.append({"path": p, "duration": d})
-    if not source_info:
+    if not sources:
         raise RuntimeError("No valid source clips available for reference mimic mode.")
 
+    if len(sources) < len(scenes):
+        raise RuntimeError(
+            f"Reference mimic requires at least {len(scenes)} sources; received {len(sources)}."
+        )
+
     timeline = []
-    used_paths = set()
     for idx, scene in enumerate(scenes, start=1):
         target_duration = float(scene.get("duration", 0.0))
-        chosen = next((s for s in source_info if s["path"] not in used_paths and s["duration"] + 0.02 >= target_duration), None)
-        if chosen is None:
-            chosen = next((s for s in source_info if s["duration"] + 0.02 >= target_duration), None)
-        if chosen is None:
-            raise RuntimeError(
-                f"Reference mimic assignment failed for scene {idx}: no clip long enough for {target_duration:.2f}s."
-            )
-        used_paths.add(chosen["path"])
-        out_path = os.path.join(work_dir, f"ref_scene_{idx:03d}.mp4")
-        clip_video(chosen["path"], out_path, 0.0, target_duration)
+        src = sources[idx - 1]
+        video_src = str(src.get("video_src", "")).strip()
+        probe_src = str(src.get("probe_src", "")).strip() or video_src
+        trim_start = max(0.0, float(src.get("trim", 0.0)))
+        source_duration = -1.0
+        if probe_src and not _is_http_url(probe_src):
+            source_duration = _probe_duration_any(probe_src)
+            if source_duration <= 0.0:
+                raise RuntimeError(
+                    f"Reference mimic source {idx} duration could not be determined: {probe_src}"
+                )
+            if source_duration + 0.02 < trim_start + target_duration:
+                raise RuntimeError(
+                    f"Reference mimic assignment failed for scene {idx}: source too short "
+                    f"(source={source_duration:.2f}s, trim={trim_start:.2f}s, required={target_duration:.2f}s)."
+                )
         start = float(scene.get("start_time", sum(durations[: idx - 1])))
         end = float(scene.get("end_time", start + target_duration))
         timeline.append(
@@ -276,14 +363,15 @@ def _build_reference_timeline(
                 "end": end,
                 "length": target_duration,
                 "duration": target_duration,
-                "videoSrc": out_path,
-                "video_src": out_path,
-                "trim": 0.0,
+                "videoSrc": video_src,
+                "video_src": video_src,
+                "trim": trim_start,
                 "transitionIn": None,
                 "transitionOut": None,
                 "text": "",
                 "text_start": start,
                 "text_end": end,
+                "source_duration": source_duration,
             }
         )
     return timeline
@@ -340,11 +428,169 @@ def _validate_reference_timeline(
             errors.append(
                 f"final_scene_end mismatch: final_end={final_scene_end:.3f}, total={generated_total:.3f}"
             )
-    if use_reference_audio and reference_audio_duration is not None:
-        if abs(reference_audio_duration - generated_total) > 0.2:
-            errors.append(
-                f"reference_audio_duration mismatch: audio={reference_audio_duration:.3f}, timeline={generated_total:.3f}"
+    # Reference audio bed is allowed to span independently; do not hard-fail on probe mismatch.
+    return errors
+
+
+def _build_overlay_timing_from_timeline(
+    timeline: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    overlays: List[Dict[str, Any]] = []
+    for i, row in enumerate(timeline, start=1):
+        start = float(row.get("text_start", row.get("start", 0.0)))
+        end = float(row.get("text_end", row.get("end", start)))
+        if end <= start:
+            continue
+        overlays.append(
+            {
+                "index": i,
+                "text": str(row.get("text", "")).strip(),
+                "start": start,
+                "end": end,
+                "length": end - start,
+            }
+        )
+    return overlays
+
+
+def _build_ocr_timeline(
+    text_segments: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    strict_index_alignment: bool = False,
+) -> List[Dict[str, Any]]:
+    if not text_segments:
+        raise RuntimeError(
+            "OCR mode selected but no OCR text segments were produced from analysis keyframes."
+        )
+    if not sources:
+        raise RuntimeError("OCR mode requires at least one source clip URL/path.")
+
+    ordered_segments = sorted(
+        text_segments,
+        key=lambda s: float(s.get("start", 0.0)),
+    )
+    if strict_index_alignment and len(sources) < len(ordered_segments):
+        raise RuntimeError(
+            f"OCR mode in reference mimic requires at least {len(ordered_segments)} sources; "
+            f"received {len(sources)}."
+        )
+    timeline: List[Dict[str, Any]] = []
+    source_duration_cache: Dict[str, float] = {}
+    for idx, seg in enumerate(ordered_segments, start=1):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        duration = end - start
+        if duration <= 0.0:
+            continue
+
+        if strict_index_alignment:
+            source = sources[idx - 1]
+        else:
+            source = sources[min(idx - 1, len(sources) - 1)]
+        video_src = str(source.get("video_src", "")).strip()
+        probe_src = str(source.get("probe_src", "")).strip() or video_src
+        trim_start = max(0.0, float(source.get("trim", 0.0) or 0.0))
+        if not video_src:
+            raise RuntimeError(f"OCR timeline source {idx} has no usable URL/path.")
+
+        cache_key = probe_src or video_src
+        if cache_key not in source_duration_cache:
+            if cache_key and _is_http_url(cache_key):
+                source_duration_cache[cache_key] = -1.0
+            else:
+                source_duration_cache[cache_key] = _probe_duration_any(cache_key)
+        source_duration = float(source_duration_cache.get(cache_key, 0.0))
+        if source_duration <= 0.0:
+            # Remote URLs (notably Google Drive) often fail local cv2/ffprobe probing due redirects/auth/timeouts.
+            # In that case, keep canonical OCR timing and defer media fetchability/duration enforcement to renderer.
+            source_duration = -1.0
+        elif source_duration + 0.02 < trim_start + duration:
+            raise RuntimeError(
+                f"OCR timeline assignment failed for segment {idx}: source too short "
+                f"(source={source_duration:.2f}s, trim={trim_start:.2f}s, required={duration:.2f}s)."
             )
+
+        text = str(seg.get("text", "")).strip()
+        timeline.append(
+            {
+                "index": idx,
+                "scene_id": idx,
+                "label": f"ocr_{idx:03d}",
+                "start": start,
+                "end": end,
+                "length": duration,
+                "duration": duration,
+                "videoSrc": video_src,
+                "video_src": video_src,
+                "trim": trim_start,
+                "transitionIn": None,
+                "transitionOut": None,
+                "text": text,
+                "text_start": start,
+                "text_end": end,
+                "source_duration": source_duration,
+                "source_index": int(source.get("index", 0) or 0),
+            }
+        )
+    if not timeline:
+        raise RuntimeError("OCR mode produced no usable timeline segments.")
+    return timeline
+
+
+def _validate_ocr_timeline(
+    text_segments: List[Dict[str, Any]],
+    timeline: List[Dict[str, Any]],
+    overlay_timing: List[Dict[str, Any]],
+) -> List[str]:
+    errors: List[str] = []
+    tol = 0.05
+    ordered_segments = sorted(text_segments, key=lambda s: float(s.get("start", 0.0)))
+    if len(timeline) != len(ordered_segments):
+        errors.append(
+            f"ocr_segment_count mismatch: timeline={len(timeline)} ocr_segments={len(ordered_segments)}"
+        )
+    if len(overlay_timing) != len(timeline):
+        errors.append(f"overlay_count mismatch: overlays={len(overlay_timing)} timeline={len(timeline)}")
+
+    for i, (row, seg) in enumerate(zip(timeline, ordered_segments), start=1):
+        rs = float(row.get("start", 0.0))
+        re = float(row.get("end", rs))
+        rd = float(row.get("duration", re - rs))
+        ss = float(seg.get("start", 0.0))
+        se = float(seg.get("end", ss))
+        sd = se - ss
+        if abs(rs - ss) > tol:
+            errors.append(f"timeline_start mismatch at {i}: timeline={rs:.3f}, ocr={ss:.3f}")
+        if abs(re - se) > tol:
+            errors.append(f"timeline_end mismatch at {i}: timeline={re:.3f}, ocr={se:.3f}")
+        if abs(rd - sd) > tol:
+            errors.append(f"timeline_duration mismatch at {i}: timeline={rd:.3f}, ocr={sd:.3f}")
+
+    for i, (overlay, row) in enumerate(zip(overlay_timing, timeline), start=1):
+        os_ = float(overlay.get("start", 0.0))
+        oe = float(overlay.get("end", os_))
+        rs = float(row.get("start", 0.0))
+        re = float(row.get("end", rs))
+        if abs(os_ - rs) > tol:
+            errors.append(f"overlay_start mismatch at {i}: overlay={os_:.3f}, video={rs:.3f}")
+        if abs((oe - os_) - (re - rs)) > tol:
+            errors.append(
+                f"overlay_length mismatch at {i}: overlay={(oe-os_):.3f}, video={(re-rs):.3f}"
+            )
+
+    if timeline:
+        total_timeline = sum(float(row.get("duration", 0.0)) for row in timeline)
+        total_ocr = sum(
+            max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
+            for seg in ordered_segments
+        )
+        if abs(total_timeline - total_ocr) > tol:
+            errors.append(f"total_duration mismatch: timeline={total_timeline:.3f}, ocr={total_ocr:.3f}")
+        timeline_end = max(float(row.get("end", 0.0)) for row in timeline)
+        overlay_end = max((float(r.get("end", 0.0)) for r in overlay_timing), default=0.0)
+        if abs(overlay_end - timeline_end) > tol:
+            errors.append(f"final_end mismatch: overlay_end={overlay_end:.3f}, timeline_end={timeline_end:.3f}")
+
     return errors
 
 
@@ -423,6 +669,9 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
     requirements["generation_mode"] = str(requirements.get("generation_mode", "free_generation_mode")).lower()
     if requirements["generation_mode"] not in {"free_generation_mode", "reference_mimic_mode"}:
         requirements["generation_mode"] = "free_generation_mode"
+    requirements["edit_mode"] = str(requirements.get("edit_mode", "scene")).lower().strip()
+    if requirements["edit_mode"] not in {"scene", "ocr"}:
+        requirements["edit_mode"] = "scene"
     requirements["intent_mode"] = _infer_intent_mode(requirements.get("prompt", ""), requirements)
     requirements["output_mode"] = str(requirements.get("output_mode", "")).lower().strip()
     if requirements["output_mode"] not in {"native_9x16", "crop_to_9x16", ""}:
@@ -497,36 +746,99 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
     def stage_fetch_sources():
         folder_id = request_payload.get("gdrive_folder_id")
         sources = request_payload.get("sources") or []
+        generation_mode = requirements.get("generation_mode", "free_generation_mode")
         if folder_id:
             adapter = DriveStorageAdapter()
             assets = adapter.list_videos(folder_id)
             if not assets:
                 raise RuntimeError("No video files found in provided Google Drive folder.")
-            for i, asset in enumerate(assets, start=1):
-                dst = os.path.join(dirs["media"], f"source_raw_{i:03d}.mp4")
-                local = adapter.download(asset, dst)
-                ctx.artifacts.register_file(f"sources.raw.{i}", local, {"backend": "drive", "asset_id": asset.id}, "video/mp4")
-                ctx.artifacts.register_url(f"sources.fetch.{i}", adapter.get_fetchable_url(asset), {"backend": "drive", "asset_id": asset.id}, "video/mp4")
+            if generation_mode == "reference_mimic_mode":
+                # Mimic mode: use original Drive URLs directly (no pre-trim/re-upload).
+                for i, asset in enumerate(assets, start=1):
+                    fetch_url = adapter.get_fetchable_url(asset)
+                    ctx.artifacts.register_url(
+                        f"sources.fetch.{i}",
+                        fetch_url,
+                        {"backend": "drive", "asset_id": asset.id, "trim_start": 0.0},
+                        "video/mp4",
+                    )
+            else:
+                for i, asset in enumerate(assets, start=1):
+                    dst = os.path.join(dirs["media"], f"source_raw_{i:03d}.mp4")
+                    local = adapter.download(asset, dst)
+                    ctx.artifacts.register_file(
+                        f"sources.raw.{i}",
+                        local,
+                        {"backend": "drive", "asset_id": asset.id},
+                        "video/mp4",
+                    )
+                    ctx.artifacts.register_url(
+                        f"sources.fetch.{i}",
+                        adapter.get_fetchable_url(asset),
+                        {"backend": "drive", "asset_id": asset.id},
+                        "video/mp4",
+                    )
             ctx.runtime["drive_adapter"] = adapter
             ctx.runtime["drive_folder_id"] = folder_id
         else:
-            # Preserve current behavior by using existing clip downloader.
-            clip_result = download_and_clip(sources, os.path.join(dirs["media"], "source_work"))
-            if not clip_result.get("success"):
-                raise RuntimeError(f"Clipping failed: {clip_result.get('error')}")
-            clips = clip_result.get("clips") or []
-            if not clips:
-                raise RuntimeError("No source clips found.")
-            for i, clip in enumerate(clips, start=1):
-                p = clip["path"]
-                ctx.artifacts.register_file(f"sources.raw.{i}", p, {"backend": "url"}, "video/mp4")
-                ctx.artifacts.register_file(f"sources.fetch.{i}", p, {"backend": "local"}, "video/mp4")
+            if generation_mode == "reference_mimic_mode":
+                if not sources:
+                    raise RuntimeError("Reference mimic mode requires explicit source URLs when Drive folder is not provided.")
+                for i, source in enumerate(sources, start=1):
+                    url = str(source.get("url", "")).strip()
+                    if not url:
+                        raise RuntimeError(f"Source {i} is missing URL.")
+                    trim_start = _extract_start_override(source)
+                    if _is_direct_shotstack_source_url(url):
+                        ctx.artifacts.register_url(
+                            f"sources.fetch.{i}",
+                            url,
+                            {"backend": "url", "trim_start": trim_start},
+                            "video/mp4",
+                        )
+                    else:
+                        segment_bounds = _extract_bounded_segment(source)
+                        if segment_bounds and ("youtube.com" in url.lower() or "youtu.be" in url.lower()):
+                            local = download_video_section(
+                                url=url,
+                                output_dir=dirs["media"],
+                                filename=f"source_raw_{i:03d}.mp4",
+                                start_time=segment_bounds[0],
+                                end_time=segment_bounds[1],
+                            )
+                            trim_start = 0.0
+                        else:
+                            local = download_video(url, dirs["media"], f"source_raw_{i:03d}.mp4")
+                        ctx.artifacts.register_file(
+                            f"sources.raw.{i}",
+                            local,
+                            {"backend": "url", "source_url": url, "trim_start": trim_start},
+                            "video/mp4",
+                        )
+                        ctx.artifacts.register_file(
+                            f"sources.fetch.{i}",
+                            local,
+                            {"backend": "local", "source_url": url, "trim_start": trim_start},
+                            "video/mp4",
+                        )
+            else:
+                # Preserve current free-mode behavior by using existing clip downloader.
+                clip_result = download_and_clip(sources, os.path.join(dirs["media"], "source_work"))
+                if not clip_result.get("success"):
+                    raise RuntimeError(f"Clipping failed: {clip_result.get('error')}")
+                clips = clip_result.get("clips") or []
+                if not clips:
+                    raise RuntimeError("No source clips found.")
+                for i, clip in enumerate(clips, start=1):
+                    p = clip["path"]
+                    ctx.artifacts.register_file(f"sources.raw.{i}", p, {"backend": "url"}, "video/mp4")
+                    ctx.artifacts.register_file(f"sources.fetch.{i}", p, {"backend": "local"}, "video/mp4")
 
     _run_stage(
         ctx,
         StageName.FETCH_SOURCES,
         stage_fetch_sources,
-        done_check=lambda: ctx.artifacts.exists("sources.raw.1"),
+        done_check=lambda: ctx.artifacts.exists("sources.raw.1") or ctx.artifacts.exists("sources.fetch.1"),
     )
     if ctx.runtime.get("failed"):
         return _build_failure_response(ctx)
@@ -539,7 +851,7 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
             for s in (analysis.get("scenes") or [])
             if float(s.get("duration", 0.0)) > 0
         ]
-        raw_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.raw."))
+        raw_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
         raw_paths = [ctx.artifacts.get(k).path_or_url for k in raw_keys]
         aligned_paths, notice = _align_sources(raw_paths, scene_durations, os.path.join(dirs["media"], "aligned"))
         if notice:
@@ -580,7 +892,9 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         ctx,
         StageName.ALIGN_SOURCES,
         stage_align_sources,
-        done_check=lambda: ctx.artifacts.exists("sources.aligned.1") or ctx.state.stages[StageName.ALIGN_SOURCES.value].status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED},
+        done_check=lambda: requirements.get("generation_mode") == "reference_mimic_mode"
+        or ctx.artifacts.exists("sources.aligned.1")
+        or ctx.state.stages[StageName.ALIGN_SOURCES.value].status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED},
     )
     if ctx.runtime.get("failed"):
         return _build_failure_response(ctx)
@@ -628,12 +942,23 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         analysis = json.load(open(ctx.artifacts.get("analysis.json").path_or_url, "r", encoding="utf-8"))
         summary = open(ctx.artifacts.get("analysis.summary").path_or_url, "r", encoding="utf-8").read()
         generation_mode = requirements.get("generation_mode", "free_generation_mode")
+        edit_mode = str(requirements.get("edit_mode", "scene")).lower().strip()
+        if edit_mode not in {"scene", "ocr"}:
+            edit_mode = "scene"
 
-        source_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.aligned."))
-        if not source_keys:
-            source_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.raw."))
-        src_paths = [ctx.artifacts.get(k).path_or_url for k in source_keys]
-        src_durations = [_probe_duration(p) for p in src_paths]
+        if generation_mode == "reference_mimic_mode":
+            source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+            if not source_keys:
+                raise RuntimeError("Reference mimic mode requires fetchable source URLs.")
+            # Reference mimic timing comes from analyzed timeline (scene or OCR), not source probes.
+            # Avoid slow/fragile remote duration probes for Drive URLs.
+            src_durations = []
+        else:
+            source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
+            if not source_keys:
+                source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+            src_paths = [ctx.artifacts.get(k).path_or_url for k in source_keys]
+            src_durations = [_probe_duration(p) for p in src_paths]
         render_duration = float(sum(d for d in src_durations if d > 0))
         analysis_duration = max(
             max((float(s.get("end_time", 0.0)) for s in (analysis.get("scenes") or [])), default=0.0),
@@ -654,11 +979,70 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         render_spec = build_render_spec(timeline_plan, overlay_plan, audio_plan, requirements)
         postprocess_plan = build_postprocess_plan(requirements)
 
-        if generation_mode == "reference_mimic_mode":
+        if edit_mode == "ocr":
+            ocr_source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+            if not ocr_source_keys:
+                ocr_source_keys = source_keys
+            if not ocr_source_keys:
+                raise RuntimeError("OCR mode requires at least one source clip.")
+
+            source_rows = []
+            for idx, key in enumerate(ocr_source_keys, start=1):
+                art = ctx.artifacts.get(key)
+                meta = art.meta or {}
+                trim_start = float(meta.get("trim_start", 0.0) or 0.0)
+                if generation_mode == "reference_mimic_mode":
+                    trim_start = 0.0
+                probe_src = art.path_or_url
+                raw_art = ctx.artifacts.get(f"sources.raw.{idx}")
+                if raw_art and raw_art.type == "file" and os.path.exists(raw_art.path_or_url):
+                    probe_src = raw_art.path_or_url
+                source_rows.append(
+                    {
+                        "index": idx,
+                        "video_src": art.path_or_url,
+                        "probe_src": probe_src,
+                        "trim": trim_start,
+                    }
+                )
+
+            ocr_segments = overlay_plan.get("text_segments") or []
+            canonical_timeline = _build_ocr_timeline(
+                text_segments=ocr_segments,
+                sources=source_rows,
+                strict_index_alignment=(generation_mode == "reference_mimic_mode"),
+            )
+            overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
+            ocr_errors = _validate_ocr_timeline(
+                text_segments=ocr_segments,
+                timeline=canonical_timeline,
+                overlay_timing=overlay_timing,
+            )
+            if ocr_errors:
+                raise RuntimeError("OCR timing validation failed:\n" + "\n".join(ocr_errors))
+            render_spec["canonical_timeline"] = canonical_timeline
+            render_spec["overlay_timing"] = overlay_timing
+
+        elif generation_mode == "reference_mimic_mode":
+            source_rows = []
+            for idx, key in enumerate(source_keys, start=1):
+                art = ctx.artifacts.get(key)
+                trim_start = 0.0
+                probe_src = art.path_or_url
+                raw_art = ctx.artifacts.get(f"sources.raw.{idx}")
+                if raw_art and raw_art.type == "file" and os.path.exists(raw_art.path_or_url):
+                    probe_src = raw_art.path_or_url
+                source_rows.append(
+                    {
+                        "index": idx,
+                        "video_src": art.path_or_url,
+                        "probe_src": probe_src,
+                        "trim": trim_start,
+                    }
+                )
             canonical_timeline = _build_reference_timeline(
                 analysis=analysis,
-                source_paths=src_paths,
-                work_dir=os.path.join(dirs["media"], "mimic"),
+                sources=source_rows,
             )
             script = overlay_plan.get("overlay_script") or {}
             script_texts = []
@@ -668,24 +1052,15 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
                 script_texts.extend([str(x) for x in (script.get("items") or []) if str(x)])
             if not script_texts:
                 script_texts = [str(o.get("text", "")).strip() for o in (overlay_plan.get("overlays") or []) if str(o.get("text", "")).strip()]
-            overlay_timing = []
             # Strict mimic policy: overlay timing always inherits scene timing exactly.
             for i, scene in enumerate(canonical_timeline):
                 text = script_texts[i] if i < len(script_texts) else ""
                 start = float(scene["start"])
                 end = float(scene["end"])
-                overlay_timing.append(
-                    {
-                        "index": i + 1,
-                        "text": text,
-                        "start": start,
-                        "end": end,
-                        "length": max(0.0, end - start),
-                    }
-                )
                 scene["text"] = text
                 scene["text_start"] = start
                 scene["text_end"] = end
+            overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
             reference_audio_duration = None
             if audio_plan.get("use_reference_audio_bed") and ctx.artifacts.exists("audio.soundtrack"):
                 reference_audio_duration = _probe_duration(ctx.artifacts.get("audio.soundtrack").path_or_url)
@@ -707,16 +1082,24 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
             "overlay_script.json",
             overlay_plan.get("overlay_script") or {"title": "", "items": [], "source": ""},
         )
-        if generation_mode == "reference_mimic_mode":
+        if render_spec.get("canonical_timeline"):
             write_plan(
                 dirs["job"],
                 "canonical_timeline.json",
-                {"mode": generation_mode, "timeline": render_spec.get("canonical_timeline", [])},
+                {
+                    "generation_mode": generation_mode,
+                    "edit_mode": edit_mode,
+                    "timeline": render_spec.get("canonical_timeline", []),
+                },
             )
             write_plan(
                 dirs["job"],
                 "overlay_timing.json",
-                {"mode": generation_mode, "overlays": render_spec.get("overlay_timing", [])},
+                {
+                    "generation_mode": generation_mode,
+                    "edit_mode": edit_mode,
+                    "overlays": render_spec.get("overlay_timing", []),
+                },
             )
         write_plan(
             dirs["job"],
@@ -748,9 +1131,16 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         spec = json.load(open(os.path.join(dirs["plans"], "render_spec.json"), "r", encoding="utf-8"))
         canonical_timeline = spec.get("canonical_timeline") or []
         generation_mode = str(spec.get("generation_mode", requirements.get("generation_mode", "free_generation_mode"))).lower()
-        if generation_mode == "reference_mimic_mode" and not canonical_timeline:
+        edit_mode = str(spec.get("edit_mode", requirements.get("edit_mode", "scene"))).lower().strip()
+        if edit_mode not in {"scene", "ocr"}:
+            edit_mode = "scene"
+        if generation_mode == "reference_mimic_mode" and edit_mode == "scene" and not canonical_timeline:
             raise RuntimeError(
                 "reference_mimic_mode requires canonical_timeline in render_spec; refusing non-canonical render."
+            )
+        if edit_mode == "ocr" and not canonical_timeline:
+            raise RuntimeError(
+                "OCR mode requires canonical_timeline in render_spec; refusing scene-timed fallback."
             )
         fetch_entries = []
         if canonical_timeline:
@@ -763,7 +1153,7 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 )
         else:
-            fetch_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.fetch."))
+            fetch_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
             if not fetch_keys:
                 raise RuntimeError("No fetchable sources available for rendering.")
             for k in fetch_keys:
@@ -806,15 +1196,19 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
             # Guard against accidental clip-count drift before render.
             analysis = json.load(open(ctx.artifacts.get("analysis.json").path_or_url, "r", encoding="utf-8"))
             analyzed_scenes = analysis.get("scenes") or []
-            if generation_mode == "reference_mimic_mode" and len(canonical_timeline) != len(analyzed_scenes):
+            if (
+                generation_mode == "reference_mimic_mode"
+                and edit_mode == "scene"
+                and len(canonical_timeline) != len(analyzed_scenes)
+            ):
                 raise RuntimeError(
                     f"reference_mimic_mode clip-count mismatch: canonical={len(canonical_timeline)} analyzed={len(analyzed_scenes)}"
                 )
 
-        probe_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.aligned."))
+        probe_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
         if not probe_keys:
-            probe_keys = sorted(k for k in ctx.artifacts.items if k.startswith("sources.raw."))
-        duration_probe_urls = None if generation_mode == "reference_mimic_mode" else [
+            probe_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        duration_probe_urls = None if canonical_timeline else [
             ctx.artifacts.get(k).path_or_url for k in probe_keys
         ]
 
@@ -856,6 +1250,7 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
             debug_text_visibility=bool(requirements.get("debug_text_visibility", False)),
             debug_render_spec_path=os.path.join(dirs["plans"], "render_spec.json"),
             debug_overlay_timing_path=os.path.join(dirs["plans"], "overlay_timing.json"),
+            debug_shotstack_payload_path=os.path.join(dirs["plans"], "shotstack_request_payload.json"),
         )
         if not render_result.get("success") or not render_result.get("url"):
             raise RuntimeError(
