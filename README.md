@@ -10,12 +10,7 @@
 
 ---
 
-<!-- DEMO PLACEHOLDER
-  Replace the block below once you have a recording:
-  ![Demo GIF](docs/assets/demo.gif)
--->
-
-> 📸 **Screenshots & demo GIF** — see [docs/assets/](docs/assets/) (drop-in ready, instructions below).
+![Demo](docs/assets/demo.gif)
 
 ---
 
@@ -243,26 +238,17 @@ See [docs/API_EXAMPLES.md](docs/API_EXAMPLES.md) for full request/response examp
 
 ## Screenshots
 
-<!-- SCREENSHOT SECTION
-  Drop your actual screenshots into docs/assets/ and update the paths below.
-  Suggested captures:
-  1. docs/assets/screenshot-chat.png      — Chat / brief builder interface
-  2. docs/assets/screenshot-job-status.png — Job status / stage progress view
-  3. docs/assets/screenshot-timeline.png  — Edit plan / timeline output
-  4. docs/assets/screenshot-render.png    — Render progress / Shotstack job
-  5. docs/assets/screenshot-shorts.png    — Shorts conversion view
-  6. docs/assets/screenshot-upload.png    — YouTube publish result
--->
+### Chat Interface
+![Chat Interface](docs/assets/screenshot-chat.png)
 
-| Chat Interface | Job Status | Timeline Plan |
-|---|---|---|
-| `docs/assets/screenshot-chat.png` | `docs/assets/screenshot-job-status.png` | `docs/assets/screenshot-timeline.png` |
+### Job Status
+![Job Status](docs/assets/screenshot-job-status.png)
 
-| Render Flow | Shorts Output | Published Result |
-|---|---|---|
-| `docs/assets/screenshot-render.png` | `docs/assets/screenshot-shorts.png` | `docs/assets/screenshot-upload.png` |
+### Timeline Plan
+![Timeline Plan](docs/assets/screenshot-timeline.png)
 
-> Replace the placeholder paths above with actual `![caption](path)` image tags once you capture the screenshots.
+### Render Flow
+![Render Flow](docs/assets/screenshot-render.png)
 
 ---
 
