@@ -1,4 +1,4 @@
-import cv2
+﻿import cv2
 import numpy as np
 import pandas as pd
 from scenedetect import VideoManager, SceneManager
@@ -9,6 +9,7 @@ import warnings
 from datetime import timedelta
 from collections import defaultdict
 import math
+import re
 from typing import Dict, Tuple
 
 
@@ -155,6 +156,14 @@ class VideoEditAnalyzer:
     def extract_and_analyze_keyframes(self, num_frames: int = 12):
         keyframes = []
         intervals = max(1, self.total_frames // num_frames)
+
+        def _clean_ocr_text(value: str) -> str:
+            txt = str(value or "")
+            txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
+            txt = txt.replace("|", " ")
+            txt = txt.replace("'", "")
+            txt = " ".join(txt.split())
+            return txt.strip()
         
         for i in range(0, self.total_frames, intervals):
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
@@ -173,7 +182,12 @@ class VideoEditAnalyzer:
                     # Paddle expects BGR or RGB. We pass the frame directly.
                     paddle_res = self.paddle_ocr.ocr(frame, cls=True)
                     if paddle_res and paddle_res[0]:
-                        paddle_text = [line[1][0] for line in paddle_res[0] if line[1][0]]
+                        paddle_text = [
+                            _clean_ocr_text(line[1][0])
+                            for line in paddle_res[0]
+                            if line[1][0]
+                        ]
+                        paddle_text = [t for t in paddle_text if t]
                 except Exception as e:
                     print(f"PaddleOCR per-frame OCR failed, skipping for this frame: {e}")
             
@@ -192,7 +206,9 @@ class VideoEditAnalyzer:
                         pos = "Middle"
                     else:
                         pos = "Bottom"
-                    easy_details.append(f"'{text}' ({pos})")
+                    cleaned = _clean_ocr_text(text)
+                    if cleaned:
+                        easy_details.append(cleaned)
 
             # Consolidate Text
             detected_text = "; ".join(paddle_text) if paddle_text else "No text"

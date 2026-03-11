@@ -4,7 +4,7 @@
 
 ### Example 1: Single Video, No Clipping
 ```bash
-curl -X POST http://localhost:8000/process-video-url \
+curl -X POST http://localhost:10000/process-video-url \
   -H "Content-Type: application/json" \
   -d '{
     "primary_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
@@ -21,7 +21,7 @@ curl -X POST http://localhost:8000/process-video-url \
 
 ### Example 2: Multiple Videos with Segments
 ```bash
-curl -X POST http://localhost:8000/process-video-url \
+curl -X POST http://localhost:10000/process-video-url \
   -H "Content-Type: application/json" \
   -d '{
     "primary_url": "https://www.youtube.com/watch?v=main_video",
@@ -66,7 +66,7 @@ curl -X POST http://localhost:8000/process-video-url \
 ```python
 import requests
 
-API_BASE = "http://localhost:8000"
+API_BASE = "http://localhost:10000"
 
 payload = {
     "primary_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
@@ -96,7 +96,7 @@ import requests
 from typing import List, Dict, Optional
 
 class VideoProcessor:
-    def __init__(self, api_base: str = "http://localhost:8000"):
+    def __init__(self, api_base: str = "http://localhost:10000"):
         self.api_base = api_base
 
     def process_videos(
@@ -138,7 +138,7 @@ class VideoProcessor:
 import requests, time
 from typing import List, Dict
 
-def process_batch(jobs: List[Dict], api_base: str = "http://localhost:8000") -> List[Dict]:
+def process_batch(jobs: List[Dict], api_base: str = "http://localhost:10000") -> List[Dict]:
     results = []
     for i, job in enumerate(jobs, 1):
         print(f"[{i}/{len(jobs)}] Processing: {job.get('name', f'Job {i}')}")
@@ -160,7 +160,7 @@ def process_batch(jobs: List[Dict], api_base: str = "http://localhost:8000") -> 
 
 ### Basic Fetch
 ```javascript
-const response = await fetch("http://localhost:8000/process-video-url", {
+const response = await fetch("http://localhost:10000/process-video-url", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({

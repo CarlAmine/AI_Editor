@@ -9,9 +9,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
+It can:
+
+- analyze a reference video
+- build a timeline from scenes or OCR text
+- assemble clips from YouTube or Google Drive sources
+- render a master output
+- optionally post-process a Shorts preview
+- upload the approved render to YouTube
 
 ![Demo](docs/assets/03091-ezgif.com-optimize.gif)
 
+<<<<<<< HEAD
 ---
 
 ## What It Does
@@ -353,6 +362,89 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding conventions
 
 ---
 
+- `app.py` - FastAPI application entrypoint
+- `ai_editor/` - media utilities, downloaders, auth helpers, editor builders, and upload integrations
+- `pipeline/` - stage runner, planners, state management, artifact handling, and render orchestration
+- `frontend/` - React user interface
+- `docs/` - setup, deployment, troubleshooting, operations, and architecture notes
+- `tests/` - unit tests for timing and overlay behavior
+
+See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for a more detailed map of the repository and `tmp/jobs/<job_id>/` layout.
+
+## Credential Files
+
+The server may use the following local files depending on which features you enable:
+
+- `.env`
+  - required for `SHOTSTACK_KEY`
+  - also stores optional runtime configuration
+
+- `drive-oauth-client-secret.json`
+  - optional
+  - used when you want users to connect their own Google Drive account through the UI
+
+- `drive-token.json`
+  - optional
+  - generated automatically after a successful Google Drive OAuth login
+
+- `service-account.json`
+  - optional
+  - used only if you choose `DRIVE_AUTH_MODE=service_account`
+
+- `youtube-client-secret.json`
+  - optional
+  - required only if you want to upload approved renders to YouTube
+
+- `youtube-token.json`
+  - optional
+  - generated automatically after the first successful YouTube OAuth login
+
+None of these files should be committed. They are ignored by `.gitignore`.
+
+## Local Setup
+
+1. Create a Python virtual environment and install dependencies:
+   - `pip install -r requirements.txt`
+2. Copy `.env.example` to `.env` and fill in at least:
+   - `SHOTSTACK_KEY`
+   - `GROQ` if you use the chat brief builder
+3. If you want Google Drive OAuth in the UI:
+   - place `drive-oauth-client-secret.json` in the project root
+4. If you want YouTube uploads:
+   - place `youtube-client-secret.json` in the project root
+5. Start the backend:
+   - `python -m uvicorn app:app --host 0.0.0.0 --port 10000 --reload`
+6. Start the frontend:
+   - `cd frontend && npm install && npm run dev`
+
+Default local URLs:
+
+- Frontend: `http://localhost:5173`
+- Backend API: `http://localhost:10000`
+- Swagger docs: `http://localhost:10000/docs`
+
+## Operating Manual
+
+For day-to-day operation, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+That document covers:
+
+- how to start and stop the server
+- what goes in `.env`
+- when to use Drive OAuth vs service account
+- where to place Google and YouTube JSON files
+- how tokens are created
+- how to operate the UI end to end
+
+## Additional Docs
+
+- [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)
+
+---
+
 ## License
 
-MIT â€” see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -12,11 +13,13 @@ from ai_editor.analyzer import analyze_video_content_with_results
 from ai_editor.downloader import (
     VideoClapError,
     VideoDownloadError,
+    _is_youtube_url,
     clip_video,
     download_and_clip,
     download_video,
     download_video_section,
     extract_audio,
+    extract_audio_segment,
 )
 from ai_editor.editor import create_and_render_video
 
@@ -225,6 +228,73 @@ def _extract_bounded_segment(source: Dict[str, Any]) -> Optional[Tuple[float, fl
     return max(0.0, start), max(0.0, end)
 
 
+def _parse_timestamp_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    # Plain numeric string.
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if ":" not in raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) > 3 or len(parts) < 2:
+        return None
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        else:
+            hours = 0
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+    except ValueError:
+        return None
+    total = hours * 3600 + minutes * 60 + seconds
+    return float(total)
+
+
+def _extract_music_segment(requirements: Dict[str, Any]) -> Optional[Tuple[float, Optional[float]]]:
+    seg = requirements.get("custom_music_segment") or requirements.get("custom_music_segments")
+    if isinstance(seg, list) and seg:
+        seg = seg[0]
+    if isinstance(seg, str):
+        cleaned = seg.strip()
+        if "-" in cleaned and "http" not in cleaned.lower():
+            parts = [p.strip() for p in cleaned.split("-", 1)]
+            if len(parts) == 2:
+                start = _parse_timestamp_seconds(parts[0])
+                end = _parse_timestamp_seconds(parts[1])
+                if start is not None and (end is None or end > start):
+                    return max(0.0, start), end
+    if isinstance(seg, dict):
+        start = _parse_timestamp_seconds(seg.get("start"))
+        end = _parse_timestamp_seconds(seg.get("end")) if seg.get("end") is not None else None
+        if start is not None:
+            if end is not None and end <= start:
+                return None
+            return max(0.0, start), end
+
+    start = requirements.get("custom_music_start")
+    end = requirements.get("custom_music_end")
+    start_val = _parse_timestamp_seconds(start)
+    end_val = _parse_timestamp_seconds(end) if end is not None else None
+    if start_val is not None:
+        if end_val is not None and end_val <= start_val:
+            return None
+        return max(0.0, start_val), end_val
+    return None
+
+
 def _download_file(url: str, out_path: str) -> None:
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
@@ -313,6 +383,193 @@ def _sorted_indexed_artifact_keys(items: Dict[str, Any], prefix: str) -> List[st
         if suffix.isdigit():
             keys.append(key)
     return sorted(keys, key=lambda k: int(k[len(prefix):]))
+
+
+def _collect_edit_request_lines(requirements: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    for key in ("edit_requests", "user_requests"):
+        vals = requirements.get(key) or []
+        if isinstance(vals, list):
+            lines.extend([str(v) for v in vals if str(v).strip()])
+    return lines
+
+
+def _sanitize_overlay_text(text: str) -> str:
+    txt = str(text or "")
+    txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
+    txt = txt.replace("|", " ")
+    txt = txt.replace("'", "")
+    txt = " ".join(txt.split())
+    return txt.strip()
+
+
+def _parse_edit_ops(requirements: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    lines = _collect_edit_request_lines(requirements)
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        prefix = line.split(":", 1)[0].strip().lower()
+        if prefix in {"remove", "cut", "delete", "trim", "add", "replace", "swap", "edit"} and ":" in line:
+            line = line.split(":", 1)[1].strip()
+        low = line.lower()
+
+        m = re.search(r"(?:trim|remove|cut)\s+(?:the\s+)?(?:end|last)\s+(\d+(?:\.\d+)?)", low)
+        if not m:
+            m = re.search(r"last\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)", low)
+        if m:
+            ops.append({"op": "trim_end", "seconds": float(m.group(1)), "raw": raw})
+            continue
+
+        m = re.search(r"(?:remove|delete|cut)\s+(?:clip|scene)\s*(\d+)", low)
+        if m:
+            ops.append({"op": "remove_clip", "index": int(m.group(1)), "raw": raw})
+            continue
+
+        m = re.search(r"swap\s+(?:clip|scene)?\s*(\d+)\s*(?:and|with)\s*(\d+)", low)
+        if not m:
+            m = re.search(r"swap\s+(\d+)\s+(\d+)", low)
+        if m:
+            ops.append({"op": "swap", "a": int(m.group(1)), "b": int(m.group(2)), "raw": raw})
+            continue
+
+        m = re.search(
+            r"replace\s+(?:clip|scene)?\s*(\d+)\s+(?:with|from)\s*(?:clip|scene)?\s*(\d+)",
+            low,
+        )
+        if m:
+            ops.append({"op": "replace_clip", "index": int(m.group(1)), "source": int(m.group(2)), "raw": raw})
+            continue
+
+        m = re.search(
+            r"(?:add\s+)?overlay\s+text(?:\s+for)?\s*(?:clip|scene)?\s*(\d+)?\s*(?:is|=|:)?\s*(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            idx = int(m.group(1)) if m.group(1) else None
+            text = _sanitize_overlay_text(m.group(2))
+            if text:
+                ops.append({"op": "set_overlay_text", "index": idx, "text": text, "raw": raw})
+
+    return ops
+
+
+def _reflow_timeline(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cursor = 0.0
+    for idx, row in enumerate(timeline, start=1):
+        duration = float(row.get("duration", row.get("length", 0.0)) or 0.0)
+        if duration <= 0:
+            continue
+        label = str(row.get("label", "")).strip()
+        if label.startswith("scene_"):
+            prefix = "scene"
+        elif label.startswith("ocr_"):
+            prefix = "ocr"
+        else:
+            prefix = "clip"
+        row["index"] = idx
+        row["scene_id"] = int(row.get("scene_id", idx))
+        row["label"] = f"{prefix}_{idx:03d}"
+        row["start"] = cursor
+        row["end"] = cursor + duration
+        row["duration"] = duration
+        row["length"] = duration
+        row["text_start"] = row.get("text_start", row["start"])
+        row["text_end"] = row.get("text_end", row["end"])
+        cursor = row["end"]
+        out.append(row)
+    return out
+
+
+def _apply_edit_ops_to_timeline(
+    timeline: List[Dict[str, Any]],
+    ops: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not timeline or not ops:
+        return timeline, {"applied": [], "timing_changed": False, "count_changed": False}
+
+    rows = [dict(r) for r in timeline]
+    applied: List[Dict[str, Any]] = []
+    timing_changed = False
+    count_changed = False
+    overlay_queue: List[str] = []
+
+    def _valid_index(i: int) -> bool:
+        return 1 <= i <= len(rows)
+
+    for op in ops:
+        if op["op"] == "trim_end":
+            secs = max(0.0, float(op.get("seconds", 0.0)))
+            if secs <= 0 or not rows:
+                continue
+            last = rows[-1]
+            dur = float(last.get("duration", last.get("length", 0.0)) or 0.0)
+            new_dur = max(0.0, dur - secs)
+            last["duration"] = new_dur
+            last["length"] = new_dur
+            timing_changed = True
+            if new_dur <= 0:
+                rows.pop()
+                count_changed = True
+            applied.append(op)
+            continue
+
+        if op["op"] == "remove_clip":
+            idx = int(op.get("index", 0) or 0)
+            if _valid_index(idx):
+                rows.pop(idx - 1)
+                count_changed = True
+                applied.append(op)
+            continue
+
+        if op["op"] == "swap":
+            a = int(op.get("a", 0) or 0)
+            b = int(op.get("b", 0) or 0)
+            if _valid_index(a) and _valid_index(b) and a != b:
+                rows[a - 1], rows[b - 1] = rows[b - 1], rows[a - 1]
+                applied.append(op)
+            continue
+
+        if op["op"] == "replace_clip":
+            idx = int(op.get("index", 0) or 0)
+            src_idx = int(op.get("source", 0) or 0)
+            if _valid_index(idx) and _valid_index(src_idx) and idx != src_idx:
+                src = rows[src_idx - 1]
+                dst = rows[idx - 1]
+                for key in ("video_src", "videoSrc", "trim", "source_duration", "source_index"):
+                    if key in src:
+                        dst[key] = src.get(key)
+                applied.append(op)
+            continue
+
+        if op["op"] == "set_overlay_text":
+            idx = op.get("index")
+            text = _sanitize_overlay_text(op.get("text", ""))
+            if not text:
+                continue
+            if idx and _valid_index(int(idx)):
+                row = rows[int(idx) - 1]
+                row["text"] = text
+                row["text_start"] = row.get("start", 0.0)
+                row["text_end"] = row.get("end", row.get("start", 0.0))
+                applied.append(op)
+            else:
+                overlay_queue.append(text)
+                applied.append(op)
+            continue
+
+    if overlay_queue:
+        for row in rows:
+            if not overlay_queue:
+                break
+            if not str(row.get("text", "")).strip():
+                row["text"] = overlay_queue.pop(0)
+
+    rows = _reflow_timeline(rows)
+    return rows, {"applied": applied, "timing_changed": timing_changed, "count_changed": count_changed}
 
 
 def _build_reference_timeline(
@@ -666,6 +923,10 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
     requirements["prompt"] = request_payload.get("prompt", "")
     requirements["music_mode"] = request_payload.get("music_mode", "original")
     requirements["custom_music_url"] = request_payload.get("custom_music_url")
+    requirements["custom_music_start"] = request_payload.get("custom_music_start")
+    requirements["custom_music_end"] = request_payload.get("custom_music_end")
+    requirements["custom_music_segment"] = request_payload.get("custom_music_segment")
+    requirements["custom_music_segments"] = request_payload.get("custom_music_segments")
     requirements["generation_mode"] = str(requirements.get("generation_mode", "free_generation_mode")).lower()
     if requirements["generation_mode"] not in {"free_generation_mode", "reference_mimic_mode"}:
         requirements["generation_mode"] = "free_generation_mode"
@@ -904,11 +1165,38 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         soundtrack_url = None
         music_mode = requirements.get("music_mode", "original")
         custom_music_url = requirements.get("custom_music_url")
+        music_segment = _extract_music_segment(requirements)
         use_reference_audio_bed = False
         mute_source_audio = False
         if music_mode == "custom" and custom_music_url:
-            custom_video = download_video(custom_music_url, dirs["media"], "custom_music_source.mp4")
-            soundtrack_file = extract_audio(custom_video, dirs["media"], "custom_music.mp3")
+            custom_video = None
+            if music_segment:
+                seg_start, seg_end = music_segment
+                if seg_end is not None and _is_youtube_url(custom_music_url):
+                    try:
+                        custom_video = download_video_section(
+                            url=custom_music_url,
+                            output_dir=dirs["media"],
+                            filename="custom_music_source.mp4",
+                            start_time=float(seg_start),
+                            end_time=float(seg_end),
+                        )
+                    except VideoDownloadError:
+                        custom_video = None
+                if custom_video:
+                    soundtrack_file = extract_audio(custom_video, dirs["media"], "custom_music.mp3")
+                else:
+                    full_video = download_video(custom_music_url, dirs["media"], "custom_music_source.mp4")
+                    soundtrack_file = extract_audio_segment(
+                        full_video,
+                        dirs["media"],
+                        "custom_music.mp3",
+                        start_time=seg_start,
+                        end_time=seg_end,
+                    )
+            else:
+                custom_video = download_video(custom_music_url, dirs["media"], "custom_music_source.mp4")
+                soundtrack_file = extract_audio(custom_video, dirs["media"], "custom_music.mp3")
             ctx.artifacts.register_file("audio.soundtrack", soundtrack_file, {"mode": "custom"}, "audio/mpeg")
             soundtrack_url = soundtrack_file
         elif music_mode == "original" and requirements.get("generation_mode") == "reference_mimic_mode":
@@ -1012,16 +1300,35 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
                 sources=source_rows,
                 strict_index_alignment=(generation_mode == "reference_mimic_mode"),
             )
+            edit_ops = _parse_edit_ops(requirements)
+            edit_summary = None
+            if edit_ops:
+                canonical_timeline, edit_summary = _apply_edit_ops_to_timeline(canonical_timeline, edit_ops)
+                if edit_summary.get("applied"):
+                    add_warning(
+                        ctx.state,
+                        "MANUAL_EDIT_APPLIED",
+                        "Applied manual edit operations to OCR timeline.",
+                        edit_summary,
+                    )
+            for row in canonical_timeline:
+                if "text" in row:
+                    row["text"] = _sanitize_overlay_text(row.get("text", ""))
             overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
-            ocr_errors = _validate_ocr_timeline(
-                text_segments=ocr_segments,
-                timeline=canonical_timeline,
-                overlay_timing=overlay_timing,
-            )
-            if ocr_errors:
-                raise RuntimeError("OCR timing validation failed:\n" + "\n".join(ocr_errors))
+            skip_validation = bool(edit_summary and (edit_summary.get("timing_changed") or edit_summary.get("count_changed")))
+            if not skip_validation:
+                ocr_errors = _validate_ocr_timeline(
+                    text_segments=ocr_segments,
+                    timeline=canonical_timeline,
+                    overlay_timing=overlay_timing,
+                )
+                if ocr_errors:
+                    raise RuntimeError("OCR timing validation failed:\n" + "\n".join(ocr_errors))
             render_spec["canonical_timeline"] = canonical_timeline
             render_spec["overlay_timing"] = overlay_timing
+            if edit_summary:
+                render_spec["edit_summary"] = edit_summary
+                render_spec["edit_ops"] = edit_ops
 
         elif generation_mode == "reference_mimic_mode":
             source_rows = []
@@ -1057,24 +1364,43 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
                 text = script_texts[i] if i < len(script_texts) else ""
                 start = float(scene["start"])
                 end = float(scene["end"])
-                scene["text"] = text
+                scene["text"] = _sanitize_overlay_text(text)
                 scene["text_start"] = start
                 scene["text_end"] = end
+            edit_ops = _parse_edit_ops(requirements)
+            edit_summary = None
+            if edit_ops:
+                canonical_timeline, edit_summary = _apply_edit_ops_to_timeline(canonical_timeline, edit_ops)
+                if edit_summary.get("applied"):
+                    add_warning(
+                        ctx.state,
+                        "MANUAL_EDIT_APPLIED",
+                        "Applied manual edit operations to reference timeline.",
+                        edit_summary,
+                    )
+            for row in canonical_timeline:
+                if "text" in row:
+                    row["text"] = _sanitize_overlay_text(row.get("text", ""))
             overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
             reference_audio_duration = None
             if audio_plan.get("use_reference_audio_bed") and ctx.artifacts.exists("audio.soundtrack"):
                 reference_audio_duration = _probe_duration(ctx.artifacts.get("audio.soundtrack").path_or_url)
-            errors = _validate_reference_timeline(
-                analysis=analysis,
-                timeline=canonical_timeline,
-                overlay_timing=overlay_timing,
-                use_reference_audio=bool(audio_plan.get("use_reference_audio_bed")),
-                reference_audio_duration=reference_audio_duration,
-            )
-            if errors:
-                raise RuntimeError("Reference mimic validation failed:\n" + "\n".join(errors))
+            skip_validation = bool(edit_summary and (edit_summary.get("timing_changed") or edit_summary.get("count_changed")))
+            if not skip_validation:
+                errors = _validate_reference_timeline(
+                    analysis=analysis,
+                    timeline=canonical_timeline,
+                    overlay_timing=overlay_timing,
+                    use_reference_audio=bool(audio_plan.get("use_reference_audio_bed")),
+                    reference_audio_duration=reference_audio_duration,
+                )
+                if errors:
+                    raise RuntimeError("Reference mimic validation failed:\n" + "\n".join(errors))
             render_spec["canonical_timeline"] = canonical_timeline
             render_spec["overlay_timing"] = overlay_timing
+            if edit_summary:
+                render_spec["edit_summary"] = edit_summary
+                render_spec["edit_ops"] = edit_ops
 
         write_plan(dirs["job"], "overlay_plan.json", overlay_plan)
         write_plan(
@@ -1130,6 +1456,7 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
     def stage_shotstack_render():
         spec = json.load(open(os.path.join(dirs["plans"], "render_spec.json"), "r", encoding="utf-8"))
         canonical_timeline = spec.get("canonical_timeline") or []
+        edit_summary = spec.get("edit_summary") or {}
         generation_mode = str(spec.get("generation_mode", requirements.get("generation_mode", "free_generation_mode"))).lower()
         edit_mode = str(spec.get("edit_mode", requirements.get("edit_mode", "scene"))).lower().strip()
         if edit_mode not in {"scene", "ocr"}:
@@ -1200,6 +1527,7 @@ def run_job(job_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
                 generation_mode == "reference_mimic_mode"
                 and edit_mode == "scene"
                 and len(canonical_timeline) != len(analyzed_scenes)
+                and not (edit_summary.get("count_changed") or edit_summary.get("timing_changed"))
             ):
                 raise RuntimeError(
                     f"reference_mimic_mode clip-count mismatch: canonical={len(canonical_timeline)} analyzed={len(analyzed_scenes)}"

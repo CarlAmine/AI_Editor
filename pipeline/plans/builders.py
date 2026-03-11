@@ -11,9 +11,11 @@ def _normalize_detected_text(value: Any) -> str:
         return ""
     txt = " ".join(str(value).split()).strip()
     txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
-    txt = re.sub(r"\s*\|\s*", " | ", txt)
-    txt = txt.strip("\"' ")
-    txt = re.sub(r"\s*;\s*", " | ", txt)
+    txt = txt.replace("|", " ")
+    txt = txt.replace("'", "")
+    txt = re.sub(r"\s*;\s*", " ", txt)
+    txt = re.sub(r"\s+", " ", txt)
+    txt = txt.strip("\" ").strip()
     return txt
 
 
@@ -448,6 +450,10 @@ def build_audio_plan(inputs: Dict[str, Any], requirements: Dict[str, Any]) -> Di
     return {
         "music_mode": requirements.get("music_mode", "original"),
         "custom_music_url": requirements.get("custom_music_url"),
+        "custom_music_start": requirements.get("custom_music_start"),
+        "custom_music_end": requirements.get("custom_music_end"),
+        "custom_music_segment": requirements.get("custom_music_segment"),
+        "custom_music_segments": requirements.get("custom_music_segments"),
         "soundtrack_url": inputs.get("soundtrack_url"),
         "use_reference_audio_bed": bool(inputs.get("use_reference_audio_bed", False)),
         "mute_source_audio": bool(inputs.get("mute_source_audio", False)),

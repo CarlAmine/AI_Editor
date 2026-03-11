@@ -4,6 +4,7 @@ import time
 import requests
 import textwrap
 import copy
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Union, Any
 from dataclasses import dataclass, asdict
@@ -564,6 +565,14 @@ def create_and_render_video(
 
     planning_warnings: List[Dict[str, Any]] = []
 
+    def _clean_overlay_text(text: str) -> str:
+        txt = str(text or "")
+        txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
+        txt = txt.replace("|", " ")
+        txt = txt.replace("'", "")
+        txt = " ".join(txt.split())
+        return txt.strip()
+
     # Process Text Overlays
     # Priority 1: Use an explicit overlay_plan (timestamps from analyzer + LLM).
     # Priority 2: Fall back to evenly-spaced overlays based on overlay_text.
@@ -572,12 +581,12 @@ def create_and_render_video(
     if use_canonical_timeline and canonical_timeline:
         # Strict canonical policy: overlay timing must match canonical timeline exactly.
         # Ignore heuristic/legacy timing sources (overlay_timing/overlay_plan) in this mode.
-        overlay_texts = [str(row.get("text", "")).strip() for row in canonical_timeline]
+        overlay_texts = [_clean_overlay_text(str(row.get("text", "")).strip()) for row in canonical_timeline]
         if not any(overlay_texts) and overlay_timing:
             for i, item in enumerate(sorted(overlay_timing, key=lambda o: float(o.get("start", 0.0)))):
                 if i >= len(overlay_texts):
                     break
-                overlay_texts[i] = str(item.get("text", "")).strip()
+                overlay_texts[i] = _clean_overlay_text(str(item.get("text", "")).strip())
         for i, row in enumerate(canonical_timeline):
             start = float(row.get("start", 0.0))
             duration = float(row.get("duration", row.get("length", 0.0)))
@@ -586,7 +595,7 @@ def create_and_render_video(
             text = overlay_texts[i] if i < len(overlay_texts) and overlay_texts[i] else " "
             text_overlays.append(
                 TextOverlay(
-                    text=text,
+                    text=_clean_overlay_text(text),
                     start_time=start,
                     duration=duration,
                     position="top",
@@ -607,7 +616,7 @@ def create_and_render_video(
             raw_text = item.get("text", "")
             if not raw_text:
                 continue
-            text = str(raw_text).strip()
+            text = _clean_overlay_text(str(raw_text).strip())
             if not text:
                 continue
 
@@ -624,7 +633,7 @@ def create_and_render_video(
             dur = max(0.01, min(dur, total_video_duration - ts))
             text_overlays.append(
                 TextOverlay(
-                    text=text,
+                    text=_clean_overlay_text(text),
                     start_time=ts,
                     duration=dur,
                     position=position,
@@ -637,7 +646,7 @@ def create_and_render_video(
         for i, text in enumerate(overlay_text):
             text_overlays.append(
                 TextOverlay(
-                    text=text,
+                    text=_clean_overlay_text(text),
                     start_time=(i + 1) * interval - 1.5,
                     duration=min(3.0, max(0.5, interval - 0.1)),
                     position="center" if i % 2 == 0 else "bottom",

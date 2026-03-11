@@ -111,6 +111,10 @@ class ProcessVideoURLRequest(BaseModel):
     prompt: str
     music_mode: str = "original"  # "original" or "custom"
     custom_music_url: Optional[str] = None
+    custom_music_start: Optional[str] = None
+    custom_music_end: Optional[str] = None
+    custom_music_segment: Optional[str] = None
+    custom_music_segments: Optional[List[VideoSegment]] = None
     google_drive_link: Optional[str] = None
     edit_mode: Optional[str] = None
     job_id: Optional[str] = None
@@ -204,6 +208,14 @@ async def process_video_url(request: ProcessVideoURLRequest):
             prompt=request.prompt,
             music_mode=request.music_mode,
             custom_music_url=request.custom_music_url,
+            custom_music_start=request.custom_music_start,
+            custom_music_end=request.custom_music_end,
+            custom_music_segment=request.custom_music_segment,
+            custom_music_segments=(
+                [{"start": s.start, "end": s.end} for s in (request.custom_music_segments or [])]
+                if request.custom_music_segments
+                else None
+            ),
             requirements_state=requirements_state,
             job_id=request.job_id,
             gdrive_folder_id=folder_id,

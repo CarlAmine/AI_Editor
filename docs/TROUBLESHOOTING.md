@@ -1,100 +1,156 @@
 # Troubleshooting Guide
 
----
-
 ## Quick Diagnostics
 
 ```bash
 # Backend running?
-curl http://localhost:8000/docs
+curl http://localhost:10000/docs
 
 # FFmpeg installed?
 ffmpeg -version
 
 # Python deps installed?
-python -c "import fastapi, yt_dlp, langchain; print('OK')"
-
-# .env file exists?
-cat .env | grep SHOTSTACK_KEY
+python -c "import fastapi, yt_dlp; print('OK')"
 ```
-
----
 
 ## Backend Issues
 
+### Backend does not start
+
+Check:
+
+- `.env` exists in the project root
+- `SHOTSTACK_KEY` is set
+- dependencies are installed
+
+Run:
+
+```bash
+python -m uvicorn app:app --host 0.0.0.0 --port 10000 --reload
+```
+
 ### Port already in use
+
 ```bash
-lsof -i :8000         # macOS/Linux
-netstat -ano | findstr 8000  # Windows
-kill -9 <PID>
+netstat -ano | findstr 10000
 ```
 
-### ModuleNotFoundError
-```bash
-pip install -r requirements.txt
-```
+Then stop the conflicting process.
 
-### ffmpeg not found
-```bash
-# macOS: brew install ffmpeg
-# Linux: sudo apt-get install ffmpeg
-# Windows: Download from https://ffmpeg.org and add to PATH
-```
+### `ffmpeg` or `ffprobe` not found
+
+Install FFmpeg and ensure it is on `PATH`.
 
 ### Video download fails
-- Confirm the video URL is public and not age-restricted
-- Test with: `https://www.youtube.com/watch?v=dQw4w9WgXcQ`
-- Check your internet connection
 
-### Render fails (Shotstack)
-- Verify `SHOTSTACK_KEY` in `.env`
-- For longer videos, switch to production: `SHOTSTACK_HOST=https://api.shotstack.io/production`
+Check:
 
-### Temp files not cleaned up
-```bash
-rm -rf ./tmp/videos/
-```
+- the source URL is public
+- the timestamp range is inside the source duration
+- `yt-dlp` is installed
 
----
+### Shotstack render fails
+
+Check:
+
+- `SHOTSTACK_KEY` in `.env`
+- asset URLs are publicly fetchable
+- the render payload under `tmp/jobs/<job_id>/plans/`
+
+## Google Drive Issues
+
+### `Drive OAuth client secret not found`
+
+Provide one of:
+
+- `drive-oauth-client-secret.json`
+- `drive-client-secret.json`
+- or set `DRIVE_CLIENT_SECRET_FILE`
+
+### `Drive OAuth not connected`
+
+This means the backend could not find a valid Drive OAuth token.
+
+Fix:
+
+1. Start backend on `http://localhost:10000`
+2. In the UI, click `Connect Google Drive`
+3. Finish login
+4. Confirm `drive-token.json` was created
+
+### Service account cannot access folder
+
+Check:
+
+- `DRIVE_AUTH_MODE=service_account`
+- `service-account.json` is valid
+- the Drive folder is shared with the service account email
+
+### Service account upload quota or My Drive problems
+
+Use `DRIVE_AUTH_MODE=oauth_user` instead. It is usually the correct local workflow.
+
+## YouTube Issues
+
+### `YouTube OAuth client secret file not found`
+
+Provide:
+
+- `youtube-client-secret.json`
+- or set `YOUTUBE_CLIENT_SECRET_FILE`
+
+### Upload goes to the wrong YouTube account
+
+The active account is controlled by `youtube-token.json`, not by the client secret JSON.
+
+Fix:
+
+1. delete `youtube-token.json`
+2. upload again
+3. log in with the intended Google account
+
+### YouTube Data API not enabled
+
+Enable `YouTube Data API v3` in the Google Cloud project that owns your OAuth client.
+
+### Upload fails after render download
+
+Check:
+
+- the render URL is reachable
+- local `/files/...` mapping resolves correctly
+- `YOUTUBE_RENDER_DOWNLOAD_READ_TIMEOUT` if the file is large
 
 ## Frontend Issues
 
-### Cannot connect to backend
-- Ensure backend is running on port 8000
-- Check CORS is configured in `app.py`
+### Frontend cannot reach backend
 
-### Segment format error
-```
-✓ Correct:  "10-20, 30-40"
-✗ Wrong:    "10-2030-40"   (missing comma)
-✗ Wrong:    "10-20,30-40"  (missing space)
-```
+Check:
 
----
+- backend is running on port `10000`
+- frontend uses `VITE_API_BASE_URL=http://localhost:10000` if needed
 
-## Deployment Issues
+### Bulk source import not parsed correctly
 
-### Works locally, fails on server
-1. Confirm production `.env` has correct API keys
-2. Confirm FFmpeg is installed on the server
-3. Confirm `./tmp/videos/` has write permissions
+Use:
 
-### Disk space exhaustion
-```bash
-df -h
-rm -rf ./tmp/videos/*
-# Add cron: 0 * * * * rm -rf /path/to/tmp/videos/*
+```text
+https://www.youtube.com/watch?v=abc123 - 10-20, 35-45
+https://www.youtube.com/watch?v=def456 - 01:10-01:25
 ```
 
----
+## Runtime File Cleanup
 
-## Resource Links
+Job artifacts are written to:
 
-- Shotstack Docs: https://shotstack.io/docs/
-- yt-dlp Issues: https://github.com/yt-dlp/yt-dlp/issues
-- FastAPI Docs: https://fastapi.tiangolo.com/
-- FFmpeg Wiki: https://trac.ffmpeg.org/wiki
+```text
+tmp/jobs/<job_id>/
+```
 
----
+If disk usage becomes large, clean old jobs manually.
 
-**Last Updated:** March 2026
+## More Information
+
+- [SETUP_GUIDE.md](SETUP_GUIDE.md)
+- [OPERATIONS.md](OPERATIONS.md)
+- [DEPLOYMENT.md](DEPLOYMENT.md)

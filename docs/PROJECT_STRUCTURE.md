@@ -40,6 +40,9 @@ This project is split into a small number of top-level areas. The goal is to kee
 - `.env.example`
   - Reference environment variables.
 
+- `docs/OPERATIONS.md`
+  - Day-to-day server operation manual and credential handling guide.
+
 ## Per-Job Layout
 
 Each job is written to `tmp/jobs/<job_id>/`.

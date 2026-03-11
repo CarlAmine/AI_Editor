@@ -1,58 +1,97 @@
 # Setup Guide
 
-Get the AI Editor running in under 15 minutes.
-
----
+This guide gets the project running locally with the current server layout.
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Node.js 18+
-- [FFmpeg](https://ffmpeg.org/download.html) installed and on your PATH
+- FFmpeg installed and available on `PATH`
 
-**Install FFmpeg:**
+Verify:
+
 ```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows (Chocolatey)
-choco install ffmpeg
+ffmpeg -version
+python --version
+node --version
 ```
 
----
-
-## 1. Clone the repository
+## 1. Clone the Repository
 
 ```bash
 git clone https://github.com/CarlAmine/AI_Editor.git
 cd AI_Editor
 ```
 
-## 2. Configure environment variables
+## 2. Install Backend Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+## 3. Create `.env`
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in your keys:
+Edit `.env` and set at least:
 
 ```env
-SHOTSTACK_KEY=your_shotstack_api_key
-DEEPSEEK_KEY=your_deepseek_api_key
-GROQ=your_groq_api_key
+SHOTSTACK_KEY="your-shotstack-api-key"
+GROQ="your-groq-api-key"
+DRIVE_AUTH_MODE="oauth_user"
+DRIVE_OAUTH_REDIRECT_URI="http://localhost:10000/google-drive/oauth/callback"
 ```
 
-## 3. Start the backend
+## 4. Add Optional Credential Files
+
+Add only the files you actually need:
+
+### Google Drive OAuth in the UI
+
+Place in project root:
+
+- `drive-oauth-client-secret.json`
+
+Generated automatically later:
+
+- `drive-token.json`
+
+### Google Drive service account mode
+
+Place in project root:
+
+- `service-account.json`
+
+Or set:
+
+```env
+GOOGLE_APPLICATION_CREDENTIALS="C:\\path\\to\\service-account.json"
+```
+
+### YouTube upload
+
+Place in project root:
+
+- `youtube-client-secret.json`
+
+Generated automatically later:
+
+- `youtube-token.json`
+
+## 5. Start the Backend
 
 ```bash
-pip install -r requirements.txt
-python -m uvicorn app:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app:app --host 0.0.0.0 --port 10000 --reload
 ```
 
-## 4. Start the frontend
+Backend URLs:
+
+- API: `http://localhost:10000`
+- Swagger docs: `http://localhost:10000/docs`
+
+## 6. Start the Frontend
 
 ```bash
 cd frontend
@@ -60,29 +99,34 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5173`.  
-Interactive API docs: `http://localhost:8000/api/docs`
+Frontend URL:
 
----
+- `http://localhost:5173`
 
-## Verification Checklist
+If needed, set `frontend/.env`:
 
-```bash
-# System
-ffmpeg -version        # ✓ FFmpeg installed
-python --version       # ✓ Python 3.8+
-node --version         # ✓ Node 18+
-
-# Python deps
-python -c "import fastapi, yt_dlp; print('OK')"
-
-# Services running
-curl http://localhost:8000/docs   # ✓ Swagger UI
-curl http://localhost:5173        # ✓ Frontend
+```env
+VITE_API_BASE_URL=http://localhost:10000
 ```
 
----
+## 7. First-Time Verification
 
-## Troubleshooting
+### Backend
 
-See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues and fixes.
+```bash
+curl http://localhost:10000/docs
+```
+
+### Frontend
+
+Open `http://localhost:5173`
+
+### Python dependencies
+
+```bash
+python -c "import fastapi, yt_dlp; print('OK')"
+```
+
+## 8. Next Step
+
+After setup, use [OPERATIONS.md](OPERATIONS.md) for daily usage and credential handling.

@@ -1,132 +1,189 @@
 # Deployment Guide
 
----
+This guide covers a basic deployment layout for AI-Editor.
 
 ## Pre-Deployment Checklist
 
-- [ ] All endpoints tested locally
-- [ ] Production `.env` configured with live API keys
-- [ ] FFmpeg installed on server
-- [ ] Disk space available (50 GB+ recommended)
+- All endpoints tested locally
+- Production `.env` prepared
+- FFmpeg installed on the server
+- Python and Node versions verified
+- Disk space available for `tmp/jobs/`
+- Credential files stored outside Git
 
----
-
-## 1. Server Setup
+## 1. Server Layout
 
 ```bash
 git clone https://github.com/CarlAmine/AI_Editor.git /opt/ai-editor
 cd /opt/ai-editor
-mkdir -p tmp/videos logs
-```
-
-## 2. Python Environment
-
-```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+mkdir -p tmp/jobs
 ```
 
-## 3. Environment Variables
+## 2. Production Environment
+
+Create `/opt/ai-editor/.env`:
+
+```env
+SHOTSTACK_KEY="your-production-shotstack-key"
+GROQ="your-groq-key"
+DRIVE_AUTH_MODE="oauth_user"
+DRIVE_OAUTH_REDIRECT_URI="https://your-domain.example/google-drive/oauth/callback"
+YTDLP_SECTION_MODE="fast"
+```
+
+Optional:
+
+```env
+DRIVE_CLIENT_SECRET_FILE="/opt/ai-editor/secrets/drive-oauth-client-secret.json"
+DRIVE_TOKEN_FILE="/opt/ai-editor/secrets/drive-token.json"
+GOOGLE_APPLICATION_CREDENTIALS="/opt/ai-editor/secrets/service-account.json"
+YOUTUBE_CLIENT_SECRET_FILE="/opt/ai-editor/secrets/youtube-client-secret.json"
+YOUTUBE_TOKEN_FILE="/opt/ai-editor/secrets/youtube-token.json"
+```
+
+## 3. Credential Files
+
+Do not store real credential files in Git.
+
+Recommended production location:
+
+```text
+/opt/ai-editor/secrets/
+```
+
+Common files:
+
+- `drive-oauth-client-secret.json`
+- `drive-token.json`
+- `service-account.json`
+- `youtube-client-secret.json`
+- `youtube-token.json`
+
+Set permissions:
 
 ```bash
-cp .env.example .env
-chmod 600 .env
-# Edit .env with production keys
-```
-
-Production `.env`:
-```env
-SHOTSTACK_KEY=your_production_key
-SHOTSTACK_HOST=https://api.shotstack.io/production
-DEEPSEEK_KEY=your_deepseek_key
-GROQ=your_groq_key
+chmod 600 /opt/ai-editor/.env
+chmod 600 /opt/ai-editor/secrets/*
 ```
 
 ## 4. Frontend Build
 
 ```bash
-cd frontend
+cd /opt/ai-editor/frontend
 npm install
 npm run build
-# Output in frontend/dist/
 ```
 
-## 5. Start Backend
+Optional frontend environment:
 
-**Development:**
+```env
+VITE_API_BASE_URL=https://your-domain.example
+```
+
+## 5. Start the Backend
+
+### Development-style run
+
 ```bash
-python -m uvicorn app:app --reload --port 8000
+/opt/ai-editor/venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 10000
 ```
 
-**Production (Gunicorn):**
-```bash
-pip install gunicorn
-gunicorn app:app \
-  --workers 4 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
-  --timeout 300
-```
+### Systemd service
 
-**Systemd service** (recommended for production):
 ```ini
-# /etc/systemd/system/ai-editor.service
 [Unit]
-Description=AI Editor
+Description=AI Editor API
 After=network.target
 
 [Service]
 WorkingDirectory=/opt/ai-editor
-ExecStart=/opt/ai-editor/venv/bin/gunicorn app:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 300
+EnvironmentFile=/opt/ai-editor/.env
+ExecStart=/opt/ai-editor/venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 10000
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Enable it:
+
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable ai-editor
 sudo systemctl start ai-editor
 ```
 
-## 6. Nginx (Optional)
+## 6. Reverse Proxy
+
+Recommended approach: serve the static frontend from Nginx and proxy the backend API routes explicitly.
+
+Example Nginx configuration:
 
 ```nginx
 server {
     listen 80;
-    server_name yourdomain.com;
+    server_name your-domain.example;
 
     location / {
         root /opt/ai-editor/frontend/dist;
         try_files $uri /index.html;
     }
 
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000/;
+    location /process-video-url {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /chat {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /upload-approved-video-youtube {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /google-drive/ {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /files/ {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /docs {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_read_timeout 600s;
+    }
+
+    location /openapi.json {
+        proxy_pass http://127.0.0.1:10000;
         proxy_read_timeout 600s;
     }
 }
 ```
 
----
+If you serve frontend and backend from different origins, ensure the frontend points to the correct API base URL.
 
-## Post-Deployment Verification
+## 7. Post-Deployment Checks
 
 ```bash
-curl https://yourdomain.com/api/docs    # Swagger UI loads
-df -h                                   # Disk space OK
-systemctl status ai-editor              # Service running
+curl http://127.0.0.1:10000/docs
+systemctl status ai-editor
+df -h
 ```
 
----
+## 8. Operational Notes
 
-## Maintenance
+- `tmp/jobs/` will grow over time; monitor disk usage
+- OAuth token files persist between restarts
+- to switch the YouTube upload account, delete the configured `youtube-token.json`
+- to reset Drive OAuth, delete the configured `drive-token.json`
 
-- **Daily:** Check `logs/error.log` and disk usage
-- **Weekly:** Review system updates
-- **Monthly:** Rotate API keys, update dependencies
-
----
-
-**Last Updated:** March 2026
+For day-to-day operation, see [OPERATIONS.md](OPERATIONS.md).

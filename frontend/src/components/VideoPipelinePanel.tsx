@@ -44,6 +44,14 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   currentState = {},
 }) => {
   const normalizeSourceUrl = (value: string): string => value.trim().toLowerCase();
+  const toAbsoluteUrl = (value?: string | null): string => {
+    if (!value) return "";
+    if (value.startsWith("/")) {
+      return `${apiBase}${value}`;
+    }
+    return value;
+  };
+  const getPreviewUrl = (value?: string | null): string => toAbsoluteUrl(value);
 
   const [primaryUrl, setPrimaryUrl] = useState("");
   const [sources, setSources] = useState<VideoSource[]>([]);
@@ -53,6 +61,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   const [prompt, setPrompt] = useState("");
   const [musicMode, setMusicMode] = useState<"original" | "custom">("original");
   const [customMusicUrl, setCustomMusicUrl] = useState("");
+  const [customMusicSegment, setCustomMusicSegment] = useState("");
   const [intentMode, setIntentMode] = useState<"video" | "shorts">("video");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [result, setResult] = useState<PipelineResult | null>(null);
@@ -195,6 +204,10 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       prompt: prompt.trim(),
       music_mode: musicMode,
       custom_music_url: musicMode === "custom" ? customMusicUrl.trim() : null,
+      custom_music_segment:
+        musicMode === "custom" && customMusicSegment.trim()
+          ? customMusicSegment.trim()
+          : null,
       google_drive_link: googleDriveLink.trim() || null,
       requirements_state: {
         ...(currentState || {}),
@@ -236,6 +249,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         setPrompt("");
         setMusicMode("original");
         setCustomMusicUrl("");
+        setCustomMusicSegment("");
         setIntentMode("video");
         setBulkSourceSpec("");
       }
@@ -643,16 +657,32 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
         {/* Custom Music URL (conditional) */}
         {musicMode === "custom" && (
-          <label className="field">
-            <span className="field-label">Custom Music URL</span>
-            <input
-              type="text"
-              className="field-input"
-              placeholder="https://www.youtube.com/watch?v=... (audio or music video)"
-              value={customMusicUrl}
-              onChange={(e) => setCustomMusicUrl(e.target.value)}
-            />
-          </label>
+          <>
+            <label className="field">
+              <span className="field-label">Custom Music URL</span>
+              <input
+                type="text"
+                className="field-input"
+                placeholder="https://www.youtube.com/watch?v=... (audio or music video)"
+                value={customMusicUrl}
+                onChange={(e) => setCustomMusicUrl(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span className="field-label">Custom Music Segment (Optional)</span>
+              <input
+                type="text"
+                className="field-input"
+                placeholder="0:00-0:13 or 10-25"
+                value={customMusicSegment}
+                onChange={(e) => setCustomMusicSegment(e.target.value)}
+              />
+              <p className="field-hint">
+                If provided, only this portion of the music URL is used. Accepts
+                seconds or <code>HH:MM:SS</code> ranges.
+              </p>
+            </label>
+          </>
         )}
 
         {/* Submit Button */}
@@ -674,9 +704,23 @@ export const VideoPipelinePanel: React.FC<Props> = ({
           {result.success ? (
             <>
               <strong>Success:</strong> Your video is ready:{" "}
-              <a href={result.preview_url || result.url} target="_blank" rel="noopener noreferrer">
-                {result.preview_url || result.url}
+              <a
+                href={getPreviewUrl(result.preview_url) || result.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {getPreviewUrl(result.preview_url) || result.url}
               </a>
+              {getPreviewUrl(result.preview_url) || result.url ? (
+                <div className="render-preview">
+                  <video
+                    className="render-preview-video"
+                    src={getPreviewUrl(result.preview_url) || result.url}
+                    controls
+                    preload="metadata"
+                  />
+                </div>
+              ) : null}
             </>
           ) : (
             <>
@@ -699,7 +743,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
             Review the rendered video, then approve it before sending it to YouTube.
           </p>
           <a
-            href={result.preview_url || result.url}
+            href={toAbsoluteUrl(result.preview_url) || result.url}
             target="_blank"
             rel="noopener noreferrer"
             className="source-url"

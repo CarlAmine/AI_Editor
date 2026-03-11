@@ -318,6 +318,79 @@ def extract_audio(video_path: str, output_dir: str, audio_filename: str = "audio
         raise VideoClapError(f"Audio extraction error: {str(e)}")
 
 
+def extract_audio_segment(
+    source_path: str,
+    output_dir: str,
+    audio_filename: str,
+    start_time: float,
+    end_time: Optional[float] = None,
+) -> str:
+    """
+    Extract a segment of audio from a media file (video or audio).
+
+    Args:
+        source_path (str): Path to source media file
+        output_dir (str): Directory to save audio
+        audio_filename (str): Output audio filename
+        start_time (float): Start time in seconds
+        end_time (float, optional): End time in seconds (if None, extract to end)
+
+    Returns:
+        str: Path to extracted audio segment
+
+    Raises:
+        VideoClapError: If extraction fails
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    audio_path = os.path.join(output_dir, audio_filename)
+
+    try:
+        start = max(0.0, float(start_time or 0.0))
+        duration = None
+        if end_time is not None:
+            end = float(end_time)
+            if end <= start:
+                raise VideoClapError("Audio segment end time must be greater than start time.")
+            duration = end - start
+
+        cmd = [
+            "ffmpeg",
+            "-ss",
+            str(start),
+            "-i",
+            source_path,
+        ]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += [
+            "-vn",
+            "-map",
+            "0:a:0?",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            "-y",
+            audio_path,
+        ]
+
+        print(f"[downloader] Extracting audio segment to: {audio_path}")
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            raise VideoClapError("Audio extraction failed: source has no usable audio stream.")
+
+        print(f"✓ Audio segment extracted: {audio_path}")
+        return audio_path
+
+    except subprocess.CalledProcessError as e:
+        raise VideoClapError(f"ffmpeg audio segment extraction failed: {e.stderr.decode()}")
+    except FileNotFoundError:
+        raise VideoClapError("ffmpeg not found. Install from: https://ffmpeg.org/download.html")
+    except Exception as e:
+        raise VideoClapError(f"Audio segment extraction error: {str(e)}")
+
+
 def clip_video(
     video_path: str,
     output_path: str,
