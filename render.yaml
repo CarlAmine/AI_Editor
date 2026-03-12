@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: ai-editor-api
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # Secrets: Render will prompt you for these on first deploy.
+      - key: GROQ
+        sync: false
+      - key: SHOTSTACK_KEY
+        sync: false
+      # OAuth/Drive/YouTube paths or secrets (set after uploading secret files).
+      - key: DRIVE_OAUTH_REDIRECT_URI
+        sync: false
+      - key: DRIVE_CLIENT_SECRET_FILE
+        sync: false
+      - key: DRIVE_TOKEN_FILE
+        sync: false
+      - key: YOUTUBE_CLIENT_SECRET_FILE
+        sync: false
+      - key: YOUTUBE_TOKEN_FILE
+        sync: false
+
+  - type: web
+    name: ai-editor-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      # Set this to your backend service URL, e.g. https://ai-editor-api.onrender.com
+      - key: VITE_API_BASE_URL
+        sync: false
