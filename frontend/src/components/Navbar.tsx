@@ -15,6 +15,7 @@ const navLinks = [
   { href: "/architecture", label: "Architecture" },
   { href: "/stack", label: "Tech Stack" },
   { href: "/docs", label: "Docs" },
+  { href: "/pipeline", label: "Pipeline" },
 ];
 
 export default function Navbar() {
