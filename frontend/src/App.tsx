@@ -1,50 +1,88 @@
-import React, { useState } from "react";
-import { ChatPanel } from "./components/ChatPanel";
-import { VideoPipelinePanel } from "./components/VideoPipelinePanel";
+/* ============================================================
+   AI EDITOR SHOWCASE — App Router
+   Design: Cinematic Dark Editorial
+   Routes: Home, About, Features, Architecture, Docs, Stack
+   ============================================================ */
 
-const apiBase =
-  import.meta.env.VITE_API_BASE_URL?.toString().replace(/\/$/, "") ||
-  "http://localhost:10000";
+import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import NotFound from "@/pages/NotFound";
+import { Route, Switch, useLocation } from "wouter";
+import ErrorBoundary from "./components/ErrorBoundary";
+import { ThemeProvider } from "./contexts/ThemeContext";
+import { AnimatePresence, motion } from "framer-motion";
+import Home from "./pages/Home";
+import About from "./pages/About";
+import Features from "./pages/Features";
+import Architecture from "./pages/Architecture";
+import Stack from "./pages/Stack";
+import Docs from "./pages/Docs";
+import Navbar from "./components/Navbar";
+import PageLoader from "./components/PageLoader";
+import { useState, useEffect } from "react";
 
-export const App: React.FC = () => {
-  const [analyzerOutput, setAnalyzerOutput] = useState<string>("");
-  const [currentState, setCurrentState] = useState<Record<string, unknown>>({});
+const pageVariants = {
+  initial: { opacity: 0, y: 16 },
+  animate: { opacity: 1, y: 0, transition: { duration: 0.4 } },
+  exit: { opacity: 0, y: -8, transition: { duration: 0.25 } },
+};
+
+function AnimatedRoute({ component: Component }: { component: React.ComponentType }) {
+  return (
+    <motion.div
+      variants={pageVariants}
+      initial="initial"
+      animate="animate"
+      exit="exit"
+      style={{ minHeight: "100vh" }}
+    >
+      <Component />
+    </motion.div>
+  );
+}
+
+function Router() {
+  const [location] = useLocation();
+  return (
+    <AnimatePresence mode="wait">
+      <Switch key={location} location={location}>
+        <Route path="/" component={() => <AnimatedRoute component={Home} />} />
+        <Route path="/about" component={() => <AnimatedRoute component={About} />} />
+        <Route path="/features" component={() => <AnimatedRoute component={Features} />} />
+        <Route path="/architecture" component={() => <AnimatedRoute component={Architecture} />} />
+        <Route path="/stack" component={() => <AnimatedRoute component={Stack} />} />
+        <Route path="/docs" component={() => <AnimatedRoute component={Docs} />} />
+        <Route component={NotFound} />
+      </Switch>
+    </AnimatePresence>
+  );
+}
+
+function App() {
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setLoading(false), 2200);
+    return () => clearTimeout(timer);
+  }, []);
 
   return (
-    <div className="app-root">
-      <header className="app-header">
-        <div className="app-title-block">
-          <h1 className="app-title">AI Editor Studio</h1>
-          <p className="app-subtitle">
-            Analyze raw footage, capture requirements, and render polished edits
-            from one interface.
-          </p>
-        </div>
-        <div className="app-badge-row">
-          <span className="app-badge">FastAPI | React | Groq | Shotstack</span>
-        </div>
-      </header>
-
-      <main className="app-main">
-        <section className="app-grid">
-          <VideoPipelinePanel
-            apiBase={apiBase}
-            onAnalyzerSummary={setAnalyzerOutput}
-            currentState={currentState}
-          />
-          <ChatPanel
-            apiBase={apiBase}
-            analyzerOutput={analyzerOutput}
-            onStateUpdate={setCurrentState}
-          />
-        </section>
-      </main>
-
-      <footer className="app-footer">
-        <span>Backend API: {apiBase}</span>
-      </footer>
-    </div>
+    <ErrorBoundary>
+      <ThemeProvider defaultTheme="dark">
+        <TooltipProvider>
+          <Toaster />
+          {loading ? (
+            <PageLoader onComplete={() => setLoading(false)} />
+          ) : (
+            <div className="min-h-screen bg-background">
+              <Navbar />
+              <Router />
+            </div>
+          )}
+        </TooltipProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
-};
+}
 
 export default App;
