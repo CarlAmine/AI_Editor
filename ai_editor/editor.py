@@ -55,7 +55,7 @@ def _wrap_text_for_html(text: str, wrap_width: int) -> str:
             current = [word]
     if current:
         lines.append(" ".join(current))
-    return "<br/>".join(lines[:3])
+    return "<br/>".join(lines)
 
 
 def normalize_tracks(edit: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -670,13 +670,14 @@ def create_and_render_video(
     def _get_offset(position):
         if debug_text_visibility:
             return {"x": 0.0, "y": 0.0}
+        safe_for_9x16 = mobile_safe_text_mode or force_mobile_safe_text or output_mode == "crop_to_9x16"
         if position == "top":
-            y_default = -0.2
+            y_default = -0.16 if safe_for_9x16 else -0.2
         elif position == "bottom":
-            y_default = 0.2
+            y_default = 0.16 if safe_for_9x16 else 0.2
         else:
             y_default = -0.0
-        return {"x": 0.0, "y": _clamp(y_default, -0.25, 0.25)}
+        return {"x": 0.0, "y": _clamp(y_default, -0.22, 0.22)}
 
     def _overlay_width() -> int:
         if resolution == "1920x1080":
@@ -690,9 +691,27 @@ def create_and_render_video(
         wrapped = _wrap_text_for_html(text, wrap_width)
         if not wrapped:
             wrapped = "&nbsp;"
+        line_count = wrapped.count("<br/>") + 1
+        raw_len = len(re.sub(r"<br/>", "", wrapped))
+        font_size = 48 if output_mode == "crop_to_9x16" else 54
+        if line_count >= 4:
+            font_size -= 6
+        if line_count >= 5:
+            font_size -= 6
+        if raw_len >= 80:
+            font_size -= 4
+        if raw_len >= 110:
+            font_size -= 4
+        font_size = max(28, font_size)
+        line_height = 1.2 if line_count <= 3 else (1.15 if line_count == 4 else 1.1)
         return (
             f"<div style=\"font-family:'Space Grotesk',sans-serif;"
-            f"font-size:54px;line-height:1.2;color:#ffffff;text-align:center;\">{wrapped}</div>"
+            f"font-size:{font_size}px;line-height:{line_height};font-weight:600;"
+            f"color:#ffffff;text-align:center;padding:2px 4px;"
+            f"-webkit-text-stroke:2px rgba(0,0,0,0.85);"
+            f"text-shadow: 1px 1px 0 #000, -1px 1px 0 #000, "
+            f"1px -1px 0 #000, -1px -1px 0 #000, 0 2px 8px rgba(0,0,0,0.55);"
+            f"max-width:100%;box-sizing:border-box;\">{wrapped}</div>"
         )
 
     def _fit_overlay_text(text: str) -> str:
@@ -708,7 +727,8 @@ def create_and_render_video(
         if len(compact) <= wrap_width:
             return compact
         wrapped = textwrap.wrap(compact, width=wrap_width)
-        return "\n".join(wrapped[:2])
+        return "\n".join(wrapped)
+
 
     # Build intermediate edit spec (dict), normalize, validate, then convert to SDK objects.
     video_clip_specs = []
@@ -1131,4 +1151,11 @@ def create_and_render_video(
             "success": False,
             "error": str(e)
         }
+
+
+
+
+
+
+
 
