@@ -9,6 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
+
 It can:
 
 - analyze a reference video
@@ -20,7 +21,6 @@ It can:
 
 ![Demo](docs/assets/03091-ezgif.com-optimize.gif)
 
-<<<<<<< HEAD
 ---
 
 ## What It Does
@@ -375,31 +375,16 @@ See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for a more detailed m
 
 The server may use the following local files depending on which features you enable:
 
-- `.env`
-  - required for `SHOTSTACK_KEY`
-  - also stores optional runtime configuration
-
-- `drive-oauth-client-secret.json`
-  - optional
-  - used when you want users to connect their own Google Drive account through the UI
-
-- `drive-token.json`
-  - optional
-  - generated automatically after a successful Google Drive OAuth login
-
-- `service-account.json`
-  - optional
-  - used only if you choose `DRIVE_AUTH_MODE=service_account`
-
-- `youtube-client-secret.json`
-  - optional
-  - required only if you want to upload approved renders to YouTube
-
-- `youtube-token.json`
-  - optional
-  - generated automatically after the first successful YouTube OAuth login
+- `.env` — required for `SHOTSTACK_KEY`, also stores optional runtime configuration
+- `drive-oauth-client-secret.json` — optional, used when you want users to connect their own Google Drive account through the UI
+- `drive-token.json` — optional, generated automatically after a successful Google Drive OAuth login
+- `service-account.json` — optional, used only if you choose `DRIVE_AUTH_MODE=service_account`
+- `youtube-client-secret.json` — optional, required only if you want to upload approved renders to YouTube
+- `youtube-token.json` — optional, generated automatically after the first successful YouTube OAuth login
 
 None of these files should be committed. They are ignored by `.gitignore`.
+
+---
 
 ## Local Setup
 
@@ -423,11 +408,11 @@ Default local URLs:
 - Backend API: `http://localhost:10000`
 - Swagger docs: `http://localhost:10000/docs`
 
+---
+
 ## Operating Manual
 
-For day-to-day operation, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
-
-That document covers:
+For day-to-day operation, see [docs/OPERATIONS.md](docs/OPERATIONS.md). That document covers:
 
 - how to start and stop the server
 - what goes in `.env`
@@ -435,6 +420,8 @@ That document covers:
 - where to place Google and YouTube JSON files
 - how tokens are created
 - how to operate the UI end to end
+
+---
 
 ## Additional Docs
 
@@ -447,4 +434,4 @@ That document covers:
 
 ## License
 
-MIT � see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
