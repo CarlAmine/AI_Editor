@@ -1,4 +1,15 @@
 import React, { useState, FormEvent } from "react";
+import {
+  Film,
+  ArrowUp,
+  ArrowDown,
+  Trash2,
+  Plus,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
+import { PipelineProgress, PipelineStage } from "./PipelineProgress";
+import { YouTubePublishStep } from "./YouTubePublishStep";
 
 type Props = {
   apiBase: string;
@@ -30,13 +41,24 @@ type PipelineResult = {
   render_id?: string;
 };
 
-type YouTubeUploadResult = {
-  success?: boolean;
-  error?: string;
-  video_id?: string;
-  youtube_url?: string;
-  title?: string;
-};
+/** Intelligently truncate a URL: show domain + last path segment */
+function smartTruncateUrl(url: string, maxLen = 60): string {
+  try {
+    const parsed = new URL(url);
+    const domain = parsed.hostname.replace(/^www\./, "");
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    const lastPart = pathParts[pathParts.length - 1] || "";
+    const candidate =
+      pathParts.length > 1
+        ? `${domain}/\u2026/${lastPart}`
+        : `${domain}/${lastPart}`;
+    return candidate.length > maxLen
+      ? candidate.substring(0, maxLen) + "\u2026"
+      : candidate;
+  } catch {
+    return url.length > maxLen ? url.substring(0, maxLen) + "\u2026" : url;
+  }
+}
 
 export const VideoPipelinePanel: React.FC<Props> = ({
   apiBase,
@@ -46,9 +68,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   const normalizeSourceUrl = (value: string): string => value.trim().toLowerCase();
   const toAbsoluteUrl = (value?: string | null): string => {
     if (!value) return "";
-    if (value.startsWith("/")) {
-      return `${apiBase}${value}`;
-    }
+    if (value.startsWith("/")) return `${apiBase}${value}`;
     return value;
   };
   const getPreviewUrl = (value?: string | null): string => toAbsoluteUrl(value);
@@ -66,27 +86,24 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [isApprovedForYouTube, setIsApprovedForYouTube] = useState(false);
-  const [youtubeTitle, setYoutubeTitle] = useState("");
-  const [youtubeDescription, setYoutubeDescription] = useState("");
-  const [youtubePrivacy, setYoutubePrivacy] = useState<"private" | "public" | "unlisted">("private");
-  const [isUploadingYouTube, setIsUploadingYouTube] = useState(false);
-  const [youtubeUploadResult, setYoutubeUploadResult] = useState<YouTubeUploadResult | null>(null);
+  const [errorDismissed, setErrorDismissed] = useState(false);
   const [bulkSourceSpec, setBulkSourceSpec] = useState("");
   const [isConnectingDriveOauth, setIsConnectingDriveOauth] = useState(false);
   const [driveOauthEmail, setDriveOauthEmail] = useState<string | null>(null);
   const [driveOauthMessage, setDriveOauthMessage] = useState<string | null>(null);
 
-  // Add a new source to the list
+  // Progress tracking
+  const [currentStage, setCurrentStage] = useState<PipelineStage | null>(null);
+  const [stageFailed, setStageFailed] = useState(false);
+
   const handleAddSource = () => {
     if (!newSourceUrl.trim()) {
       setError("Please enter a video URL.");
+      setErrorDismissed(false);
       return;
     }
-
     const segments: VideoSegment[] = [];
     if (newSourceSegments.trim()) {
-      // Parse segments in format: "10-20, 30-45, 60-75"
       const parts = newSourceSegments.split(",");
       for (const part of parts) {
         const [startStr, endStr] = part.trim().split("-");
@@ -99,7 +116,6 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         }
       }
     }
-
     const newLabel = sources.length + 1;
     setSources([
       ...sources,
@@ -109,55 +125,38 @@ export const VideoPipelinePanel: React.FC<Props> = ({
         segments: segments.length > 0 ? segments : undefined,
       },
     ]);
-
-    // Reset form
     setNewSourceUrl("");
     setNewSourceSegments("");
     setError(null);
   };
 
-  // Remove a source from the list
   const handleRemoveSource = (index: number) => {
     setSources((prev) => {
       const updated = prev.filter((_, i) => i !== index);
-      // Renumber labels
       return updated.map((src, i) => ({ ...src, label: i + 1 }));
     });
   };
 
-  // Move source up in the list
   const handleMoveSourceUp = (index: number) => {
     if (index === 0) return;
     const updated = [...sources];
     [updated[index - 1], updated[index]] = [updated[index], updated[index - 1]];
-    // Renumber labels
-    setSources(
-      updated.map((src, i) => ({
-        ...src,
-        label: i + 1,
-      }))
-    );
+    setSources(updated.map((src, i) => ({ ...src, label: i + 1 })));
   };
 
-  // Move source down in the list
   const handleMoveSourceDown = (index: number) => {
     if (index === sources.length - 1) return;
     const updated = [...sources];
     [updated[index], updated[index + 1]] = [updated[index + 1], updated[index]];
-    // Renumber labels
-    setSources(
-      updated.map((src, i) => ({
-        ...src,
-        label: i + 1,
-      }))
-    );
+    setSources(updated.map((src, i) => ({ ...src, label: i + 1 })));
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
+    setErrorDismissed(false);
     setResult(null);
-    setYoutubeUploadResult(null);
+    setStageFailed(false);
 
     const parsedBulkSources = parseBulkSources(bulkSourceSpec);
     const bulkUrlsWithSegments = new Set(
@@ -167,9 +166,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
     );
     const filteredManualSources = sources.filter((source) => {
       const hasSegments = (source.segments?.length || 0) > 0;
-      if (hasSegments) {
-        return true;
-      }
+      if (hasSegments) return true;
       return !bulkUrlsWithSegments.has(normalizeSourceUrl(source.url));
     });
     const combinedSources = [
@@ -192,7 +189,6 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       setError("Please provide an editing description.");
       return;
     }
-
     if (musicMode === "custom" && !customMusicUrl.trim()) {
       setError("Please provide a custom music URL or select 'Use original audio'.");
       return;
@@ -216,162 +212,88 @@ export const VideoPipelinePanel: React.FC<Props> = ({
     };
 
     setIsSubmitting(true);
+    setCurrentStage("analyzing");
+
+    const stageTimer1 = setTimeout(() => setCurrentStage("editing"), 8000);
+    const stageTimer2 = setTimeout(() => setCurrentStage("rendering"), 20000);
 
     try {
       const response = await fetch(`${apiBase}/process-video-url`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 
-      const data: PipelineResult = await response.json();
-      setResult(data);
+      clearTimeout(stageTimer1);
+      clearTimeout(stageTimer2);
 
-      if (onAnalyzerSummary) {
-        onAnalyzerSummary(
-          `Processed ${sources.length} video(s) with brief: ${prompt}`
-        );
-      }
+      const data: PipelineResult = await response.json();
 
       if (!response.ok || data.success === false) {
+        setStageFailed(true);
         setError(data.error || "The pipeline failed. Check server logs.");
+        setResult(data);
       } else {
-        setIsApprovedForYouTube(false);
-        setYoutubeTitle((prompt.trim() || "AI Editor Render").slice(0, 100));
-        setYoutubeDescription(prompt.trim());
-        setYoutubePrivacy("private");
+        setCurrentStage("done");
+        setResult(data);
+        if (onAnalyzerSummary) {
+          onAnalyzerSummary(
+            `Processed ${sources.length} video(s) with brief: ${prompt}`
+          );
+        }
       }
-    } catch (err: any) {
-      setError(err?.message || "Network error while calling /process-video-url.");
+    } catch (err: unknown) {
+      clearTimeout(stageTimer1);
+      clearTimeout(stageTimer2);
+      setStageFailed(true);
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Network error while calling /process-video-url.";
+      setError(message);
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleUploadToYouTube = async () => {
-    const previewTarget = result?.preview_url || result?.url;
-    if (!previewTarget) {
-      setError("No render URL available for YouTube upload.");
-      return;
-    }
-    if (!isApprovedForYouTube) {
-      setError("Please review and approve the rendered video before uploading.");
-      return;
-    }
-    if (!youtubeTitle.trim()) {
-      setError("Please enter a YouTube title.");
-      return;
-    }
-
-    setError(null);
-    setYoutubeUploadResult(null);
-    setIsUploadingYouTube(true);
-
-    try {
-      const uploadSourceUrl = previewTarget.startsWith("/")
-        ? `${apiBase}${previewTarget}`
-        : previewTarget;
-      const response = await fetch(`${apiBase}/upload-approved-video-youtube`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          render_url: uploadSourceUrl,
-          title: youtubeTitle.trim(),
-          description: youtubeDescription.trim(),
-          privacy_status: youtubePrivacy,
-          tags: [],
-          category_id: "22",
-          made_for_kids: false,
-          project_id: result?.project_id || null,
-        }),
-      });
-
-      const data: YouTubeUploadResult = await response.json();
-      setYoutubeUploadResult(data);
-      if (!response.ok || data.success === false) {
-        setError(data.error || "YouTube upload failed.");
-      } else {
-        setPrimaryUrl("");
-        setSources([]);
-        setGoogleDriveLink("");
-        setPrompt("");
-        setMusicMode("original");
-        setCustomMusicUrl("");
-        setCustomMusicSegment("");
-        setIntentMode("video");
-        setBulkSourceSpec("");
-        setIsApprovedForYouTube(false);
-        setYoutubeTitle("");
-        setYoutubeDescription("");
-        setYoutubePrivacy("private");
-      }
-    } catch (err: any) {
-      setError(err?.message || "Network error while uploading to YouTube.");
-    } finally {
-      setIsUploadingYouTube(false);
-    }
-  };
-
   const handleConnectDriveOauth = async () => {
-    setError(null);
-    setDriveOauthMessage(null);
-    setDriveOauthEmail(null);
     setIsConnectingDriveOauth(true);
+    setDriveOauthMessage(null);
     try {
       const response = await fetch(`${apiBase}/google-drive/oauth/start`, {
-        method: "GET",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
       });
       const data = await response.json();
-      if (!response.ok || data.success === false) {
-        setError(data.error || "Failed to start Google Drive OAuth.");
-        return;
+      if (data.auth_url) {
+        window.open(data.auth_url, "_blank");
+        setDriveOauthMessage("OAuth window opened. Complete authorization then click 'Check Status'.");
+      } else {
+        setDriveOauthMessage(data.message || "OAuth start failed.");
       }
-      if (!data.auth_url) {
-        setError("No Google OAuth URL was returned by backend.");
-        return;
-      }
-      const popup = window.open(data.auth_url, "_blank", "width=520,height=720");
-      if (!popup) {
-        setError("Popup blocked. Please allow popups and try again.");
-        return;
-      }
-      setDriveOauthMessage("Google sign-in opened. Finish login, then connection status will update.");
-      for (let i = 0; i < 45; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const statusRes = await fetch(`${apiBase}/google-drive/oauth/status`);
-        const statusData = await statusRes.json();
-        if (statusData.connected) {
-          setDriveOauthEmail(statusData.email || null);
-          setDriveOauthMessage("Google Drive connected successfully.");
-          return;
-        }
-      }
-      setDriveOauthMessage("Login not completed yet. You can click 'Check Google Drive Status'.");
-    } catch (err: any) {
-      setError(err?.message || "Network error while starting Google Drive OAuth.");
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Error starting Google Drive OAuth.";
+      setDriveOauthMessage(message);
     } finally {
       setIsConnectingDriveOauth(false);
     }
   };
 
   const handleCheckDriveOauthStatus = async () => {
-    setError(null);
     try {
       const response = await fetch(`${apiBase}/google-drive/oauth/status`);
       const data = await response.json();
-      if (data.connected) {
-        setDriveOauthEmail(data.email || null);
-        setDriveOauthMessage("Google Drive connected successfully.");
-      } else {
-        setDriveOauthEmail(null);
-        setDriveOauthMessage("Google Drive is not connected yet.");
-      }
-    } catch (err: any) {
-      setError(err?.message || "Network error while checking Google Drive OAuth status.");
+      setDriveOauthEmail(data.email || null);
+      setDriveOauthMessage(
+        data.connected
+          ? `Connected as: ${data.email}`
+          : "Not connected. Please authorize Google Drive."
+      );
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Error checking Google Drive OAuth status.";
+      setDriveOauthMessage(message);
     }
   };
 
@@ -384,18 +306,10 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
     const toSeconds = (value: string): number | null => {
       const parts = value.split(":").map((num) => parseFloat(num));
-      if (parts.some((p) => Number.isNaN(p))) {
-        return null;
-      }
-      if (parts.length === 1) {
-        return parts[0];
-      }
-      if (parts.length === 2) {
-        return parts[0] * 60 + parts[1];
-      }
-      if (parts.length === 3) {
-        return parts[0] * 3600 + parts[1] * 60 + parts[2];
-      }
+      if (parts.some((p) => Number.isNaN(p))) return null;
+      if (parts.length === 1) return parts[0];
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
       return null;
     };
 
@@ -404,17 +318,13 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       const url = separatorIndex === -1 ? line : line.slice(0, separatorIndex);
       const segmentsPart = separatorIndex === -1 ? "" : line.slice(separatorIndex + 3);
       const cleanedUrl = url.trim();
-      if (!cleanedUrl) {
-        continue;
-      }
+      if (!cleanedUrl) continue;
       const segments: VideoSegment[] = [];
       if (segmentsPart) {
         const segmentParts = segmentsPart.split(",");
         for (const seg of segmentParts) {
           const [startRaw, endRaw] = seg.trim().split("-");
-          if (!startRaw || !endRaw) {
-            continue;
-          }
+          if (!startRaw || !endRaw) continue;
           const start = toSeconds(startRaw.trim());
           const end = toSeconds(endRaw.trim());
           if (start !== null && end !== null && start < end) {
@@ -434,7 +344,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2 className="panel-title">1. Build Your Edit</h2>
+        <h2 className="panel-title">Build Your Edit</h2>
         <p className="panel-caption">
           Add the reference video, define source footage, and render a polished
           edit from one workspace.
@@ -442,14 +352,14 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       </header>
 
       <form className="panel-form" onSubmit={handleSubmit}>
-        {/* Primary URL for analysis */}
-        <label className="field">
-          <span className="field-label">
+        {/* Reference Video URL — prominent */}
+        <label className="field field--prominent">
+          <span className="field-label field-label--prominent">
             Reference Video URL
           </span>
           <input
             type="text"
-            className="field-input"
+            className="field-input field-input--prominent"
             placeholder="https://www.youtube.com/watch?v=... or https://www.tiktok.com/@.../video/..."
             value={primaryUrl}
             onChange={(e) => {
@@ -459,171 +369,254 @@ export const VideoPipelinePanel: React.FC<Props> = ({
           />
         </label>
 
-        {/* Source Videos Section */}
-        <fieldset className="field-fieldset">
-          <legend className="field-legend">Source Footage</legend>
-
-          {/* Add new source */}
-          <div className="field">
-            <span className="field-label">Add a Single Source</span>
-            <div className="field-group">
-              <input
-                type="text"
-                className="field-input"
-                placeholder="Source video URL"
-                value={newSourceUrl}
-                onChange={(e) => setNewSourceUrl(e.target.value)}
-              />
-              <input
-                type="text"
-                className="field-input"
-                placeholder="Segments (for example: 10-20, 30-45)"
-                value={newSourceSegments}
-                onChange={(e) => setNewSourceSegments(e.target.value)}
-              />
-              <button
-                type="button"
-                onClick={handleAddSource}
-                className="button button-secondary"
-              >
-                Add
-              </button>
+        {/* Source Footage — collapsible, open by default */}
+        <details className="collapsible-section" open>
+          <summary className="collapsible-summary">
+            <span className="collapsible-title">Source Footage</span>
+            <ChevronDown className="collapsible-chevron collapsible-chevron--open" size={16} />
+            <ChevronUp className="collapsible-chevron collapsible-chevron--closed" size={16} />
+          </summary>
+          <div className="collapsible-body">
+            <div className="field">
+              <span className="field-label">Add a Single Source</span>
+              <div className="field-group">
+                <input
+                  type="text"
+                  className="field-input"
+                  placeholder="Source video URL"
+                  value={newSourceUrl}
+                  onChange={(e) => setNewSourceUrl(e.target.value)}
+                />
+                <input
+                  type="text"
+                  className="field-input"
+                  placeholder="Segments e.g. 10-20, 30-45"
+                  value={newSourceSegments}
+                  onChange={(e) => setNewSourceSegments(e.target.value)}
+                />
+                <button
+                  type="button"
+                  onClick={handleAddSource}
+                  className="btn btn-secondary"
+                >
+                  <Plus size={15} />
+                  Add
+                </button>
+              </div>
+              <p className="field-hint">
+                Leave segments empty to use the entire source. Use{" "}
+                <code>start-end</code> in seconds, separated by commas.
+              </p>
             </div>
-            <p className="field-hint">
-              Leave segments empty to use the entire source. Use `start-end` in
-              seconds, separated by commas.
-            </p>
-          </div>
 
-          {/* List of sources */}
-          {sources.length > 0 && (
-            <div className="sources-list">
-              <p className="field-label">Ordered Sources</p>
-              {sources.map((source, idx) => (
-                <div key={idx} className="source-item">
-                  <div className="source-info">
-                    <span className="source-label">{source.label}</span>
-                    <div className="source-details">
-                      <a
-                        href={source.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="source-url"
+            {sources.length > 0 && (
+              <div className="sources-list">
+                <p className="field-label">Ordered Sources</p>
+                {sources.map((source, idx) => (
+                  <div key={idx} className="source-item">
+                    <div className="source-thumbnail" aria-hidden="true" />
+                    <div className="source-info">
+                      <span className="source-label">{source.label}</span>
+                      <div className="source-details">
+                        <a
+                          href={source.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="source-url"
+                          title={source.url}
+                        >
+                          {smartTruncateUrl(source.url)}
+                        </a>
+                        {source.segments && source.segments.length > 0 && (
+                          <span className="source-segments">
+                            {source.segments.length} segment(s):{" "}
+                            {source.segments
+                              .map((s) => `${s.start}s\u2013${s.end}s`)
+                              .join(", ")}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="source-controls">
+                      <button
+                        type="button"
+                        onClick={() => handleMoveSourceUp(idx)}
+                        disabled={idx === 0}
+                        className="btn btn-mini"
+                        title="Move up"
                       >
-                        {source.url.substring(0, 50)}...
-                      </a>
-                      {source.segments && source.segments.length > 0 && (
-                        <span className="source-segments">
-                          {source.segments.length} segment(s):{" "}
-                          {source.segments
-                            .map((s) => `${s.start}s-${s.end}s`)
-                            .join(", ")}
-                        </span>
-                      )}
+                        <ArrowUp size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleMoveSourceDown(idx)}
+                        disabled={idx === sources.length - 1}
+                        className="btn btn-mini"
+                        title="Move down"
+                      >
+                        <ArrowDown size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveSource(idx)}
+                        className="btn btn-mini btn-danger"
+                        title="Remove"
+                      >
+                        <Trash2 size={13} />
+                      </button>
                     </div>
                   </div>
-                  <div className="source-controls">
-                    <button
-                      type="button"
-                      onClick={() => handleMoveSourceUp(idx)}
-                      disabled={idx === 0}
-                      className="button button-mini"
-                      title="Move up"
-                    >
-                      Up
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleMoveSourceDown(idx)}
-                      disabled={idx === sources.length - 1}
-                      className="button button-mini"
-                      title="Move down"
-                    >
-                      Down
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveSource(idx)}
-                      className="button button-mini button-danger"
-                      title="Remove"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </fieldset>
+                ))}
+              </div>
+            )}
 
-        <label className="field">
-          <span className="field-label">Bulk Source Import</span>
-          <textarea
-            className="field-input field-textarea"
-            placeholder={`https://www.youtube.com/watch?v=abcDEF - 10-20, 35-45\nhttps://youtu.be/xyz123 - 0:15-0:45`}
-            rows={4}
-            value={bulkSourceSpec}
-            onChange={(e) => setBulkSourceSpec(e.target.value)}
-          />
-          <p className="field-hint">
-            One source per line. Format: <code>URL - start-end, start-end</code>.
-            Timestamps can be in seconds or <code>HH:MM:SS</code>.
-          </p>
-        </label>
+            <div className="section-divider" />
 
-        <label className="field">
-          <span className="field-label">Google Drive Connection</span>
-          <div className="field-group">
-            <button
-              type="button"
-              className="button button-secondary"
-              disabled={isConnectingDriveOauth}
-              onClick={handleConnectDriveOauth}
-            >
-              {isConnectingDriveOauth ? "Connecting..." : "Connect Google Drive"}
-            </button>
-            <button
-              type="button"
-              className="button button-secondary"
-              onClick={handleCheckDriveOauthStatus}
-            >
-              Check Google Drive Status
-            </button>
+            <label className="field">
+              <span className="field-label">
+                Bulk Source Import{" "}
+                <span className="field-label-optional">(optional)</span>
+              </span>
+              <textarea
+                className="field-input field-textarea"
+                placeholder={"One URL per line. Optionally add segments:\nhttps://... - 10-20, 30-45\nhttps://..."}
+                value={bulkSourceSpec}
+                onChange={(e) => setBulkSourceSpec(e.target.value)}
+                rows={3}
+              />
+              <p className="field-hint">
+                Format: <code>URL - start-end, start-end</code>. Segments are in
+                seconds or <code>HH:MM:SS</code>.
+              </p>
+            </label>
           </div>
-          <p className="field-hint">
-            Connect your Google account if you want to load source files from Drive.
-          </p>
-          {driveOauthMessage && (
-            <p className="field-hint">
-              {driveOauthMessage}
-              {driveOauthEmail ? ` Connected as: ${driveOauthEmail}` : ""}
-            </p>
-          )}
-        </label>
+        </details>
 
-        <label className="field">
-          <span className="field-label">Google Drive Folder Link (Optional)</span>
-          <input
-            type="text"
-            className="field-input"
-            placeholder="https://drive.google.com/drive/folders/..."
-            value={googleDriveLink}
-            onChange={(e) => {
-              setGoogleDriveLink(e.target.value);
-              setError(null);
-            }}
-          />
-          <p className="field-hint">
-            Optional alternative to source URLs. If provided, source videos will
-            be loaded from this folder.
-          </p>
-        </label>
+        {/* Google Drive — collapsible, closed by default */}
+        <details className="collapsible-section">
+          <summary className="collapsible-summary">
+            <span className="collapsible-title">Google Drive</span>
+            <ChevronDown className="collapsible-chevron collapsible-chevron--open" size={16} />
+            <ChevronUp className="collapsible-chevron collapsible-chevron--closed" size={16} />
+          </summary>
+          <div className="collapsible-body">
+            <div className="field">
+              <span className="field-label">Connect Google Account</span>
+              <div className="field-group">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={isConnectingDriveOauth}
+                  onClick={handleConnectDriveOauth}
+                >
+                  {isConnectingDriveOauth ? "Connecting\u2026" : "Connect Google Drive"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleCheckDriveOauthStatus}
+                >
+                  Check Status
+                </button>
+              </div>
+              <p className="field-hint">
+                Connect your Google account to load source files from Drive.
+              </p>
+              {driveOauthMessage && (
+                <p className="field-hint">
+                  {driveOauthMessage}
+                  {driveOauthEmail ? ` Connected as: ${driveOauthEmail}` : ""}
+                </p>
+              )}
+            </div>
 
-        {/* Edit Brief */}
-        <label className="field">
-          <span className="field-label">Edit Brief</span>
+            <label className="field">
+              <span className="field-label">
+                Google Drive Folder Link{" "}
+                <span className="field-label-optional">(optional)</span>
+              </span>
+              <input
+                type="text"
+                className="field-input"
+                placeholder="https://drive.google.com/drive/folders/..."
+                value={googleDriveLink}
+                onChange={(e) => {
+                  setGoogleDriveLink(e.target.value);
+                  setError(null);
+                }}
+              />
+              <p className="field-hint">
+                Optional alternative to source URLs. Source videos will be loaded
+                from this folder.
+              </p>
+            </label>
+          </div>
+        </details>
+
+        {/* Audio Settings — collapsible, closed by default */}
+        <details className="collapsible-section">
+          <summary className="collapsible-summary">
+            <span className="collapsible-title">Audio Settings</span>
+            <ChevronDown className="collapsible-chevron collapsible-chevron--open" size={16} />
+            <ChevronUp className="collapsible-chevron collapsible-chevron--closed" size={16} />
+          </summary>
+          <div className="collapsible-body">
+            <label className="field">
+              <span className="field-label">Audio / Music</span>
+              <div className="select-wrapper">
+                <select
+                  className="field-input field-select"
+                  value={musicMode}
+                  onChange={(e) => {
+                    setMusicMode(e.target.value as "original" | "custom");
+                    setError(null);
+                  }}
+                >
+                  <option value="original">Use original audio from clips</option>
+                  <option value="custom">Use custom music from URL</option>
+                </select>
+              </div>
+            </label>
+
+            {musicMode === "custom" && (
+              <>
+                <label className="field">
+                  <span className="field-label">Custom Music URL</span>
+                  <input
+                    type="text"
+                    className="field-input"
+                    placeholder="https://www.youtube.com/watch?v=... (audio or music video)"
+                    value={customMusicUrl}
+                    onChange={(e) => setCustomMusicUrl(e.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <span className="field-label">
+                    Custom Music Segment{" "}
+                    <span className="field-label-optional">(optional)</span>
+                  </span>
+                  <input
+                    type="text"
+                    className="field-input"
+                    placeholder="0:00-0:13 or 10-25"
+                    value={customMusicSegment}
+                    onChange={(e) => setCustomMusicSegment(e.target.value)}
+                  />
+                  <p className="field-hint">
+                    If provided, only this portion of the music URL is used.
+                    Accepts seconds or <code>HH:MM:SS</code> ranges.
+                  </p>
+                </label>
+              </>
+            )}
+          </div>
+        </details>
+
+        {/* Edit Brief — prominent */}
+        <label className="field field--prominent">
+          <span className="field-label field-label--prominent">Edit Brief</span>
           <textarea
-            className="field-input field-textarea"
+            className="field-input field-input--prominent field-textarea"
             placeholder="e.g. Create a 30s vertical highlight reel with upbeat pacing and bold captions."
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -633,103 +626,74 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
         <label className="field">
           <span className="field-label">Output Intent</span>
-          <select
-            className="field-input"
-            value={intentMode}
-            onChange={(e) => setIntentMode(e.target.value as "video" | "shorts")}
-          >
-            <option value="video">Video (Standard)</option>
-            <option value="shorts">Shorts (9:16 preview from 16:9 master)</option>
-          </select>
+          <div className="select-wrapper">
+            <select
+              className="field-input field-select"
+              value={intentMode}
+              onChange={(e) => setIntentMode(e.target.value as "video" | "shorts")}
+            >
+              <option value="video">Video (Standard)</option>
+              <option value="shorts">Shorts (9:16 preview from 16:9 master)</option>
+            </select>
+          </div>
         </label>
-
-        {/* Music Mode */}
-        <label className="field">
-          <span className="field-label">Audio/Music</span>
-          <select
-            className="field-input"
-            value={musicMode}
-            onChange={(e) => {
-              setMusicMode(e.target.value as "original" | "custom");
-              setError(null);
-            }}
-          >
-            <option value="original">Use original audio from clips</option>
-            <option value="custom">Use custom music from URL</option>
-          </select>
-        </label>
-
-        {/* Custom Music URL (conditional) */}
-        {musicMode === "custom" && (
-          <>
-            <label className="field">
-              <span className="field-label">Custom Music URL</span>
-              <input
-                type="text"
-                className="field-input"
-                placeholder="https://www.youtube.com/watch?v=... (audio or music video)"
-                value={customMusicUrl}
-                onChange={(e) => setCustomMusicUrl(e.target.value)}
-              />
-            </label>
-            <label className="field">
-              <span className="field-label">Custom Music Segment (Optional)</span>
-              <input
-                type="text"
-                className="field-input"
-                placeholder="0:00-0:13 or 10-25"
-                value={customMusicSegment}
-                onChange={(e) => setCustomMusicSegment(e.target.value)}
-              />
-              <p className="field-hint">
-                If provided, only this portion of the music URL is used. Accepts
-                seconds or <code>HH:MM:SS</code> ranges.
-              </p>
-            </label>
-          </>
-        )}
 
         {/* Submit Button */}
         <button
           type="submit"
           disabled={isSubmitting}
-          className="button button-primary button-large"
+          className="btn btn-primary btn-large btn-render"
         >
-          {isSubmitting ? "Rendering..." : "Render Video"}
-        </button>
-      </form>
-
-      {/* Error Display */}
-      {error && <div className="alert alert-error">{error}</div>}
-
-      {/* Result Display */}
-      {result && (
-        <div className={`alert ${result.success ? "alert-success" : "alert-error"}`}>
-          {result.success ? (
+          {isSubmitting ? (
             <>
-              <strong>Success:</strong> Your video is ready:{" "}
-              <a
-                href={getPreviewUrl(result.preview_url) || result.url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {getPreviewUrl(result.preview_url) || result.url}
-              </a>
-              {getPreviewUrl(result.preview_url) || result.url ? (
-                <div className="render-preview">
-                  <video
-                    className="render-preview-video"
-                    src={getPreviewUrl(result.preview_url) || result.url}
-                    controls
-                    preload="metadata"
-                  />
-                </div>
-              ) : null}
+              <span className="btn-spinner" />
+              {currentStage === "analyzing"
+                ? "Analyzing\u2026"
+                : currentStage === "editing"
+                ? "Editing\u2026"
+                : currentStage === "rendering"
+                ? "Rendering\u2026"
+                : "Processing\u2026"}
             </>
           ) : (
             <>
-              <strong>Error:</strong> {result.error}
+              <Film size={20} />
+              Render Video
             </>
+          )}
+        </button>
+      </form>
+
+      {/* Progress Indicator */}
+      <PipelineProgress currentStage={currentStage} failed={stageFailed} />
+
+      {/* Error Display */}
+      {error && !errorDismissed && (
+        <div className="alert alert-error">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="alert-dismiss"
+            onClick={() => setErrorDismissed(true)}
+            aria-label="Dismiss"
+          >
+            &times;
+          </button>
+        </div>
+      )}
+
+      {/* Success alert */}
+      {result?.success && (
+        <div className="alert alert-success">
+          <strong>Success:</strong> Your video is ready.{" "}
+          {(getPreviewUrl(result.preview_url) || result.url) && (
+            <a
+              href={getPreviewUrl(result.preview_url) || result.url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open video
+            </a>
           )}
         </div>
       )}
@@ -739,87 +703,6 @@ export const VideoPipelinePanel: React.FC<Props> = ({
           <strong>Notice:</strong> {result.user_notice}
         </div>
       )}
-
-      {result?.success && (result.preview_url || result.url) && (
-        <div className="youtube-upload-card">
-          <h3 className="panel-title">2. Review and Upload</h3>
-          <p className="field-hint">
-            Review the rendered video, then approve it before sending it to YouTube.
-          </p>
-          <a
-            href={toAbsoluteUrl(result.preview_url) || result.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="source-url"
-          >
-            Open rendered video preview
-          </a>
-
-          <label className="field approval-row">
-            <input
-              type="checkbox"
-              checked={isApprovedForYouTube}
-              onChange={(e) => setIsApprovedForYouTube(e.target.checked)}
-            />
-            <span>I reviewed this video and approve uploading it to YouTube.</span>
-          </label>
-
-          <label className="field">
-            <span className="field-label">YouTube Title</span>
-            <input
-              type="text"
-              className="field-input"
-              value={youtubeTitle}
-              onChange={(e) => setYoutubeTitle(e.target.value)}
-              maxLength={100}
-            />
-          </label>
-
-          <label className="field">
-            <span className="field-label">YouTube Description</span>
-            <textarea
-              className="field-input field-textarea"
-              value={youtubeDescription}
-              onChange={(e) => setYoutubeDescription(e.target.value)}
-              rows={3}
-            />
-          </label>
-
-          <label className="field">
-            <span className="field-label">Privacy</span>
-            <select
-              className="field-input"
-              value={youtubePrivacy}
-              onChange={(e) => setYoutubePrivacy(e.target.value as "private" | "public" | "unlisted")}
-            >
-              <option value="private">Private</option>
-              <option value="unlisted">Unlisted</option>
-              <option value="public">Public</option>
-            </select>
-          </label>
-
-          <button
-            type="button"
-            className="button button-primary"
-            disabled={isUploadingYouTube || !isApprovedForYouTube}
-            onClick={handleUploadToYouTube}
-          >
-            {isUploadingYouTube ? "Uploading to YouTube..." : "Upload to YouTube"}
-          </button>
-
-          {youtubeUploadResult?.success && youtubeUploadResult.youtube_url && (
-            <div className="alert alert-success">
-              <strong>Uploaded:</strong>{" "}
-              <a href={youtubeUploadResult.youtube_url} target="_blank" rel="noopener noreferrer">
-                {youtubeUploadResult.youtube_url}
-              </a>
-            </div>
-          )}
-        </div>
-      )}
     </section>
   );
 };
-
-
-

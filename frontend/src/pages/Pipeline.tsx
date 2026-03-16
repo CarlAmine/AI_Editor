@@ -1,19 +1,33 @@
 /* ============================================================
-   Pipeline Page � Functional Pipeline UI
-   Uses VideoPipelinePanel + ChatPanel
+   Pipeline Page — Redesigned with 3-step numbered flow
    ============================================================ */
-
 import { useState } from "react";
 import { VideoPipelinePanel } from "../components/VideoPipelinePanel";
 import { ChatPanel } from "../components/ChatPanel";
+import { YouTubePublishStep } from "../components/YouTubePublishStep";
 import "./Pipeline.css";
+
+type PipelineResult = {
+  success?: boolean;
+  url?: string;
+  preview_url?: string;
+  preview_mode?: string;
+  intent_mode?: string;
+  project_id?: string;
+  user_notice?: string;
+  status?: string;
+  error?: string;
+  render_id?: string;
+};
 
 export default function Pipeline() {
   const [briefState, setBriefState] = useState<Record<string, unknown>>({});
+  const [renderResult, setRenderResult] = useState<PipelineResult | null>(null);
   const apiBase = import.meta.env.VITE_API_BASE_URL || "http://localhost:10000";
 
   return (
     <div className="min-h-screen pt-24 pipeline-page">
+      {/* Hero section */}
       <section className="py-16 relative overflow-hidden">
         <div
           className="absolute inset-0"
@@ -47,15 +61,61 @@ export default function Pipeline() {
         </div>
       </section>
 
+      {/* 3-step flow */}
       <section className="pb-16">
         <div className="container mx-auto px-6 max-w-7xl">
-          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] gap-6">
-            <VideoPipelinePanel apiBase={apiBase} currentState={briefState} />
-            <ChatPanel apiBase={apiBase} analyzerOutput="" onStateUpdate={setBriefState} />
+
+          {/* Steps 1 + 2 side by side on desktop */}
+          <div className="pipeline-steps-grid">
+
+            {/* Step 1 */}
+            <div className="pipeline-step-wrapper">
+              <div className="step-badge">01</div>
+              <div className="step-meta">
+                <h2 className="step-title">Build Your Edit</h2>
+                <p className="step-subtitle">Configure sources, brief, and render settings.</p>
+              </div>
+              <VideoPipelinePanel
+                apiBase={apiBase}
+                currentState={briefState}
+                onAnalyzerSummary={() => {}}
+              />
+            </div>
+
+            {/* Step 2 */}
+            <div className="pipeline-step-wrapper">
+              <div className="step-badge">02</div>
+              <div className="step-meta">
+                <h2 className="step-title">Brief the Assistant</h2>
+                <p className="step-subtitle">Refine your creative brief through conversation.</p>
+              </div>
+              <ChatPanel
+                apiBase={apiBase}
+                analyzerOutput=""
+                onStateUpdate={setBriefState}
+              />
+            </div>
+
           </div>
+
+          {/* Step 3 — YouTube publish, full width, only after successful render */}
+          {renderResult?.success && (renderResult.preview_url || renderResult.url) && (
+            <div className="pipeline-step-wrapper pipeline-step-wrapper--full mt-8">
+              <div className="step-badge step-badge--yt">03</div>
+              <div className="step-meta">
+                <h2 className="step-title">Publish to YouTube</h2>
+                <p className="step-subtitle">Review the rendered video and upload it to your channel.</p>
+              </div>
+              <YouTubePublishStep
+                result={renderResult}
+                apiBase={apiBase}
+                onPublished={() => setRenderResult(null)}
+              />
+            </div>
+          )}
+
         </div>
       </section>
     </div>
   );
 }
-
