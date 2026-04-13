@@ -1,13 +1,7 @@
 import json
-import os
 from typing import Any, Dict, List, Optional
 
-from groq import Groq
-
-# LLM client configuration (shared with the chatbot module via the same env var)
-GROQ_API_KEY = os.getenv("GROQ")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-MODEL_NAME = "llama-3.3-70b-versatile"
+from ai_editor.ai_client import chat_json, get_active_model_name
 
 
 def generate_overlay_plan(
@@ -28,9 +22,9 @@ def generate_overlay_plan(
             "position": str       # "top" | "middle" | "bottom" | "center"
         }
     """
-    if not client:
-        # Groq is not configured; caller should fall back to simple behavior.
-        print("Overlay planner: GROQ API key is not set; skipping overlay generation.")
+    if not get_active_model_name():
+        # No provider is configured; caller should fall back to simple behavior.
+        print("Overlay planner: no LLM provider configured; skipping overlay generation.")
         return []
 
     keyframes = analysis_results.get("keyframes") or []
@@ -129,7 +123,7 @@ def generate_overlay_plan(
         print(f"Overlay planner: failed to write overlay_debug_payload.json: {e}")
 
     try:
-        completion = client.chat.completions.create(
+        data = chat_json(
             messages=[
                 {
                     "role": "system",
@@ -142,12 +136,11 @@ def generate_overlay_plan(
                 },
                 {"role": "user", "content": user_message},
             ],
-            model=MODEL_NAME,
-            response_format={"type": "json_object"},
             temperature=0,
         )
-        raw = completion.choices[0].message.content
-        data = json.loads(raw)
+        if data is None:
+            print("Overlay planner: LLM call failed across providers; falling back.")
+            return []
         overlays = data.get("overlays") or []
         if not isinstance(overlays, list):
             print("Overlay planner: model returned a non-list 'overlays'; falling back.")
@@ -162,6 +155,6 @@ def generate_overlay_plan(
 
         return overlays
     except Exception as e:
-        print(f"Groq overlay planning error: {e}")
+        print(f"Overlay planner: LLM error: {e}")
         return []
 

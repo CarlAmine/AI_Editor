@@ -1,7 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 import shutil
 import os
 import re
@@ -14,13 +16,18 @@ from urllib.parse import parse_qs, urlparse
 
 from ai_editor.pipeline import Assemble_Pipeline
 from ai_editor.chatbot_interface import process_ui_turn
-from ai_editor.youtube_clipper import YouTubeClipper
-from ai_editor.youtube_uploader import YouTubeUploader, YouTubeUploadError
 from ai_editor.google_auth import (
     build_drive_service_oauth,
     GoogleCredentialError,
     resolve_drive_oauth_client_secret_path,
     resolve_drive_token_path,
+)
+from pipeline.providers import get_provider_health
+from pipeline.state import (
+    JobStatus,
+    build_controller_status_payload,
+    load_state,
+    sanitize_decision_trace_entries,
 )
 
 load_dotenv()
@@ -33,22 +40,53 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-# Optional static frontend (only if a 'static' directory exists)
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-HAS_STATIC = os.path.isdir(STATIC_DIR)
-
-if HAS_STATIC:
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-TMP_JOBS_DIR = os.path.join(os.path.dirname(__file__), "tmp", "jobs")
-os.makedirs(TMP_JOBS_DIR, exist_ok=True)
-app.mount("/files", StaticFiles(directory=TMP_JOBS_DIR), name="files")
-ROOT_DIR = os.path.dirname(__file__)
+APP_DIR = Path(__file__).resolve().parent
+TMP_JOBS_DIR = APP_DIR / "tmp" / "jobs"
+TMP_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory=str(TMP_JOBS_DIR)), name="files")
 DRIVE_OAUTH_PENDING = {}
 
 
+def _find_frontend_dist() -> Optional[Path]:
+    candidates = (
+        APP_DIR / "static",
+        APP_DIR / "frontend" / "dist",
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+FRONTEND_DIST_DIR = _find_frontend_dist()
+
+
+def _frontend_index_path() -> Optional[Path]:
+    if FRONTEND_DIST_DIR is None:
+        return None
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if index_path.is_file():
+        return index_path
+    return None
+
+
+def _resolve_frontend_asset_path(relative_path: str) -> Optional[Path]:
+    if FRONTEND_DIST_DIR is None:
+        return None
+
+    requested_path = (relative_path or "").lstrip("/")
+    candidate = (FRONTEND_DIST_DIR / requested_path).resolve()
+    dist_root = FRONTEND_DIST_DIR.resolve()
+
+    if candidate != dist_root and dist_root not in candidate.parents:
+        return None
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 def _state_file_path(project_id: str) -> str:
-    return os.path.join(TMP_JOBS_DIR, project_id, "state.json")
+    return str(TMP_JOBS_DIR / project_id / "state.json")
 
 
 def _mark_youtube_uploaded_and_cleanup(project_id: str) -> None:
@@ -63,8 +101,8 @@ def _mark_youtube_uploaded_and_cleanup(project_id: str) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
         work_dir = state.get("work_dir")
-        job_dir = os.path.join(TMP_JOBS_DIR, project_id)
-        if os.path.isdir(job_dir):
+        job_dir = TMP_JOBS_DIR / project_id
+        if job_dir.is_dir():
             shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as e:
         print(f"[cleanup] Failed deferred cleanup for project {project_id}: {e}")
@@ -72,9 +110,10 @@ def _mark_youtube_uploaded_and_cleanup(project_id: str) -> None:
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Redirect root path to the web UI if present, otherwise to API docs."""
-    if HAS_STATIC:
-        return RedirectResponse(url="/static/index.html")
+    """Serve the SPA when bundled, otherwise redirect to the API docs."""
+    index_path = _frontend_index_path()
+    if index_path is not None:
+        return FileResponse(index_path)
     return RedirectResponse(url="/api/docs")
 
 
@@ -308,6 +347,48 @@ async def google_drive_oauth_status():
         return {"connected": False, "error": str(e)}
 
 
+@app.get("/jobs/{project_id}/status")
+async def job_status(project_id: str, include_trace: bool = False):
+    job_dir = TMP_JOBS_DIR / project_id
+    state = load_state(str(job_dir))
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job state not found.")
+    payload = {
+        "success": state.status == JobStatus.SUCCEEDED,
+        "project_id": project_id,
+        "requested_user_input": state.requested_user_input,
+        "warnings": state.warnings,
+        "errors": state.errors,
+        "render_summary": state.render_summary,
+        "source_status": state.source_status,
+        **build_controller_status_payload(state),
+    }
+    if include_trace:
+        payload["decision_trace"] = sanitize_decision_trace_entries(state.decision_trace)
+    return payload
+
+
+@app.get("/health/providers")
+async def provider_health():
+    health = get_provider_health(
+        require_llm=True,
+        require_render=True,
+        require_drive=True,
+    )
+    providers = {
+        name: {
+            "name": payload.get("name", name),
+            "required": bool(payload.get("required", False)),
+            "configured": bool(payload.get("configured", False)),
+            "ready": bool(payload.get("ready", False)),
+            "code": payload.get("code", ""),
+            "message": payload.get("message", ""),
+        }
+        for name, payload in (health.get("providers") or {}).items()
+    }
+    return {"success": bool(health.get("ready", False)), "ready": bool(health.get("ready", False)), "providers": providers}
+
+
 # Legacy endpoint (kept for compatibility)
 @app.post("/process-video")
 async def process_video(
@@ -396,6 +477,8 @@ async def clip_youtube_video(request: YouTubeClipRequest):
     }
     """
     try:
+        from ai_editor.youtube_clipper import YouTubeClipper
+
         clipper = YouTubeClipper()
         result = clipper.process_youtube_clip(
             yt_url=request.youtube_url,
@@ -405,6 +488,11 @@ async def clip_youtube_video(request: YouTubeClipRequest):
             clip_name=request.clip_name,
         )
         return result
+    except ModuleNotFoundError as e:
+        return {
+            "success": False,
+            "error": f"YouTube clipper dependencies are missing: {str(e)}",
+        }
     except Exception as e:
         return {
             "success": False,
@@ -437,6 +525,8 @@ async def clip_youtube_videos_batch(request: YouTubeClipBatchRequest):
     }
     """
     try:
+        from ai_editor.youtube_clipper import YouTubeClipper
+
         clipper = YouTubeClipper()
         clips_data = [
             {
@@ -469,6 +559,8 @@ async def upload_approved_video_to_youtube(request: YouTubeApprovedUploadRequest
     This endpoint should be called only after user previews and approves the video.
     """
     try:
+        from ai_editor.youtube_uploader import YouTubeUploader, YouTubeUploadError
+
         uploader = YouTubeUploader()
         result = uploader.upload_from_render_url(
             render_url=request.render_url,
@@ -482,8 +574,33 @@ async def upload_approved_video_to_youtube(request: YouTubeApprovedUploadRequest
         if result.get("success") and request.project_id:
             _mark_youtube_uploaded_and_cleanup(request.project_id)
         return result
+    except ModuleNotFoundError as e:
+        return {"success": False, "error": f"YouTube upload dependencies are missing: {str(e)}"}
     except YouTubeUploadError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": f"YouTube upload failed: {str(e)}"}
+
+
+@app.get("/healthz")
+async def healthz():
+    """Container health endpoint used by Docker and deployment platforms."""
+    return {
+        "status": "ok",
+        "frontend_bundled": _frontend_index_path() is not None,
+    }
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str):
+    """Serve bundled frontend assets and fall back to the SPA index for client routes."""
+    index_path = _frontend_index_path()
+    if index_path is None:
+        raise HTTPException(status_code=404, detail="Frontend build not found.")
+
+    asset_path = _resolve_frontend_asset_path(full_path)
+    if asset_path is not None:
+        return FileResponse(asset_path)
+
+    return FileResponse(index_path)
 

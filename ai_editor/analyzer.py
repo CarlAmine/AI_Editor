@@ -1,313 +1,273 @@
-﻿import cv2
-import numpy as np
-import pandas as pd
-from scenedetect import VideoManager, SceneManager
-from scenedetect.detectors import ContentDetector
-from paddleocr import PaddleOCR
-import easyocr
+from __future__ import annotations
+
+import os
 import warnings
-from datetime import timedelta
 from collections import defaultdict
-import math
-import re
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Dict, Optional, Tuple
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - dependency availability varies by environment
+    class _CV2Stub:
+        CAP_PROP_FPS = 5
+        CAP_PROP_FRAME_COUNT = 7
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+
+        @staticmethod
+        def VideoCapture(_path: str):
+            raise ImportError("cv2 is required for video analysis")
+
+    cv2 = _CV2Stub()  # type: ignore
+
+from ai_editor.analysis import (
+    AnalysisResult,
+    OCRAnalyzer,
+    SceneAnalyzer,
+    SegmentBuilder,
+    SegmentScorer,
+    StyleProfiler,
+    TranscriptAnalyzer,
+    VideoMetadata,
+    VisualSignatureAnalyzer,
+)
+
+
+@dataclass
+class AnalysisContext:
+    metadata: VideoMetadata
+    result: AnalysisResult
+    keyframes: list[dict]
 
 
 class VideoEditAnalyzer:
-    def __init__(self, path: str):
+    """
+    Backward-compatible analyzer entrypoint.
+
+    The public methods mirror the previous monolithic analyzer, but the actual
+    work now lives in focused sub-analyzers under ``ai_editor.analysis``.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        scene_analyzer: Optional[SceneAnalyzer] = None,
+        ocr_analyzer: Optional[OCRAnalyzer] = None,
+        transcript_analyzer: Optional[TranscriptAnalyzer] = None,
+        segment_builder: Optional[SegmentBuilder] = None,
+        segment_scorer: Optional[SegmentScorer] = None,
+        style_profiler: Optional[StyleProfiler] = None,
+        visual_signature_analyzer: Optional[VisualSignatureAnalyzer] = None,
+    ):
         self.video_path = path
         self.cap = cv2.VideoCapture(path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration = self.total_frames / self.fps if self.fps > 0 else 0
-        self.results: Dict = {}
-        self.video_name = path.split("/")[-1]  # Simple basename
-        
-        # Initialize OCR Engines
-        # Note: In a production pipeline, these might be initialized globally to save load time
-        # PaddleOCR depends on `paddle`. If it's not installed, we degrade gracefully and
-        # rely only on EasyOCR so the rest of the analyzer still works.
-        try:
-            self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
-        except Exception as e:
-            print(f"PaddleOCR initialization failed, continuing without it: {e}")
-            self.paddle_ocr = None
-        self.easy_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        self.metadata = self._build_metadata(path)
+        self.fps = self.metadata.fps
+        self.total_frames = self.metadata.total_frames
+        self.duration = self.metadata.duration_seconds
+        self.video_name = self.metadata.name
+        if scene_analyzer is None:
+            if SceneAnalyzer is None:
+                raise ImportError("Scene analysis dependencies are not installed.")
+            scene_analyzer = SceneAnalyzer()
+        if ocr_analyzer is None:
+            if OCRAnalyzer is None:
+                raise ImportError("OCR analysis dependencies are not installed.")
+            ocr_analyzer = OCRAnalyzer()
+        self.scene_analyzer = scene_analyzer
+        self.ocr_analyzer = ocr_analyzer
+        self.transcript_analyzer = transcript_analyzer or TranscriptAnalyzer()
+        self.segment_builder = segment_builder or SegmentBuilder()
+        self.segment_scorer = segment_scorer or SegmentScorer()
+        self.style_profiler = style_profiler or StyleProfiler()
+        self.visual_signature_analyzer = visual_signature_analyzer or VisualSignatureAnalyzer()
+        self.analysis = AnalysisResult(metadata=self.metadata)
+        self.results: Dict = self.analysis.to_dict()
+        self._keyframes: list[dict] = []
+
+    def _build_metadata(self, path: str) -> VideoMetadata:
+        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        duration = (total_frames / fps) if fps > 0 else 0.0
+        return VideoMetadata(
+            path=path,
+            name=os.path.basename(path),
+            fps=fps,
+            total_frames=total_frames,
+            duration_seconds=duration,
+            width=width,
+            height=height,
+        )
+
+    def _refresh_results(self) -> Dict:
+        self.results = self.analysis.to_dict()
+        if self._keyframes:
+            self.results["keyframes"] = list(self._keyframes)
+        return self.results
 
     def close(self):
         if self.cap.isOpened():
             self.cap.release()
 
     def detect_scenes(self, threshold: float = 30.0):
-        video_manager = VideoManager([self.video_path])
-        scene_manager = SceneManager()
-        scene_manager.add_detector(ContentDetector(threshold=threshold))
-        
-        video_manager.start()
-        scene_manager.detect_scenes(frame_source=video_manager)
-        scene_list = scene_manager.get_scene_list()
-        
-        scenes_data = []
-        for i, scene in enumerate(scene_list):
-            start = scene[0].get_seconds()
-            end = scene[1].get_seconds()
-            scenes_data.append(
-                {
-                    "scene_id": i + 1,
-                    "start_time": start,
-                    "end_time": end,
-                    "duration": end - start,
-                    "start_frame": scene[0].get_frames(),
-                    "end_frame": scene[1].get_frames(),
-                }
-            )
-        
-        video_manager.release()
-        self.results["scenes"] = scenes_data
-        return scenes_data
+        output = self.scene_analyzer.detect_scenes(self.video_path, threshold=threshold)
+        self.analysis.scenes = output
+        self._refresh_results()
+        return [scene.to_legacy_dict() for scene in output]
 
     def analyze_pacing(self):
-        if "scenes" not in self.results:
-            return
-        
-        durations = [s["duration"] for s in self.results["scenes"]]
-        if not durations:
-            return
-
-        avg_duration = np.mean(durations)
-        if avg_duration < 2.0:
-            category = "Fast (rapid cuts)"
-        elif avg_duration < 5.0:
-            category = "Medium"
-        else:
-            category = "Slow (long takes)"
-
-        self.results["pacing"] = {
-            "total_shots": len(durations),
-            "avg_shot_duration": avg_duration,
-            "min_shot_duration": min(durations),
-            "max_shot_duration": max(durations),
-            "shots_per_minute": len(durations) / (self.duration / 60) if self.duration > 0 else 0,
-            "pacing_category": category,
-        }
+        self.analysis.pacing = self.scene_analyzer.analyze_pacing(self.analysis.scenes, self.duration)
+        self._refresh_results()
 
     def detect_black_frames(self, threshold: float = 15):
-        black_frames = []
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        frame_count = 0
-        consecutive_black = 0
-        black_start = None
-
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            
-            # Fast grayscale conversion
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-            if np.mean(gray) < threshold:
-                if black_start is None:
-                    black_start = frame_count / self.fps
-                consecutive_black += 1
-            else:
-                if consecutive_black >= int(self.fps * 0.5):
-                    black_end = (frame_count - 1) / self.fps
-                    duration = black_end - black_start
-                    
-                    if consecutive_black > self.fps * 1.5:
-                        b_type = "Fade to black"
-                    elif consecutive_black > self.fps * 0.8:
-                        b_type = "Medium black"
-                    else:
-                        b_type = "Quick black"
-                    
-                    black_frames.append(
-                        {"start_time": black_start, "duration": duration, "type": b_type}
-                    )
-                consecutive_black = 0
-                black_start = None
-            frame_count += 1
-        
-        self.results["black_frames"] = black_frames
+        self.analysis.black_frames = self.scene_analyzer.detect_black_frames(self.video_path, self.fps, threshold)
+        self._refresh_results()
 
     def detect_transitions(self):
-        if "scenes" not in self.results:
-            return
-        scenes = self.results["scenes"]
-        transitions = []
-        
-        for i in range(len(scenes) - 1):
-            gap = scenes[i + 1]["start_time"] - scenes[i]["end_time"]
-            if gap < 0.05:
-                t_type = "Hard Cut"
-            elif gap < 0.2:
-                t_type = "Quick Fade"
-            elif gap < 0.8:
-                t_type = "Standard Dissolve"
-            elif gap < 2.0:
-                t_type = "Long Fade"
-            else:
-                t_type = "Pause/Gap"
-            
-            transitions.append({"type": t_type, "gap": gap})
-        
-        self.results["transitions"] = transitions
+        self.analysis.transitions = self.scene_analyzer.detect_transitions(self.analysis.scenes)
+        self._refresh_results()
 
     def extract_and_analyze_keyframes(self, num_frames: int = 12):
-        keyframes = []
-        intervals = max(1, self.total_frames // num_frames)
+        output = self.ocr_analyzer.analyze(self.video_path, self.metadata, num_frames=num_frames)
+        self.analysis.ocr_spans = output.ocr_spans
+        self._keyframes = output.keyframes
+        self._refresh_results()
 
-        def _clean_ocr_text(value: str) -> str:
-            txt = str(value or "")
-            txt = re.sub(r"\((?:top|bottom|middle|center)\)", "", txt, flags=re.IGNORECASE)
-            txt = txt.replace("|", " ")
-            txt = txt.replace("'", "")
-            txt = " ".join(txt.split())
-            return txt.strip()
-        
-        for i in range(0, self.total_frames, intervals):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+    def analyze_transcript(self):
+        self.analysis.transcript = self.transcript_analyzer.analyze(self.video_path)
+        self._refresh_results()
 
-            # 1. Basic Stats
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness = np.mean(gray)
-            
-            # 2. PaddleOCR Detection (if available)
-            paddle_text = []
-            if self.paddle_ocr is not None:
-                try:
-                    # Paddle expects BGR or RGB. We pass the frame directly.
-                    paddle_res = self.paddle_ocr.ocr(frame, cls=True)
-                    if paddle_res and paddle_res[0]:
-                        paddle_text = [
-                            _clean_ocr_text(line[1][0])
-                            for line in paddle_res[0]
-                            if line[1][0]
-                        ]
-                        paddle_text = [t for t in paddle_text if t]
-                except Exception as e:
-                    print(f"PaddleOCR per-frame OCR failed, skipping for this frame: {e}")
-            
-            # 3. EasyOCR Detection (Detailed)
-            # EasyOCR expects the image array
-            easy_res = self.easy_reader.readtext(frame)
-            easy_details = []
-            for bbox, text, conf in easy_res:
-                if conf > 0.3:  # Filter low confidence
-                    # Determine position
-                    h, w = frame.shape[:2]
-                    avg_y = sum(p[1] for p in bbox) / 4
-                    if avg_y < h / 3:
-                        pos = "Top"
-                    elif avg_y < 2 * h / 3:
-                        pos = "Middle"
-                    else:
-                        pos = "Bottom"
-                    cleaned = _clean_ocr_text(text)
-                    if cleaned:
-                        easy_details.append(cleaned)
+    def build_segments(self):
+        build_result = self.segment_builder.build(
+            metadata=self.metadata,
+            scenes=self.analysis.scenes,
+            transcript=self.analysis.transcript,
+            ocr_spans=self.analysis.ocr_spans,
+        )
+        self.analysis.segments = self.segment_scorer.score(
+            self.visual_signature_analyzer.annotate_segments(build_result.segments, self._keyframes),
+            metadata=self.metadata,
+            pacing=self.analysis.pacing,
+            transitions=self.analysis.transitions,
+        )
+        self.analysis.analysis_profile["segment_strategy"] = build_result.strategy
+        self._refresh_results()
 
-            # Consolidate Text
-            detected_text = "; ".join(paddle_text) if paddle_text else "No text"
-            if not paddle_text and easy_details:
-                detected_text = "; ".join(easy_details)
+    def build_style_profile(self):
+        self.analysis.style_profile = self.style_profiler.profile(
+            metadata=self.metadata,
+            scenes=self.analysis.scenes,
+            ocr_spans=self.analysis.ocr_spans,
+            transcript_spans=self.analysis.transcript.spans,
+            segments=self.analysis.segments,
+            pacing=self.analysis.pacing,
+            transitions=self.analysis.transitions,
+            keyframes=self._keyframes,
+        )
+        self._refresh_results()
 
-            keyframes.append(
-                {
-                    "timestamp": i / self.fps,
-                    "frame_number": i,
-                    "brightness": brightness,
-                    "detected_text": detected_text,
-                    "easyocr_details": easy_details,
-                }
+    def run_full_analysis(self) -> AnalysisContext:
+        scene_output = self.scene_analyzer.analyze(self.video_path, self.metadata)
+        self.analysis.scenes = scene_output.scenes
+        self.analysis.pacing = scene_output.pacing
+        self.analysis.black_frames = scene_output.black_frames
+        self.analysis.transitions = scene_output.transitions
+
+        ocr_output = self.ocr_analyzer.analyze(self.video_path, self.metadata)
+        self.analysis.ocr_spans = ocr_output.ocr_spans
+        self._keyframes = ocr_output.keyframes
+
+        self.analysis.transcript = self.transcript_analyzer.analyze(self.video_path)
+        self.build_segments()
+        self.build_style_profile()
+        self.analysis.analysis_profile = {
+            "scene_analysis": "enabled",
+            "ocr_analysis": "enabled",
+            "transcript_analysis": self.analysis.transcript.status,
+        }
+        self.analysis.analysis_profile["segment_count"] = len(self.analysis.segments)
+        self.analysis.analysis_profile["style_profile_ready"] = True
+        self._refresh_results()
+        return AnalysisContext(metadata=self.metadata, result=self.analysis, keyframes=self._keyframes)
+
+
+def _generate_summary(metadata: VideoMetadata, result: AnalysisResult, legacy: Dict) -> str:
+    summary_lines = []
+    summary_lines.append(" VIDEO ANALYSIS SUMMARY")
+    summary_lines.append("=" * 40)
+    summary_lines.append(f"File: {metadata.name}")
+    summary_lines.append(f"Duration: {timedelta(seconds=metadata.duration_seconds)}")
+    summary_lines.append(f"FPS: {metadata.fps:.2f}")
+
+    pacing = legacy.get("pacing") or {}
+    if pacing:
+        summary_lines.append(f"\nPACING: {pacing['pacing_category']}")
+        summary_lines.append(f"   • Total Shots: {pacing['total_shots']}")
+        summary_lines.append(f"   • Avg Shot Duration: {pacing['avg_shot_duration']:.2f}s")
+        summary_lines.append(f"   • Cuts per Minute: {pacing['shots_per_minute']:.1f}")
+
+    transitions = legacy.get("transitions") or []
+    if transitions:
+        counts = defaultdict(int)
+        for transition in transitions:
+            counts[str(transition.get("type"))] += 1
+        most_common = max(counts, key=counts.get) if counts else "None"
+        summary_lines.append("\nEDITING STYLE:")
+        summary_lines.append(f"   • Dominant Transition: {most_common}")
+        summary_lines.append(f"   • Transition Counts: {dict(counts)}")
+
+    black_frames = legacy.get("black_frames") or []
+    if black_frames:
+        summary_lines.append(f"\nBLACK SEQUENCES: {len(black_frames)} detected")
+        for bf in black_frames[:3]:
+            summary_lines.append(
+                f"   • At {bf['start_time']:.1f}s ({bf['duration']:.1f}s): {bf['type']}"
             )
-        
-        self.results["keyframes"] = keyframes
+
+    summary_lines.append("\nDETECTED TEXT CONTENT:")
+    text_found = False
+    for keyframe in legacy.get("keyframes") or []:
+        detected_text = keyframe.get("detected_text")
+        if detected_text and detected_text != "No text":
+            summary_lines.append(f"   • @ {keyframe['timestamp']:.1f}s: {detected_text}")
+            text_found = True
+    if not text_found:
+        summary_lines.append("   • No significant on-screen text detected.")
+
+    transcript = result.transcript
+    if transcript.spans:
+        summary_lines.append(f"\nTRANSCRIPT: {len(transcript.spans)} spans available")
+    elif transcript.reason:
+        summary_lines.append(f"\nTRANSCRIPT: {transcript.status} ({transcript.reason})")
+
+    return "\n".join(summary_lines)
 
 
 def analyze_video_content_with_results(video_path: str) -> Tuple[str, Dict]:
     """
-    Run the full analysis and return both the human-readable summary and
-    the structured results dictionary (scenes, pacing, keyframes, etc.).
+    Run the full modular analysis and return both the human-readable summary and
+    the structured results dictionary.
     """
-    # Suppress warnings for cleaner pipeline logs
     warnings.filterwarnings("ignore")
 
     try:
         analyzer = VideoEditAnalyzer(video_path)
-        
-        # Run Analysis Modules
-        analyzer.detect_scenes()
-        analyzer.analyze_pacing()
-        analyzer.detect_black_frames()
-        analyzer.detect_transitions()
-        analyzer.extract_and_analyze_keyframes()
+        context = analyzer.run_full_analysis()
+        payload = context.result.to_dict(include_legacy=True)
+        payload["keyframes"] = context.keyframes
+        summary = _generate_summary(context.metadata, context.result, payload)
         analyzer.close()
-        
-        # --- Generate Summary Report ---
-        res = analyzer.results
-        
-        # Header
-        summary_lines = []
-        summary_lines.append(" VIDEO ANALYSIS SUMMARY")
-        summary_lines.append("=" * 40)
-        summary_lines.append(f"File: {analyzer.video_name}")
-        summary_lines.append(f"Duration: {timedelta(seconds=analyzer.duration)}")
-        summary_lines.append(f"FPS: {analyzer.fps:.2f}")
-        
-        # Scene & Pacing
-        if "pacing" in res:
-            p = res["pacing"]
-            summary_lines.append(f"\nPACING: {p['pacing_category']}")
-            summary_lines.append(f"   • Total Shots: {p['total_shots']}")
-            summary_lines.append(f"   • Avg Shot Duration: {p['avg_shot_duration']:.2f}s")
-            summary_lines.append(f"   • Cuts per Minute: {p['shots_per_minute']:.1f}")
-        
-        # Transitions
-        if "transitions" in res:
-            t_counts = defaultdict(int)
-            for t in res["transitions"]:
-                t_counts[t["type"]] += 1
-            most_common = max(t_counts, key=t_counts.get) if t_counts else "None"
-            summary_lines.append("\nEDITING STYLE:")
-            summary_lines.append(f"   • Dominant Transition: {most_common}")
-            summary_lines.append(f"   • Transition Counts: {dict(t_counts)}")
-            
-        # Black Frames
-        if "black_frames" in res and res["black_frames"]:
-            summary_lines.append(f"\nBLACK SEQUENCES: {len(res['black_frames'])} detected")
-            for bf in res["black_frames"][:3]:
-                summary_lines.append(
-                    f"   • At {bf['start_time']:.1f}s ({bf['duration']:.1f}s): {bf['type']}"
-                )
-        
-        # Text Content (Content Analysis)
-        summary_lines.append("\nDETECTED TEXT CONTENT:")
-        text_found = False
-        if "keyframes" in res:
-            for kf in res["keyframes"]:
-                if kf["detected_text"] and kf["detected_text"] != "No text":
-                    summary_lines.append(
-                        f"   • @ {kf['timestamp']:.1f}s: {kf['detected_text']}"
-                    )
-                    text_found = True
-        
-        if not text_found:
-            summary_lines.append("   • No significant on-screen text detected.")
-            
-        return "\n".join(summary_lines), res
-
-    except Exception as e:
-        error_msg = f"Error analyzing video: {str(e)}"
+        return summary, payload
+    except Exception as exc:
+        error_msg = f"Error analyzing video: {str(exc)}"
         return error_msg, {}
 
 
 def analyze_video_content(video_path: str) -> str:
-    """
-    Backwards-compatible wrapper that returns only the textual summary.
-    """
+    """Backwards-compatible wrapper that returns only the textual summary."""
     summary, _ = analyze_video_content_with_results(video_path)
     return summary

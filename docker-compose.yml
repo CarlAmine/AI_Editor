@@ -1,0 +1,10 @@
+services:
+  ai-editor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "10000:10000"
+    restart: unless-stopped

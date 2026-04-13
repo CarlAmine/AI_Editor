@@ -4,6 +4,7 @@ type Props = {
   apiBase: string;
   onAnalyzerSummary?: (summary: string) => void;
   currentState?: Record<string, unknown>;
+  onAssistantFeedback?: (feedback: AssistantFeedback) => void;
 };
 
 type VideoSegment = {
@@ -17,7 +18,7 @@ type VideoSource = {
   segments?: VideoSegment[];
 };
 
-type PipelineResult = {
+export type PipelineResult = {
   success?: boolean;
   url?: string;
   preview_url?: string;
@@ -26,8 +27,23 @@ type PipelineResult = {
   project_id?: string;
   user_notice?: string;
   status?: string;
+  job_status?: string;
+  controller_status?: string;
+  controller_status_category?: string;
+  controller_status_detail?: string;
+  terminal_status?: string | null;
+  decision_trace_count?: number;
   error?: string;
   render_id?: string;
+  assistant_feedback?: AssistantFeedback;
+};
+
+type AssistantFeedback = {
+  route_to_chat?: boolean;
+  category?: string;
+  reason?: string;
+  message?: string;
+  state_patch?: Record<string, unknown>;
 };
 
 type YouTubeUploadResult = {
@@ -38,20 +54,82 @@ type YouTubeUploadResult = {
   title?: string;
 };
 
+const toAbsoluteUrl = (apiBase: string, value?: string | null): string => {
+  if (!value) return "";
+  if (value.startsWith("/")) {
+    return `${apiBase}${value}`;
+  }
+  return value;
+};
+
+const getPreviewUrl = (apiBase: string, value?: string | null): string =>
+  toAbsoluteUrl(apiBase, value);
+
+export const getControllerStatusLabel = (result: PipelineResult): string => {
+  switch (result.controller_status_category) {
+    case "working":
+      return "Working";
+    case "waiting_for_user_input":
+      return "Awaiting User Input";
+    case "blocked":
+      return "Blocked";
+    case "complete":
+      return "Complete";
+    default:
+      return result.success ? "Complete" : "Failed";
+  }
+};
+
+export const VideoPipelineResultNotice: React.FC<{
+  apiBase: string;
+  result: PipelineResult;
+}> = ({ apiBase, result }) => {
+  const controllerLabel = getControllerStatusLabel(result);
+  const previewTarget = getPreviewUrl(apiBase, result.preview_url) || result.url;
+
+  return (
+    <div className={`alert ${result.success ? "alert-success" : "alert-error"}`}>
+      {(result.controller_status || result.controller_status_category) && (
+        <p style={{ marginBottom: "0.5rem" }}>
+          <strong>Controller:</strong>{" "}
+          {controllerLabel}
+          {result.controller_status ? ` - ${result.controller_status}` : ""}
+          {result.controller_status_detail ? ` - ${result.controller_status_detail}` : ""}
+        </p>
+      )}
+      {result.success ? (
+        <>
+          <strong>Success:</strong> Your video is ready:{" "}
+          <a href={previewTarget} target="_blank" rel="noopener noreferrer">
+            {previewTarget}
+          </a>
+          {previewTarget ? (
+            <div className="render-preview">
+              <video
+                className="render-preview-video"
+                src={previewTarget}
+                controls
+                preload="metadata"
+              />
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <strong>Error:</strong> {result.error}
+        </>
+      )}
+    </div>
+  );
+};
+
 export const VideoPipelinePanel: React.FC<Props> = ({
   apiBase,
   onAnalyzerSummary,
   currentState = {},
+  onAssistantFeedback,
 }) => {
   const normalizeSourceUrl = (value: string): string => value.trim().toLowerCase();
-  const toAbsoluteUrl = (value?: string | null): string => {
-    if (!value) return "";
-    if (value.startsWith("/")) {
-      return `${apiBase}${value}`;
-    }
-    return value;
-  };
-  const getPreviewUrl = (value?: string | null): string => toAbsoluteUrl(value);
 
   const [primaryUrl, setPrimaryUrl] = useState("");
   const [sources, setSources] = useState<VideoSource[]>([]);
@@ -237,7 +315,16 @@ export const VideoPipelinePanel: React.FC<Props> = ({
 
       if (!response.ok || data.success === false) {
         setError(data.error || "The pipeline failed. Check server logs.");
+        if (data.assistant_feedback && onAssistantFeedback) {
+          onAssistantFeedback(data.assistant_feedback);
+        }
       } else {
+        if (onAssistantFeedback) {
+          onAssistantFeedback({
+            route_to_chat: false,
+            state_patch: { pipeline_feedback: null },
+          });
+        }
         setIsApprovedForYouTube(false);
         setYoutubeTitle((prompt.trim() || "AI Editor Render").slice(0, 100));
         setYoutubeDescription(prompt.trim());
@@ -703,36 +790,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
       {error && <div className="alert alert-error">{error}</div>}
 
       {/* Result Display */}
-      {result && (
-        <div className={`alert ${result.success ? "alert-success" : "alert-error"}`}>
-          {result.success ? (
-            <>
-              <strong>Success:</strong> Your video is ready:{" "}
-              <a
-                href={getPreviewUrl(result.preview_url) || result.url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {getPreviewUrl(result.preview_url) || result.url}
-              </a>
-              {getPreviewUrl(result.preview_url) || result.url ? (
-                <div className="render-preview">
-                  <video
-                    className="render-preview-video"
-                    src={getPreviewUrl(result.preview_url) || result.url}
-                    controls
-                    preload="metadata"
-                  />
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <>
-              <strong>Error:</strong> {result.error}
-            </>
-          )}
-        </div>
-      )}
+      {result && <VideoPipelineResultNotice apiBase={apiBase} result={result} />}
 
       {result?.user_notice && (
         <div className="alert alert-error">
@@ -747,7 +805,7 @@ export const VideoPipelinePanel: React.FC<Props> = ({
             Review the rendered video, then approve it before sending it to YouTube.
           </p>
           <a
-            href={toAbsoluteUrl(result.preview_url) || result.url}
+            href={toAbsoluteUrl(apiBase, result.preview_url) || result.url}
             target="_blank"
             rel="noopener noreferrer"
             className="source-url"

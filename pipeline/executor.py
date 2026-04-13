@@ -1,0 +1,2152 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
+
+from ai_editor.analyzer import analyze_video_content_with_results
+from ai_editor.downloader import (
+    VideoDownloadError,
+    _is_youtube_url,
+    download_and_clip,
+    download_video,
+    download_video_section,
+    extract_audio,
+    extract_audio_segment,
+)
+from ai_editor.editing import EditSession, InstructionParser
+from ai_editor.google_auth import GoogleCredentialError
+from ai_editor.planning import PlanRewriter, PlanValidator
+
+from .artifacts import ArtifactRegistry
+from .decision_engine import PipelineDecision
+from .provider_errors import ProviderFailure, normalize_provider_exception
+from .plans import (
+    build_audio_plan,
+    build_overlay_plan,
+    build_postprocess_plan,
+    build_render_spec,
+    build_timeline_plan,
+    write_plan,
+)
+from .state import (
+    ControllerStatus,
+    JobState,
+    JobStatus,
+    StageName,
+    StageStatus,
+    add_error,
+    add_warning,
+    apply_analysis,
+    apply_plan,
+    apply_plan_validation,
+    build_controller_status_payload,
+    clear_plan_validation,
+    clear_requested_user_input,
+    extract_edit_requests,
+    mark_terminal,
+    mark_edit_requests_applied,
+    pending_edit_requests,
+    set_render_summary,
+    set_controller_status,
+    set_requested_user_input,
+    set_source_status,
+    summarize_plan,
+    touch,
+    update_stage,
+)
+@dataclass
+class ExecutionContext:
+    job_id: str
+    request_payload: Dict[str, Any]
+    requirements: Dict[str, Any]
+    dirs: Dict[str, str]
+    state: JobState
+    artifacts: ArtifactRegistry
+    runtime: Dict[str, Any] = field(default_factory=dict)
+
+
+class PipelineExecutor:
+    """Deterministic executor for bounded pipeline actions."""
+
+    def __init__(
+        self,
+        *,
+        save_hook: Optional[Callable[[ExecutionContext], None]] = None,
+        validator: Optional[PlanValidator] = None,
+        rewriter: Optional[PlanRewriter] = None,
+        instruction_parser: Optional[InstructionParser] = None,
+        minimum_validation_score: float = 0.74,
+        provider_requirements: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        self._save_hook = save_hook or (lambda _ctx: None)
+        self.validator = validator or PlanValidator()
+        self.rewriter = rewriter or PlanRewriter()
+        self.instruction_parser = instruction_parser or InstructionParser()
+        self.minimum_validation_score = minimum_validation_score
+        self._provider_requirements = {"render": True, "drive": True}
+        if provider_requirements:
+            self._provider_requirements.update(provider_requirements)
+        self._routes: Dict[str, Callable[[ExecutionContext, PipelineDecision], None]] = {
+            "run_analysis": self._handle_run_analysis,
+            "generate_plan": self._handle_generate_plan,
+            "revise_plan": self._handle_revise_plan,
+            "validate_plan": self._handle_validate_plan,
+            "render_preview": self._handle_render_preview,
+            "render_final": self._handle_render_final,
+            "request_user_input": self._handle_request_user_input,
+            "abort_job": self._handle_abort_job,
+            "finish": self._handle_finish,
+        }
+        self._action_stages: Dict[str, StageName] = {
+            "run_analysis": StageName.RUN_ANALYSIS,
+            "generate_plan": StageName.GENERATE_PLAN,
+            "revise_plan": StageName.REVISE_PLAN,
+            "validate_plan": StageName.VALIDATE_PLAN,
+            "render_preview": StageName.RENDER_PREVIEW,
+            "render_final": StageName.RENDER_FINAL,
+            "request_user_input": StageName.REQUEST_USER_INPUT,
+            "abort_job": StageName.ABORT_JOB,
+            "finish": StageName.FINISH,
+        }
+        self._action_controller_status: Dict[str, ControllerStatus] = {
+            "run_analysis": ControllerStatus.ANALYZING,
+            "generate_plan": ControllerStatus.PLANNING,
+            "revise_plan": ControllerStatus.REVISING,
+            "validate_plan": ControllerStatus.VALIDATING,
+            "render_preview": ControllerStatus.RENDERING,
+            "render_final": ControllerStatus.RENDERING,
+        }
+
+    def provider_requirements(self) -> Dict[str, bool]:
+        return dict(self._provider_requirements)
+
+    def execute(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        handler = self._routes.get(decision.next_action)
+        if handler is None:
+            raise ValueError(f"Unsupported action: {decision.next_action}")
+
+        if decision.next_action != "request_user_input":
+            clear_requested_user_input(ctx.state)
+            ctx.state.status = JobStatus.RUNNING
+            ctx.state.terminal_status = None
+            controller_status = self._action_controller_status.get(decision.next_action)
+            if controller_status is not None:
+                set_controller_status(ctx.state, controller_status, detail=decision.rationale)
+
+        action_stage = self._action_stages[decision.next_action]
+        update_stage(
+            ctx.state,
+            action_stage,
+            StageStatus.RUNNING,
+            {
+                "confidence": round(float(decision.confidence), 4),
+                "rationale": decision.rationale,
+                "parameters": decision.parameters,
+            },
+        )
+        self._save(ctx)
+        try:
+            handler(ctx, decision)
+            update_stage(ctx.state, action_stage, StageStatus.SUCCEEDED)
+            self._save(ctx)
+        except ProviderFailure as exc:
+            add_error(ctx.state, action_stage, exc.code, exc.user_message, exc.to_error_detail())
+            update_stage(
+                ctx.state,
+                action_stage,
+                StageStatus.FAILED,
+                {"code": exc.code, "provider": exc.provider, "retryable": exc.retryable},
+            )
+            self._save(ctx)
+            raise
+        except Exception as exc:
+            add_error(
+                ctx.state,
+                action_stage,
+                "ACTION_FAILED",
+                str(exc),
+                {"exception": repr(exc), "action": decision.next_action},
+            )
+            update_stage(ctx.state, action_stage, StageStatus.FAILED, {"exception": repr(exc)})
+            self._save(ctx)
+            raise
+
+    def _handle_run_analysis(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        self._run_stage(ctx, StageName.INGEST, lambda: self._stage_ingest(ctx))
+        self._run_stage(
+            ctx,
+            StageName.FETCH_PRIMARY,
+            lambda: self._stage_fetch_primary(ctx),
+            done_check=lambda: _artifact_path_exists(ctx.artifacts, "primary.video"),
+        )
+        self._run_stage(
+            ctx,
+            StageName.ANALYZE_PRIMARY,
+            lambda: self._stage_analyze_primary(ctx),
+            done_check=lambda: bool(ctx.state.analysis_available and ctx.artifacts.exists("analysis.json")),
+        )
+        self._run_stage(
+            ctx,
+            StageName.FETCH_SOURCES,
+            lambda: self._stage_fetch_sources(ctx),
+            done_check=lambda: ctx.artifacts.exists("sources.raw.1") or ctx.artifacts.exists("sources.fetch.1"),
+        )
+        if ctx.requirements.get("generation_mode") == "reference_mimic_mode":
+            update_stage(
+                ctx.state,
+                StageName.ALIGN_SOURCES,
+                StageStatus.SKIPPED,
+                {"reason": "reference_mimic_mode"},
+            )
+            self._save(ctx)
+        else:
+            self._run_stage(
+                ctx,
+                StageName.ALIGN_SOURCES,
+                lambda: self._stage_align_sources(ctx),
+                done_check=lambda: ctx.artifacts.exists("sources.aligned.1"),
+            )
+        self._refresh_source_status(ctx)
+
+    def _handle_generate_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        if not ctx.state.analysis_available:
+            raise RuntimeError("Analysis must complete before generating a plan.")
+        self._run_stage(
+            ctx,
+            StageName.AUDIO_PLAN,
+            lambda: self._stage_audio_plan(ctx),
+            done_check=lambda: bool(ctx.state.audio_plan),
+        )
+        self._generate_plan_bundle(ctx)
+
+    def _handle_validate_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        if not ctx.state.current_plan:
+            raise RuntimeError("No plan is available to validate.")
+        validation = self.validator.validate(
+            ctx.state.current_plan,
+            analysis=self._load_analysis(ctx),
+            requirements=ctx.requirements,
+        )
+        apply_plan_validation(ctx.state, validation)
+        updated_plan = dict(ctx.state.current_plan)
+        updated_plan["plan_validation"] = validation
+        ctx.state.current_plan = updated_plan
+        ctx.state.plan_summary = summarize_plan(updated_plan)
+        write_plan(ctx.dirs["job"], "timeline_plan.json", updated_plan)
+        self._save(ctx)
+
+    def _handle_revise_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        if not ctx.state.current_plan:
+            raise RuntimeError("No plan is available to revise.")
+        validation = ctx.state.plan_validation or self.validator.validate(
+            ctx.state.current_plan,
+            analysis=self._load_analysis(ctx),
+            requirements=ctx.requirements,
+        )
+        rewritten = self.rewriter.apply(
+            ctx.state.current_plan,
+            validation,
+            analysis=self._load_analysis(ctx),
+            requirements=ctx.requirements,
+        )
+        rewritten = self._apply_edit_requests(
+            ctx,
+            rewritten,
+            requests=pending_edit_requests(ctx.state),
+        )
+        ctx.state.revision_attempts += 1
+        provisional_render_spec = build_render_spec(
+            rewritten,
+            ctx.state.overlay_plan or {"overlays": [], "overlay_script": None},
+            ctx.state.audio_plan or {},
+            ctx.requirements,
+        )
+        apply_plan(
+            ctx.state,
+            rewritten,
+            overlay_plan=ctx.state.overlay_plan,
+            audio_plan=ctx.state.audio_plan,
+            render_spec=provisional_render_spec,
+            needs_validation=True,
+        )
+        clear_plan_validation(ctx.state)
+        write_plan(ctx.dirs["job"], "timeline_plan.json", rewritten)
+        write_plan(ctx.dirs["job"], "render_spec.json", provisional_render_spec)
+        self._save(ctx)
+
+    def _handle_render_preview(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        self._ensure_render_gate(ctx, decision, action_name="render_preview")
+        self._render(ctx, render_mode="preview")
+
+    def _handle_render_final(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        self._ensure_render_gate(ctx, decision, action_name="render_final")
+        self._render(ctx, render_mode="final")
+
+    def _handle_request_user_input(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        question = str(
+            decision.parameters.get("question")
+            or decision.parameters.get("message")
+            or decision.rationale
+            or "More input is needed to continue."
+        ).strip()
+        request = {
+            "reason": decision.parameters.get("reason") or "clarification_required",
+            "question": question,
+            "parameters": decision.parameters,
+        }
+        set_requested_user_input(ctx.state, request)
+        self._save(ctx)
+
+    def _handle_abort_job(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        reason = str(decision.parameters.get("reason") or decision.rationale or "The job was aborted.").strip()
+        mark_terminal(ctx.state, JobStatus.ABORTED, reason=reason)
+        self._save(ctx)
+
+    def _handle_finish(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        self._ensure_render_gate(ctx, decision, action_name="finish")
+        render_url = (ctx.state.final_response or {}).get("url") or (ctx.state.render_summary or {}).get("url")
+        if not render_url:
+            raise RuntimeError("Cannot finish a job before a render result exists.")
+        final_response = self._build_success_response(ctx, status="done")
+        mark_terminal(ctx.state, JobStatus.SUCCEEDED, final_response=final_response)
+        self._save(ctx)
+
+    def _render(self, ctx: ExecutionContext, *, render_mode: str) -> None:
+        if not ctx.state.current_plan:
+            raise RuntimeError("No plan is available to render.")
+        ctx.state.render_attempts += 1
+        touch(ctx.state)
+        self._save(ctx)
+        self._run_stage(ctx, StageName.RENDER_PLAN, lambda: self._stage_render_plan(ctx))
+        self._run_stage(ctx, StageName.SHOTSTACK_RENDER, lambda: self._stage_shotstack_render(ctx))
+        self._run_stage(ctx, StageName.POSTPROCESS, lambda: self._stage_postprocess(ctx))
+        self._run_stage(ctx, StageName.PUBLISH, lambda: self._stage_publish(ctx))
+        response_status = "preview_ready" if render_mode == "preview" else "rendered"
+        response = self._build_success_response(ctx, status=response_status)
+        summary = {
+            "mode": render_mode,
+            "status": response_status,
+            "url": response.get("url"),
+            "render_id": response.get("render_id"),
+            "preview_url": response.get("preview_url"),
+            "preview_mode": response.get("preview_mode"),
+        }
+        set_render_summary(ctx.state, summary, final_response=response if render_mode == "final" else None)
+        self._save(ctx)
+
+    def _run_stage(
+        self,
+        ctx: ExecutionContext,
+        stage: StageName,
+        fn: Callable[[], None],
+        *,
+        done_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        if done_check and done_check():
+            update_stage(ctx.state, stage, StageStatus.SKIPPED, {"reused": True})
+            self._save(ctx)
+            return
+        update_stage(ctx.state, stage, StageStatus.RUNNING)
+        self._save(ctx)
+        try:
+            fn()
+            update_stage(ctx.state, stage, StageStatus.SUCCEEDED)
+            self._save(ctx)
+        except ProviderFailure as exc:
+            add_error(ctx.state, stage, exc.code, exc.user_message, exc.to_error_detail())
+            update_stage(
+                ctx.state,
+                stage,
+                StageStatus.FAILED,
+                {"code": exc.code, "provider": exc.provider, "retryable": exc.retryable},
+            )
+            self._save(ctx)
+            raise
+        except Exception as exc:
+            add_error(ctx.state, stage, "STAGE_FAILED", str(exc), {"exception": repr(exc)})
+            update_stage(ctx.state, stage, StageStatus.FAILED, {"exception": repr(exc)})
+            self._save(ctx)
+            raise
+
+    def _stage_ingest(self, ctx: ExecutionContext) -> None:
+        self._write_json(os.path.join(ctx.dirs["debug"], "request_payload.json"), ctx.request_payload)
+        self._write_json(os.path.join(ctx.dirs["job"], "requirements.json"), ctx.requirements)
+        ctx.state.user_goal = str(ctx.requirements.get("prompt", "") or "")
+        ctx.state.work_dir = ctx.dirs["job"]
+        touch(ctx.state)
+
+    def _stage_fetch_primary(self, ctx: ExecutionContext) -> None:
+        primary_path = download_video(ctx.request_payload["primary_url"], ctx.dirs["media"], "primary.mp4")
+        ctx.artifacts.register_file(
+            "primary.video",
+            primary_path,
+            {"source": ctx.request_payload["primary_url"]},
+            "video/mp4",
+        )
+
+    def _stage_analyze_primary(self, ctx: ExecutionContext) -> None:
+        primary = ctx.artifacts.get("primary.video")
+        if primary is None:
+            raise RuntimeError("Primary video is missing.")
+        summary, analysis = analyze_video_content_with_results(primary.path_or_url)
+        analysis_path = os.path.join(ctx.dirs["job"], "analysis.json")
+        summary_path = os.path.join(ctx.dirs["job"], "analysis_summary.txt")
+        self._write_json(analysis_path, analysis)
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            handle.write(summary)
+        ctx.artifacts.register_file("analysis.json", analysis_path, {}, "application/json")
+        ctx.artifacts.register_file("analysis.summary", summary_path, {}, "text/plain")
+        apply_analysis(ctx.state, analysis, summary)
+
+    def _stage_fetch_sources(self, ctx: ExecutionContext) -> None:
+        folder_id = ctx.request_payload.get("gdrive_folder_id")
+        sources = ctx.request_payload.get("sources") or []
+        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+
+        if folder_id:
+            from .storage import DriveStorageAdapter
+
+            try:
+                adapter = DriveStorageAdapter()
+                assets = adapter.list_videos(folder_id)
+            except Exception as exc:
+                raise normalize_provider_exception(
+                    "drive_storage",
+                    exc,
+                    operation="fetch_sources.drive",
+                    config_message="Google Drive is not configured correctly for source loading.",
+                    timeout_message="Google Drive took too long to respond while loading source videos.",
+                    auth_message="Google Drive access is not authorized. Reconnect or fix the configured credentials.",
+                    network_message="Google Drive is temporarily unavailable while loading source videos.",
+                    default_message="Google Drive source loading failed.",
+                ) from exc
+            if not assets:
+                raise RuntimeError("No video files found in provided Google Drive folder.")
+            try:
+                if generation_mode == "reference_mimic_mode":
+                    for index, asset in enumerate(assets, start=1):
+                        fetch_url = adapter.get_fetchable_url(asset)
+                        ctx.artifacts.register_url(
+                            f"sources.fetch.{index}",
+                            fetch_url,
+                            {"backend": "drive", "asset_id": asset.id, "trim_start": 0.0},
+                            "video/mp4",
+                        )
+                else:
+                    for index, asset in enumerate(assets, start=1):
+                        dst = os.path.join(ctx.dirs["media"], f"source_raw_{index:03d}.mp4")
+                        local = adapter.download(asset, dst)
+                        ctx.artifacts.register_file(
+                            f"sources.raw.{index}",
+                            local,
+                            {"backend": "drive", "asset_id": asset.id},
+                            "video/mp4",
+                        )
+                        ctx.artifacts.register_url(
+                            f"sources.fetch.{index}",
+                            adapter.get_fetchable_url(asset),
+                            {"backend": "drive", "asset_id": asset.id},
+                            "video/mp4",
+                        )
+            except Exception as exc:
+                raise normalize_provider_exception(
+                    "drive_storage",
+                    exc,
+                    operation="fetch_sources.drive_transfer",
+                    config_message="Google Drive is not configured correctly for source transfers.",
+                    timeout_message="Google Drive timed out while transferring source videos.",
+                    auth_message="Google Drive access is not authorized for source transfers.",
+                    network_message="Google Drive is temporarily unavailable while transferring source videos.",
+                    default_message="Google Drive source transfer failed.",
+                ) from exc
+            ctx.runtime["drive_adapter"] = adapter
+            ctx.runtime["drive_folder_id"] = folder_id
+            return
+
+        if generation_mode == "reference_mimic_mode":
+            if not sources:
+                raise RuntimeError(
+                    "Reference mimic mode requires explicit source URLs when Drive folder is not provided."
+                )
+            for index, source in enumerate(sources, start=1):
+                url = str(source.get("url", "")).strip()
+                if not url:
+                    raise RuntimeError(f"Source {index} is missing URL.")
+                trim_start = _extract_start_override(source)
+                if _is_direct_shotstack_source_url(url):
+                    ctx.artifacts.register_url(
+                        f"sources.fetch.{index}",
+                        url,
+                        {"backend": "url", "trim_start": trim_start},
+                        "video/mp4",
+                    )
+                    continue
+                segment_bounds = _extract_bounded_segment(source)
+                if segment_bounds and ("youtube.com" in url.lower() or "youtu.be" in url.lower()):
+                    local = download_video_section(
+                        url=url,
+                        output_dir=ctx.dirs["media"],
+                        filename=f"source_raw_{index:03d}.mp4",
+                        start_time=segment_bounds[0],
+                        end_time=segment_bounds[1],
+                    )
+                    trim_start = 0.0
+                else:
+                    local = download_video(url, ctx.dirs["media"], f"source_raw_{index:03d}.mp4")
+                ctx.artifacts.register_file(
+                    f"sources.raw.{index}",
+                    local,
+                    {"backend": "url", "source_url": url, "trim_start": trim_start},
+                    "video/mp4",
+                )
+                ctx.artifacts.register_file(
+                    f"sources.fetch.{index}",
+                    local,
+                    {"backend": "local", "source_url": url, "trim_start": trim_start},
+                    "video/mp4",
+                )
+            return
+
+        clip_result = download_and_clip(sources, os.path.join(ctx.dirs["media"], "source_work"))
+        if not clip_result.get("success"):
+            raise RuntimeError(f"Clipping failed: {clip_result.get('error')}")
+        clips = clip_result.get("clips") or []
+        if not clips:
+            raise RuntimeError("No source clips found.")
+        for index, clip in enumerate(clips, start=1):
+            path = clip["path"]
+            ctx.artifacts.register_file(f"sources.raw.{index}", path, {"backend": "url"}, "video/mp4")
+            ctx.artifacts.register_file(f"sources.fetch.{index}", path, {"backend": "local"}, "video/mp4")
+
+    def _stage_align_sources(self, ctx: ExecutionContext) -> None:
+        analysis = self._load_analysis(ctx)
+        scene_durations = [
+            float(scene.get("duration", 0.0))
+            for scene in (analysis.get("scenes") or [])
+            if float(scene.get("duration", 0.0)) > 0
+        ]
+        raw_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        raw_paths = [ctx.artifacts.get(key).path_or_url for key in raw_keys if ctx.artifacts.get(key)]
+        aligned_paths, notice = _align_sources(raw_paths, scene_durations, os.path.join(ctx.dirs["media"], "aligned"))
+        if notice:
+            add_warning(ctx.state, "SOURCE_DURATION_SHORT", notice)
+            return
+        if not aligned_paths:
+            return
+        for index, path in enumerate(aligned_paths, start=1):
+            ctx.artifacts.register_file(f"sources.aligned.{index}", path, {"aligned": True}, "video/mp4")
+
+        drive_adapter = ctx.runtime.get("drive_adapter")
+        drive_folder = ctx.runtime.get("drive_folder_id")
+        if drive_adapter and drive_folder:
+            try:
+                for index, path in enumerate(aligned_paths, start=1):
+                    uploaded = drive_adapter.upload(path, drive_folder)
+                    ctx.artifacts.register_url(
+                        f"sources.fetch.{index}",
+                        drive_adapter.get_fetchable_url(uploaded),
+                        {"backend": "drive", "aligned": True, "asset_id": uploaded.id},
+                        "video/mp4",
+                    )
+            except Exception as exc:
+                add_warning(
+                    ctx.state,
+                    "DRIVE_UPLOAD_TIMEOUT",
+                    "Aligned clip upload to Drive failed; using original Drive links.",
+                    str(exc),
+                )
+        else:
+            for index, path in enumerate(aligned_paths, start=1):
+                ctx.artifacts.register_file(
+                    f"sources.fetch.{index}",
+                    path,
+                    {"backend": "local", "aligned": True},
+                    "video/mp4",
+                )
+
+    def _stage_audio_plan(self, ctx: ExecutionContext) -> None:
+        soundtrack_url = None
+        music_mode = ctx.requirements.get("music_mode", "original")
+        custom_music_url = ctx.requirements.get("custom_music_url")
+        music_segment = _extract_music_segment(ctx.requirements)
+        use_reference_audio_bed = False
+        mute_source_audio = False
+
+        if music_mode == "custom" and custom_music_url:
+            custom_video = None
+            if music_segment:
+                segment_start, segment_end = music_segment
+                if segment_end is not None and _is_youtube_url(custom_music_url):
+                    try:
+                        custom_video = download_video_section(
+                            url=custom_music_url,
+                            output_dir=ctx.dirs["media"],
+                            filename="custom_music_source.mp4",
+                            start_time=float(segment_start),
+                            end_time=float(segment_end),
+                        )
+                    except VideoDownloadError:
+                        custom_video = None
+                if custom_video:
+                    soundtrack_file = extract_audio(custom_video, ctx.dirs["media"], "custom_music.mp3")
+                else:
+                    full_video = download_video(custom_music_url, ctx.dirs["media"], "custom_music_source.mp4")
+                    soundtrack_file = extract_audio_segment(
+                        full_video,
+                        ctx.dirs["media"],
+                        "custom_music.mp3",
+                        start_time=segment_start,
+                        end_time=segment_end,
+                    )
+            else:
+                custom_video = download_video(custom_music_url, ctx.dirs["media"], "custom_music_source.mp4")
+                soundtrack_file = extract_audio(custom_video, ctx.dirs["media"], "custom_music.mp3")
+            ctx.artifacts.register_file("audio.soundtrack", soundtrack_file, {"mode": "custom"}, "audio/mpeg")
+            soundtrack_url = soundtrack_file
+        elif music_mode == "original" and ctx.requirements.get("generation_mode") == "reference_mimic_mode":
+            primary = ctx.artifacts.get("primary.video")
+            if primary is None:
+                raise RuntimeError("Primary video is required to extract reference audio.")
+            soundtrack_file = extract_audio(primary.path_or_url, ctx.dirs["media"], "reference_audio.mp3")
+            ctx.artifacts.register_file(
+                "audio.soundtrack",
+                soundtrack_file,
+                {"mode": "reference_primary"},
+                "audio/mpeg",
+            )
+            soundtrack_url = soundtrack_file
+            use_reference_audio_bed = True
+            mute_source_audio = True
+
+        audio_plan = build_audio_plan(
+            {
+                "soundtrack_url": soundtrack_url,
+                "use_reference_audio_bed": use_reference_audio_bed,
+                "mute_source_audio": mute_source_audio,
+            },
+            ctx.requirements,
+        )
+        ctx.state.audio_plan = audio_plan
+        touch(ctx.state)
+        write_plan(ctx.dirs["job"], "audio_plan.json", audio_plan)
+
+    def _generate_plan_bundle(self, ctx: ExecutionContext) -> None:
+        analysis = self._load_analysis(ctx)
+        summary = ctx.state.analysis_summary
+        source_durations = self._source_durations_for_plan(ctx, analysis)
+        render_duration = float(sum(duration for duration in source_durations if duration > 0))
+        analysis_duration = max(
+            max((float(scene.get("end_time", 0.0)) for scene in (analysis.get("scenes") or [])), default=0.0),
+            max((float(frame.get("timestamp", 0.0)) for frame in (analysis.get("keyframes") or [])), default=0.0),
+        )
+        source_keys = self._source_keys_for_generation(ctx)
+        overlay_plan = build_overlay_plan(
+            analysis,
+            ctx.requirements,
+            summary,
+            render_duration=render_duration if render_duration > 0 else None,
+            analysis_duration=analysis_duration if analysis_duration > 0 else None,
+            montage_mode=bool(source_keys and len(source_keys) > 1),
+        )
+        timeline_plan = build_timeline_plan(
+            analysis.get("scenes") or [],
+            source_durations,
+            ctx.requirements,
+            analysis=analysis,
+            include_validation=False,
+            include_rewrite=False,
+        )
+        timeline_plan = self._apply_edit_requests(
+            ctx,
+            timeline_plan,
+            requests=extract_edit_requests(ctx.requirements),
+        )
+        audio_plan = ctx.state.audio_plan or self._load_json_if_exists(
+            os.path.join(ctx.dirs["plans"], "audio_plan.json")
+        )
+        provisional_render_spec = build_render_spec(timeline_plan, overlay_plan, audio_plan, ctx.requirements)
+        postprocess_plan = build_postprocess_plan(ctx.requirements)
+
+        apply_plan(
+            ctx.state,
+            timeline_plan,
+            overlay_plan=overlay_plan,
+            audio_plan=audio_plan,
+            render_spec=provisional_render_spec,
+            needs_validation=True,
+        )
+        ctx.state.render_summary = {}
+        touch(ctx.state)
+
+        self._write_plan_bundle(
+            ctx,
+            timeline_plan=timeline_plan,
+            overlay_plan=overlay_plan,
+            audio_plan=audio_plan,
+            render_spec=provisional_render_spec,
+            postprocess_plan=postprocess_plan,
+            analysis_duration=analysis_duration,
+            render_duration=render_duration,
+        )
+        self._record_overlay_warnings(ctx, overlay_plan)
+        self._save(ctx)
+
+    def _stage_render_plan(self, ctx: ExecutionContext) -> None:
+        if not ctx.state.current_plan:
+            raise RuntimeError("No plan is available to render.")
+
+        analysis = self._load_analysis(ctx)
+        overlay_plan = ctx.state.overlay_plan
+        audio_plan = ctx.state.audio_plan
+        if not overlay_plan:
+            self._generate_plan_bundle(ctx)
+            overlay_plan = ctx.state.overlay_plan
+        if not audio_plan:
+            self._stage_audio_plan(ctx)
+            audio_plan = ctx.state.audio_plan
+
+        render_spec = build_render_spec(ctx.state.current_plan, overlay_plan, audio_plan, ctx.requirements)
+        postprocess_plan = build_postprocess_plan(ctx.requirements)
+        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        edit_mode = str(ctx.requirements.get("edit_mode", "scene")).lower().strip()
+        if edit_mode not in {"scene", "ocr"}:
+            edit_mode = "scene"
+
+        source_keys = self._source_keys_for_generation(ctx)
+        render_duration = float(
+            sum(duration for duration in self._source_durations_for_plan(ctx, analysis) if duration > 0)
+        )
+        analysis_duration = max(
+            max((float(scene.get("end_time", 0.0)) for scene in (analysis.get("scenes") or [])), default=0.0),
+            max((float(frame.get("timestamp", 0.0)) for frame in (analysis.get("keyframes") or [])), default=0.0),
+        )
+
+        if edit_mode == "ocr":
+            canonical_timeline, overlay_timing, edit_summary, edit_ops = self._build_ocr_render_timeline(
+                ctx,
+                analysis,
+                overlay_plan,
+                generation_mode,
+            )
+            render_spec["canonical_timeline"] = canonical_timeline
+            render_spec["overlay_timing"] = overlay_timing
+            if edit_summary:
+                render_spec["edit_summary"] = edit_summary
+                render_spec["edit_ops"] = edit_ops
+        elif generation_mode == "reference_mimic_mode":
+            canonical_timeline, overlay_timing, edit_summary, edit_ops = self._build_reference_render_timeline(
+                ctx,
+                analysis,
+                overlay_plan,
+                audio_plan,
+                source_keys,
+            )
+            render_spec["canonical_timeline"] = canonical_timeline
+            render_spec["overlay_timing"] = overlay_timing
+            if edit_summary:
+                render_spec["edit_summary"] = edit_summary
+                render_spec["edit_ops"] = edit_ops
+
+        ctx.state.render_spec = render_spec
+        touch(ctx.state)
+        self._write_plan_bundle(
+            ctx,
+            timeline_plan=ctx.state.current_plan,
+            overlay_plan=overlay_plan,
+            audio_plan=audio_plan,
+            render_spec=render_spec,
+            postprocess_plan=postprocess_plan,
+            analysis_duration=analysis_duration,
+            render_duration=render_duration,
+        )
+        self._record_overlay_warnings(ctx, overlay_plan)
+
+    def _build_ocr_render_timeline(
+        self,
+        ctx: ExecutionContext,
+        analysis: Dict[str, Any],
+        overlay_plan: Dict[str, Any],
+        generation_mode: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+        if not source_keys:
+            source_keys = self._source_keys_for_generation(ctx)
+        if not source_keys:
+            raise RuntimeError("OCR mode requires at least one source clip.")
+
+        source_rows = []
+        for index, key in enumerate(source_keys, start=1):
+            art = ctx.artifacts.get(key)
+            if art is None:
+                continue
+            meta = art.meta or {}
+            trim_start = float(meta.get("trim_start", 0.0) or 0.0)
+            if generation_mode == "reference_mimic_mode":
+                trim_start = 0.0
+            probe_src = art.path_or_url
+            raw_art = ctx.artifacts.get(f"sources.raw.{index}")
+            if raw_art and raw_art.type == "file" and os.path.exists(raw_art.path_or_url):
+                probe_src = raw_art.path_or_url
+            source_rows.append(
+                {"index": index, "video_src": art.path_or_url, "probe_src": probe_src, "trim": trim_start}
+            )
+
+        ocr_segments = overlay_plan.get("text_segments") or []
+        canonical_timeline = _build_ocr_timeline(
+            text_segments=ocr_segments,
+            sources=source_rows,
+            strict_index_alignment=(generation_mode == "reference_mimic_mode"),
+        )
+        edit_ops = _parse_edit_ops(ctx.requirements)
+        edit_summary = None
+        if edit_ops:
+            canonical_timeline, edit_summary = _apply_edit_ops_to_timeline(canonical_timeline, edit_ops)
+            if edit_summary.get("applied"):
+                add_warning(
+                    ctx.state,
+                    "MANUAL_EDIT_APPLIED",
+                    "Applied manual edit operations to OCR timeline.",
+                    edit_summary,
+                )
+        for row in canonical_timeline:
+            if "text" in row:
+                row["text"] = _sanitize_overlay_text(row.get("text", ""))
+        overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
+        skip_validation = bool(
+            edit_summary and (edit_summary.get("timing_changed") or edit_summary.get("count_changed"))
+        )
+        if not skip_validation:
+            errors = _validate_ocr_timeline(
+                text_segments=ocr_segments,
+                timeline=canonical_timeline,
+                overlay_timing=overlay_timing,
+            )
+            if errors:
+                raise RuntimeError("OCR timing validation failed:\n" + "\n".join(errors))
+        return canonical_timeline, overlay_timing, edit_summary, edit_ops
+
+    def _build_reference_render_timeline(
+        self,
+        ctx: ExecutionContext,
+        analysis: Dict[str, Any],
+        overlay_plan: Dict[str, Any],
+        audio_plan: Dict[str, Any],
+        source_keys: List[str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        source_rows = []
+        for index, key in enumerate(source_keys, start=1):
+            art = ctx.artifacts.get(key)
+            if art is None:
+                continue
+            probe_src = art.path_or_url
+            raw_art = ctx.artifacts.get(f"sources.raw.{index}")
+            if raw_art and raw_art.type == "file" and os.path.exists(raw_art.path_or_url):
+                probe_src = raw_art.path_or_url
+            source_rows.append(
+                {"index": index, "video_src": art.path_or_url, "probe_src": probe_src, "trim": 0.0}
+            )
+
+        canonical_timeline = _build_reference_timeline(analysis=analysis, sources=source_rows)
+        script = overlay_plan.get("overlay_script") or {}
+        script_texts: List[str] = []
+        if isinstance(script, dict):
+            if script.get("title"):
+                script_texts.append(str(script.get("title")))
+            script_texts.extend([str(item) for item in (script.get("items") or []) if str(item)])
+        if not script_texts:
+            script_texts = [
+                str(overlay.get("text", "")).strip()
+                for overlay in (overlay_plan.get("overlays") or [])
+                if str(overlay.get("text", "")).strip()
+            ]
+        for index, scene in enumerate(canonical_timeline):
+            text = script_texts[index] if index < len(script_texts) else ""
+            start = float(scene["start"])
+            end = float(scene["end"])
+            scene["text"] = _sanitize_overlay_text(text)
+            scene["text_start"] = start
+            scene["text_end"] = end
+
+        edit_ops = _parse_edit_ops(ctx.requirements)
+        edit_summary = None
+        if edit_ops:
+            canonical_timeline, edit_summary = _apply_edit_ops_to_timeline(canonical_timeline, edit_ops)
+            if edit_summary.get("applied"):
+                add_warning(
+                    ctx.state,
+                    "MANUAL_EDIT_APPLIED",
+                    "Applied manual edit operations to reference timeline.",
+                    edit_summary,
+                )
+        for row in canonical_timeline:
+            if "text" in row:
+                row["text"] = _sanitize_overlay_text(row.get("text", ""))
+        overlay_timing = _build_overlay_timing_from_timeline(canonical_timeline)
+        reference_audio_duration = None
+        if audio_plan.get("use_reference_audio_bed") and ctx.artifacts.exists("audio.soundtrack"):
+            soundtrack_artifact = ctx.artifacts.get("audio.soundtrack")
+            if soundtrack_artifact is not None:
+                reference_audio_duration = _probe_duration(soundtrack_artifact.path_or_url)
+        skip_validation = bool(
+            edit_summary and (edit_summary.get("timing_changed") or edit_summary.get("count_changed"))
+        )
+        if not skip_validation:
+            errors = _validate_reference_timeline(
+                analysis=analysis,
+                timeline=canonical_timeline,
+                overlay_timing=overlay_timing,
+                use_reference_audio=bool(audio_plan.get("use_reference_audio_bed")),
+                reference_audio_duration=reference_audio_duration,
+            )
+            if errors:
+                raise RuntimeError("Reference mimic validation failed:\n" + "\n".join(errors))
+        return canonical_timeline, overlay_timing, edit_summary, edit_ops
+
+    def _stage_shotstack_render(self, ctx: ExecutionContext) -> None:
+        from ai_editor.editor import create_and_render_video
+
+        shotstack_key = str(os.getenv("SHOTSTACK_KEY", "") or "").strip()
+        if not shotstack_key:
+            raise ProviderFailure(
+                provider="render_provider",
+                code="RENDER_PROVIDER_NOT_CONFIGURED",
+                user_message="Rendering is not configured. Set SHOTSTACK_KEY before running final renders.",
+                detail={"env_key": "SHOTSTACK_KEY"},
+                retryable=False,
+            )
+
+        spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
+        canonical_timeline = spec.get("canonical_timeline") or []
+        edit_summary = spec.get("edit_summary") or {}
+        generation_mode = str(spec.get("generation_mode", ctx.requirements.get("generation_mode", "free_generation_mode"))).lower()
+        edit_mode = str(spec.get("edit_mode", ctx.requirements.get("edit_mode", "scene"))).lower().strip()
+        if edit_mode not in {"scene", "ocr"}:
+            edit_mode = "scene"
+        if generation_mode == "reference_mimic_mode" and edit_mode == "scene" and not canonical_timeline:
+            raise RuntimeError(
+                "reference_mimic_mode requires canonical_timeline in render_spec; refusing non-canonical render."
+            )
+        if edit_mode == "ocr" and not canonical_timeline:
+            raise RuntimeError("OCR mode requires canonical_timeline in render_spec; refusing scene-timed fallback.")
+
+        fetch_entries = []
+        if canonical_timeline:
+            for index, row in enumerate(canonical_timeline, start=1):
+                fetch_entries.append(
+                    {"key": f"timeline.scene.{index}", "path": row.get("video_src"), "meta": {"timeline": True}}
+                )
+        else:
+            fetch_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+            if not fetch_keys:
+                raise RuntimeError("No fetchable sources available for rendering.")
+            for key in fetch_keys:
+                art = ctx.artifacts.get(key)
+                if art is None:
+                    continue
+                fetch_entries.append({"key": key, "path": art.path_or_url, "meta": art.meta or {}})
+
+        local_uploads = [
+            os.path.normpath(entry["path"])
+            for entry in fetch_entries
+            if entry["path"] and not _is_http_url(entry["path"])
+        ]
+        shotstack_links = _upload_assets_for_shotstack(ctx.job_id, local_uploads) if local_uploads else []
+        links_path = os.path.join(ctx.dirs["plans"], "shotstack_asset_links.json")
+        self._write_json(links_path, shotstack_links)
+        ctx.artifacts.register_file(
+            "sources.aligned.drive_links",
+            links_path,
+            {"uploaded": bool(shotstack_links)},
+            "application/json",
+        )
+        upload_map = {os.path.normpath(item["local_path"]): item for item in shotstack_links}
+        for entry in fetch_entries:
+            path = entry["path"]
+            normalized = os.path.normpath(path) if path else None
+            public_url = path
+            if normalized and normalized in upload_map:
+                public_url = upload_map[normalized]["public_url"]
+                if entry["key"].startswith("sources.fetch."):
+                    ctx.artifacts.register_url(
+                        entry["key"],
+                        public_url,
+                        {
+                            "backend": "drive",
+                            **({"aligned": entry["meta"].get("aligned")} if entry["meta"].get("aligned") else {}),
+                        },
+                        "video/mp4",
+                    )
+            entry["public_url"] = public_url
+        video_urls = [entry["public_url"] for entry in fetch_entries if entry["public_url"]]
+
+        if canonical_timeline:
+            for index, row in enumerate(canonical_timeline):
+                local_src = os.path.normpath(str(row.get("video_src", "")))
+                if local_src in upload_map:
+                    canonical_timeline[index]["video_src"] = upload_map[local_src]["public_url"]
+                elif _is_http_url(row.get("video_src")):
+                    canonical_timeline[index]["video_src"] = row.get("video_src")
+                else:
+                    raise RuntimeError(f"Canonical timeline source is not fetchable: {row.get('video_src')}")
+
+            analysis = self._load_analysis(ctx)
+            analyzed_scenes = analysis.get("scenes") or []
+            if (
+                generation_mode == "reference_mimic_mode"
+                and edit_mode == "scene"
+                and len(canonical_timeline) != len(analyzed_scenes)
+                and not (edit_summary.get("count_changed") or edit_summary.get("timing_changed"))
+            ):
+                raise RuntimeError(
+                    f"reference_mimic_mode clip-count mismatch: canonical={len(canonical_timeline)} analyzed={len(analyzed_scenes)}"
+                )
+
+        probe_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
+        if not probe_keys:
+            probe_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        duration_probe_urls = None if canonical_timeline else [
+            ctx.artifacts.get(key).path_or_url for key in probe_keys if ctx.artifacts.get(key)
+        ]
+
+        for index, url in enumerate(video_urls, start=1):
+            if not _is_http_url(url):
+                raise RuntimeError(f"Shotstack asset URL invalid: {url} (entry {index})")
+
+        soundtrack_url = spec.get("soundtrack_url")
+        if soundtrack_url and not _is_http_url(soundtrack_url):
+            uploads = _upload_assets_for_shotstack(ctx.job_id, [soundtrack_url])
+            if not uploads:
+                raise RuntimeError("Failed to upload local soundtrack for Shotstack.")
+            soundtrack_url = uploads[0]["public_url"]
+            spec["soundtrack_url"] = soundtrack_url
+            ctx.state.render_spec = spec
+
+        try:
+            render_result = create_and_render_video(
+                api_key=shotstack_key,
+                video_urls=video_urls,
+                duration_probe_urls=duration_probe_urls,
+                project_title=f"Auto-Edit ({ctx.job_id})",
+                overlay_text=[ctx.requirements.get("prompt", "")[:50]],
+                soundtrack_url=soundtrack_url,
+                music_mode=spec.get("music_mode", "original"),
+                resolution=spec.get("resolution", "1080x1920"),
+                wait_for_render=True,
+                overlay_plan=spec.get("overlay_plan") or None,
+                overlay_timing=spec.get("overlay_timing") or None,
+                overlay_script=spec.get("overlay_script") or None,
+                timing_mode=str(spec.get("timing_mode", "ocr_keyframe")),
+                generation_mode=str(spec.get("generation_mode", ctx.requirements.get("generation_mode", "free_generation_mode"))),
+                canonical_timeline=canonical_timeline or None,
+                force_mobile_safe_text=bool(spec.get("force_mobile_safe_text")),
+                mobile_safe_text_mode=bool(spec.get("mobile_safe_text_mode", False)),
+                caption_density_mode=str(spec.get("caption_density_mode", "normal")),
+                caption_style_preset=str(spec.get("caption_style_preset", "default")),
+                overlay_density_cap=spec.get("overlay_density_cap"),
+                text_placement_policy=str(spec.get("text_placement_policy", "default")),
+                text_readability_mode=str(spec.get("text_readability_mode", "balanced")),
+                overlay_full_clip=bool(spec.get("overlay_full_clip")),
+                mute_source_audio=bool(spec.get("mute_source_audio", False)),
+                disable_auto_transitions=bool(spec.get("disable_auto_transitions", False)),
+                refit_mode=str(spec.get("refit_mode", ctx.requirements.get("refit_mode", "crop_center"))),
+                output_mode=str(spec.get("output_mode", ctx.requirements.get("output_mode", "crop_to_9x16"))),
+                debug_text_visibility=bool(ctx.requirements.get("debug_text_visibility", False)),
+                debug_render_spec_path=os.path.join(ctx.dirs["plans"], "render_spec.json"),
+                debug_overlay_timing_path=os.path.join(ctx.dirs["plans"], "overlay_timing.json"),
+                debug_shotstack_payload_path=os.path.join(ctx.dirs["plans"], "shotstack_request_payload.json"),
+            )
+        except Exception as exc:
+            raise normalize_provider_exception(
+                "render_provider",
+                exc,
+                operation="shotstack_render.create_and_render_video",
+                config_message="The render provider is not configured correctly.",
+                timeout_message="The render provider timed out while producing the video.",
+                auth_message="The render provider rejected authentication. Check SHOTSTACK_KEY.",
+                network_message="The render provider is temporarily unavailable.",
+                default_message="The render provider failed while creating the video render.",
+            ) from exc
+        if not render_result.get("success") or not render_result.get("url"):
+            raise RuntimeError(f"Render failed: {render_result.get('error') or 'No output URL returned.'}")
+
+        master_path = os.path.join(ctx.dirs["outputs"], "master_16x9.mp4")
+        try:
+            _download_file(render_result["url"], master_path)
+        except Exception as exc:
+            raise normalize_provider_exception(
+                "render_provider",
+                exc,
+                operation="shotstack_render.download_result",
+                config_message="The render output could not be downloaded because the render provider is misconfigured.",
+                timeout_message="Downloading the render output timed out.",
+                auth_message="The render output could not be downloaded due to authorization failure.",
+                network_message="The render output is temporarily unavailable for download.",
+                default_message="Downloading the render output failed.",
+            ) from exc
+        ctx.artifacts.register_file(
+            "render.master_16x9",
+            master_path,
+            {"render_id": render_result.get("render_id")},
+            "video/mp4",
+        )
+        ctx.artifacts.register_url(
+            "render.shotstack_url",
+            render_result["url"],
+            {"render_id": render_result.get("render_id")},
+            "video/mp4",
+        )
+        ctx.runtime["render_result"] = render_result
+
+    def _stage_postprocess(self, ctx: ExecutionContext) -> None:
+        plan = self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "postprocess_plan.json"))
+        if not plan.get("create_shorts"):
+            update_stage(ctx.state, StageName.POSTPROCESS, StageStatus.SKIPPED, {"reason": "intent_mode=video"})
+            self._save(ctx)
+            return
+        master = ctx.artifacts.get("render.master_16x9")
+        if master is None:
+            raise RuntimeError("Rendered master video is missing.")
+        short_path = os.path.join(ctx.dirs["outputs"], "short_9x16.mp4")
+        try:
+            _run_shorts_refit(master.path_or_url, short_path, plan.get("refit_mode", "crop_center"))
+            ctx.artifacts.register_file(
+                "render.short_9x16",
+                short_path,
+                {"refit_mode": plan.get("refit_mode", "crop_center")},
+                "video/mp4",
+            )
+        except Exception as exc:
+            add_warning(
+                ctx.state,
+                "FFMPEG_POSTPROCESS_FAILED",
+                "Shorts conversion failed; using master preview fallback.",
+                str(exc),
+            )
+
+    def _stage_publish(self, ctx: ExecutionContext) -> None:
+        plan = self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "postprocess_plan.json"))
+        create_shorts = bool(plan.get("create_shorts"))
+        if create_shorts and _artifact_path_exists(ctx.artifacts, "render.short_9x16"):
+            preview_mode = "shorts"
+            preview_name = "short_9x16.mp4"
+        else:
+            preview_mode = "video"
+            preview_name = "master_16x9.mp4"
+        ctx.runtime["preview_url"] = f"/files/{ctx.job_id}/outputs/{preview_name}"
+        ctx.runtime["preview_mode"] = preview_mode
+
+    def _load_analysis(self, ctx: ExecutionContext) -> Dict[str, Any]:
+        if ctx.state.analysis:
+            return ctx.state.analysis
+        artifact = ctx.artifacts.get("analysis.json")
+        if artifact and os.path.exists(artifact.path_or_url):
+            analysis = self._load_json_if_exists(artifact.path_or_url)
+            ctx.state.analysis = analysis
+            return analysis
+        return {}
+
+    def _source_keys_for_generation(self, ctx: ExecutionContext) -> List[str]:
+        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        if generation_mode == "reference_mimic_mode":
+            return _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+        source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
+        if not source_keys:
+            source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        return source_keys
+
+    def _source_durations_for_plan(self, ctx: ExecutionContext, analysis: Dict[str, Any]) -> List[float]:
+        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        if generation_mode == "reference_mimic_mode":
+            return []
+        source_keys = self._source_keys_for_generation(ctx)
+        source_paths = [ctx.artifacts.get(key).path_or_url for key in source_keys if ctx.artifacts.get(key)]
+        return [_probe_duration(path) for path in source_paths]
+
+    def _refresh_source_status(self, ctx: ExecutionContext) -> None:
+        raw_count = len(_sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw."))
+        fetch_count = len(_sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch."))
+        aligned_count = len(_sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned."))
+        status = {
+            "generation_mode": ctx.requirements.get("generation_mode", "free_generation_mode"),
+            "primary_ready": _artifact_path_exists(ctx.artifacts, "primary.video"),
+            "raw_source_count": raw_count,
+            "fetch_source_count": fetch_count,
+            "aligned_source_count": aligned_count,
+            "sources_ready": fetch_count > 0 or aligned_count > 0 or raw_count > 0,
+            "drive_folder_connected": bool(ctx.request_payload.get("gdrive_folder_id")),
+        }
+        set_source_status(ctx.state, status)
+        self._save(ctx)
+
+    def _record_overlay_warnings(self, ctx: ExecutionContext, overlay_plan: Dict[str, Any]) -> None:
+        for warning in overlay_plan.get("warnings", []):
+            add_warning(
+                ctx.state,
+                warning.get("code", "OVERLAY_WARNING"),
+                warning.get("message", "Overlay warning"),
+                warning.get("detail"),
+            )
+
+    def _write_plan_bundle(
+        self,
+        ctx: ExecutionContext,
+        *,
+        timeline_plan: Dict[str, Any],
+        overlay_plan: Dict[str, Any],
+        audio_plan: Dict[str, Any],
+        render_spec: Dict[str, Any],
+        postprocess_plan: Dict[str, Any],
+        analysis_duration: float,
+        render_duration: float,
+    ) -> None:
+        write_plan(ctx.dirs["job"], "audio_plan.json", audio_plan)
+        write_plan(ctx.dirs["job"], "overlay_plan.json", overlay_plan)
+        write_plan(
+            ctx.dirs["job"],
+            "overlay_script.json",
+            overlay_plan.get("overlay_script") or {"title": "", "items": [], "source": ""},
+        )
+        write_plan(
+            ctx.dirs["job"],
+            "text_segments.json",
+            {
+                "segments": overlay_plan.get("text_segments", []),
+                "warnings": overlay_plan.get("warnings", []),
+                "analysis_duration": analysis_duration,
+                "render_duration": render_duration,
+            },
+        )
+        write_plan(ctx.dirs["job"], "timeline_plan.json", timeline_plan)
+        write_plan(ctx.dirs["job"], "render_spec.json", render_spec)
+        write_plan(ctx.dirs["job"], "postprocess_plan.json", postprocess_plan)
+        if render_spec.get("canonical_timeline"):
+            write_plan(
+                ctx.dirs["job"],
+                "canonical_timeline.json",
+                {
+                    "generation_mode": render_spec.get("generation_mode"),
+                    "edit_mode": render_spec.get("edit_mode"),
+                    "timeline": render_spec.get("canonical_timeline", []),
+                },
+            )
+            write_plan(
+                ctx.dirs["job"],
+                "overlay_timing.json",
+                {
+                    "generation_mode": render_spec.get("generation_mode"),
+                    "edit_mode": render_spec.get("edit_mode"),
+                    "overlays": render_spec.get("overlay_timing", []),
+                },
+            )
+
+    def _apply_edit_requests(
+        self,
+        ctx: ExecutionContext,
+        timeline_plan: Dict[str, Any],
+        *,
+        requests: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        requests = list(requests or [])
+        if not requests or not timeline_plan:
+            return timeline_plan
+
+        session = EditSession.from_payloads(
+            timeline_plan=timeline_plan,
+            analysis=self._load_analysis(ctx),
+            requirements=ctx.requirements,
+        )
+        processed_requests: List[str] = []
+        unstructured_requests: List[str] = []
+
+        for request in requests:
+            operations = self.instruction_parser.parse(request)
+            processed_requests.append(request)
+            if not operations:
+                unstructured_requests.append(request)
+                continue
+            session.apply_operations(operations, raw_instruction=request)
+
+        if processed_requests:
+            mark_edit_requests_applied(ctx.state, processed_requests)
+
+        for request in unstructured_requests:
+            add_warning(
+                ctx.state,
+                "UNSTRUCTURED_EDIT_REQUEST",
+                "An edit request could not be mapped to deterministic plan operations, so it was kept as qualitative guidance only.",
+                {"request": request},
+            )
+
+        if not session.history:
+            return timeline_plan
+
+        patched_plan = dict(session.timeline_plan)
+        patch_history = [
+            {
+                "instruction": entry.get("instruction", ""),
+                "operation_count": int((entry.get("result") or {}).get("operation_count", 0) or 0),
+            }
+            for entry in session.history
+        ]
+        applied_operations = []
+        deferred_operations = []
+        for entry in session.history:
+            result = entry.get("result") or {}
+            applied_operations.extend(list(result.get("applied_operations") or []))
+            deferred_operations.extend(list(result.get("deferred_operations") or []))
+
+        debug = dict(patched_plan.get("planning_debug") or {})
+        debug["controller_feedback_requests_applied"] = processed_requests
+        debug["controller_feedback_patch_history"] = patch_history
+        patched_plan["planning_debug"] = debug
+        patched_plan["plan_patch"] = {
+            "applied_requests": processed_requests,
+            "applied_operations": applied_operations,
+            "deferred_operations": deferred_operations,
+            "operation_count": len(applied_operations),
+            "patch_strategy": "controller_feedback_edit_patch",
+        }
+        return patched_plan
+
+    def _ensure_render_gate(
+        self,
+        ctx: ExecutionContext,
+        decision: PipelineDecision,
+        *,
+        action_name: str,
+    ) -> None:
+        if pending_edit_requests(ctx.state):
+            raise RuntimeError(f"{action_name} blocked: pending edit requests remain unapplied.")
+        if not ctx.state.current_plan:
+            raise RuntimeError(f"{action_name} blocked: no current plan is available.")
+        if ctx.state.plan_needs_validation or not ctx.state.plan_validation or ctx.state.plan_validation_score is None:
+            raise RuntimeError(f"{action_name} blocked: plan validation is missing or stale.")
+        override_reason = _validation_override_reason(decision.parameters)
+        if ctx.state.plan_validation_score < self.minimum_validation_score and not override_reason:
+            raise RuntimeError(
+                f"{action_name} blocked: validation score {ctx.state.plan_validation_score:.3f} is below "
+                f"minimum {self.minimum_validation_score:.3f}."
+            )
+        if override_reason:
+            add_warning(
+                ctx.state,
+                "VALIDATION_GATE_BYPASSED",
+                f"{action_name} was allowed because an explicit validation override reason was recorded.",
+                {
+                    "action": action_name,
+                    "override_reason": override_reason,
+                    "validation_score": ctx.state.plan_validation_score,
+                },
+            )
+
+    def _build_success_response(self, ctx: ExecutionContext, *, status: str) -> Dict[str, Any]:
+        render_url_artifact = ctx.artifacts.get("render.shotstack_url")
+        render_url = render_url_artifact.path_or_url if render_url_artifact else None
+        render_id = (render_url_artifact.meta or {}).get("render_id") if render_url_artifact else None
+        render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
+        resolution = str(render_spec.get("resolution", "1080x1920"))
+        render_aspect = "16:9" if resolution == "1920x1080" else ("1:1" if resolution == "1080x1080" else "9:16")
+        user_notice = next(
+            (warning["message"] for warning in ctx.state.warnings if warning.get("code") == "SOURCE_DURATION_SHORT"),
+            None,
+        )
+        ffmpeg_error = next(
+            (warning.get("detail") for warning in ctx.state.warnings if warning.get("code") == "FFMPEG_POSTPROCESS_FAILED"),
+            None,
+        )
+        return {
+            "success": True,
+            "url": render_url,
+            "render_id": render_id,
+            "status": status,
+            "project_id": ctx.job_id,
+            "intent_mode": ctx.requirements.get("intent_mode", "video"),
+            "refit_mode": ctx.requirements.get("refit_mode", "crop_center"),
+            "output_mode": ctx.requirements.get("output_mode", "crop_to_9x16"),
+            "render_aspect": render_aspect,
+            "preview_url": ctx.runtime.get("preview_url"),
+            "preview_mode": ctx.runtime.get("preview_mode", "video"),
+            "user_notice": user_notice,
+            "ffmpeg_error": ffmpeg_error,
+            "warnings": ctx.state.warnings,
+            "errors": ctx.state.errors,
+            **build_controller_status_payload(ctx.state),
+        }
+
+    def _load_json_if_exists(self, path: str) -> Dict[str, Any]:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _write_json(self, path: str, payload: Any) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    def _save(self, ctx: ExecutionContext) -> None:
+        self._save_hook(ctx)
+
+
+def _is_http_url(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
+
+
+def _default_drive_folder() -> Optional[str]:
+    return os.getenv("DRIVE_UPLOAD_FOLDER_ID") or os.getenv("DRIVE_DEFAULT_FOLDER_ID") or os.getenv("VIDEO_FOLDER")
+
+
+def _upload_assets_for_shotstack(job_id: str, local_paths: List[str]) -> List[Dict[str, Any]]:
+    if not local_paths:
+        return []
+    from .storage import DriveStorageAdapter
+
+    try:
+        adapter = DriveStorageAdapter()
+    except Exception as exc:
+        raise normalize_provider_exception(
+            "drive_storage",
+            exc,
+            operation="shotstack_asset_upload.init",
+            config_message="Google Drive is not configured correctly for render asset uploads.",
+            timeout_message="Google Drive timed out while preparing render asset uploads.",
+            auth_message="Google Drive access is not authorized for render asset uploads.",
+            network_message="Google Drive is temporarily unavailable for render asset uploads.",
+            default_message="Preparing Google Drive uploads for rendering failed.",
+        ) from exc
+    folder_id = _default_drive_folder()
+    results = []
+    for path in local_paths:
+        normalized = os.path.normpath(path)
+        if not os.path.exists(normalized):
+            raise RuntimeError(f"Aligned clip missing: {normalized}")
+        attempts = 3
+        last_exc: Optional[Exception] = None
+        current_folder = folder_id
+        asset = None
+        for attempt in range(attempts):
+            try:
+                asset = adapter.upload(normalized, current_folder)
+                break
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if current_folder and (
+                    "insufficientParentPermissions" in message or "Insufficient permissions" in message
+                ):
+                    current_folder = None
+                    continue
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(2**attempt)
+        if asset is None:
+            if last_exc is not None:
+                raise normalize_provider_exception(
+                    "drive_storage",
+                    last_exc,
+                    operation="shotstack_asset_upload.upload",
+                    config_message="Google Drive is not configured correctly for render asset uploads.",
+                    timeout_message="Google Drive timed out while uploading render assets.",
+                    auth_message="Google Drive access is not authorized for render asset uploads.",
+                    network_message="Google Drive is temporarily unavailable for render asset uploads.",
+                    default_message="Uploading render assets to Google Drive failed.",
+                ) from last_exc
+            raise RuntimeError(f"Failed to upload {normalized}")
+        try:
+            adapter.drive.permissions().create(
+                fileId=asset.id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+            ).execute()
+        except Exception as exc:
+            raise normalize_provider_exception(
+                "drive_storage",
+                exc,
+                operation="shotstack_asset_upload.permissions",
+                config_message="Google Drive is not configured correctly for public asset sharing.",
+                timeout_message="Google Drive timed out while sharing render assets.",
+                auth_message="Google Drive access is not authorized for asset sharing.",
+                network_message="Google Drive is temporarily unavailable for asset sharing.",
+                default_message="Sharing uploaded render assets failed.",
+            ) from exc
+        public_url = adapter.get_fetchable_url(asset)
+        try:
+            response = requests.head(public_url, timeout=10)
+            if response.status_code >= 400:
+                print(f"Warning: HEAD {public_url} returned {response.status_code}")
+        except requests.RequestException as exc:
+            print(f"Warning: could not verify {public_url}: {exc}")
+        results.append(
+            {
+                "local_path": normalized,
+                "file_id": asset.id,
+                "name": asset.name,
+                "public_url": public_url,
+            }
+        )
+    return results
+
+
+def _probe_duration(path: str) -> float:
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            return 0.0
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        capture.release()
+        return (frames / fps) if fps > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _probe_duration_any(path_or_url: str) -> float:
+    if not path_or_url:
+        return 0.0
+    duration = _probe_duration(path_or_url)
+    if duration > 0:
+        return duration
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path_or_url),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return float((proc.stdout or "0").strip() or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _is_direct_shotstack_source_url(url: str) -> bool:
+    if not _is_http_url(url):
+        return False
+    lowered = str(url).lower().strip()
+    if "drive.google.com/uc?" in lowered:
+        return True
+    return any(lowered.endswith(ext) for ext in [".mp4", ".mov", ".m4v", ".webm", ".mkv"])
+
+
+def _extract_start_override(source: Dict[str, Any]) -> float:
+    try:
+        if source.get("start") is not None:
+            return max(0.0, float(source.get("start")))
+    except (TypeError, ValueError):
+        pass
+    segments = source.get("segments") or []
+    if isinstance(segments, list) and segments:
+        first = segments[0] or {}
+        try:
+            if first.get("start") is not None:
+                return max(0.0, float(first.get("start")))
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _extract_bounded_segment(source: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    segments = source.get("segments") or []
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = segments[0] or {}
+    try:
+        start = float(first.get("start"))
+        end = float(first.get("end"))
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    return max(0.0, start), max(0.0, end)
+
+
+def _parse_timestamp_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if ":" not in raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        else:
+            hours = 0
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+    except ValueError:
+        return None
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def _extract_music_segment(requirements: Dict[str, Any]) -> Optional[Tuple[float, Optional[float]]]:
+    segment = requirements.get("custom_music_segment") or requirements.get("custom_music_segments")
+    if isinstance(segment, list) and segment:
+        segment = segment[0]
+    if isinstance(segment, str):
+        cleaned = segment.strip()
+        if "-" in cleaned and "http" not in cleaned.lower():
+            parts = [part.strip() for part in cleaned.split("-", 1)]
+            if len(parts) == 2:
+                start = _parse_timestamp_seconds(parts[0])
+                end = _parse_timestamp_seconds(parts[1])
+                if start is not None and (end is None or end > start):
+                    return max(0.0, start), end
+    if isinstance(segment, dict):
+        start = _parse_timestamp_seconds(segment.get("start"))
+        end = _parse_timestamp_seconds(segment.get("end")) if segment.get("end") is not None else None
+        if start is not None:
+            if end is not None and end <= start:
+                return None
+            return max(0.0, start), end
+
+    start = requirements.get("custom_music_start")
+    end = requirements.get("custom_music_end")
+    start_value = _parse_timestamp_seconds(start)
+    end_value = _parse_timestamp_seconds(end) if end is not None else None
+    if start_value is not None:
+        if end_value is not None and end_value <= start_value:
+            return None
+        return max(0.0, start_value), end_value
+    return None
+
+
+def _download_file(url: str, out_path: str) -> None:
+    with requests.get(url, stream=True, timeout=180) as response:
+        response.raise_for_status()
+        with open(out_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"Downloaded file is empty: {out_path}")
+
+
+def _run_shorts_refit(master_path: str, short_path: str, refit_mode: str) -> None:
+    if refit_mode == "crop":
+        refit_mode = "crop_center"
+    if refit_mode not in {"crop_center", "pad"}:
+        refit_mode = "crop_center"
+    if refit_mode == "pad":
+        vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+    else:
+        vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    cmd = [
+        "ffmpeg",
+        "-i",
+        master_path,
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        "-y",
+        short_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "").strip())
+
+
+def _align_sources(raw_paths: List[str], scene_durations: List[float], out_dir: str) -> Tuple[List[str], Optional[str]]:
+    sources = []
+    for path in raw_paths:
+        duration = _probe_duration(path)
+        if duration > 0:
+            sources.append({"path": path, "dur": duration})
+    if not sources or not scene_durations:
+        return [], None
+    total_source = sum(source["dur"] for source in sources)
+    total_target = sum(scene_durations)
+    if total_source + 0.05 < total_target:
+        return [], (
+            f"Uploaded source duration ({total_source:.1f}s) is shorter than analyzed timeline ({total_target:.1f}s). "
+            "Proceeding with sources as-is. Re-upload if this is not your intent."
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    aligned = []
+    for index, _target_duration in enumerate(scene_durations, start=1):
+        source_index = index - 1
+        if source_index >= len(sources):
+            return [], f"Not enough source clips for strict index alignment: need source {index} for scene {index}."
+        current = sources[source_index]
+        if current["dur"] <= 0.05:
+            return [], f"Source {index} has invalid duration ({current['dur']:.2f}s)."
+        dst = os.path.join(out_dir, f"aligned_{index:03d}.mp4")
+        shutil.copy2(current["path"], dst)
+        aligned.append(dst)
+    return aligned, None
+
+
+def _sorted_indexed_artifact_keys(items: Dict[str, Any], prefix: str) -> List[str]:
+    keys = []
+    for key in items:
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix) :]
+        if suffix.isdigit():
+            keys.append(key)
+    return sorted(keys, key=lambda item: int(item[len(prefix) :]))
+
+
+def _collect_edit_request_lines(requirements: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    for key in ("edit_requests", "user_requests"):
+        values = requirements.get(key) or []
+        if isinstance(values, list):
+            lines.extend([str(value) for value in values if str(value).strip()])
+    return lines
+
+
+def _sanitize_overlay_text(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"\((?:top|bottom|middle|center)\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("|", " ")
+    cleaned = cleaned.replace("'", "")
+    return " ".join(cleaned.split()).strip()
+
+
+def _parse_edit_ops(requirements: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    for raw in _collect_edit_request_lines(requirements):
+        line = raw.strip()
+        if not line:
+            continue
+        prefix = line.split(":", 1)[0].strip().lower()
+        if prefix in {"remove", "cut", "delete", "trim", "add", "replace", "swap", "edit"} and ":" in line:
+            line = line.split(":", 1)[1].strip()
+        lowered = line.lower()
+
+        match = re.search(r"(?:trim|remove|cut)\s+(?:the\s+)?(?:end|last)\s+(\d+(?:\.\d+)?)", lowered)
+        if not match:
+            match = re.search(r"last\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)", lowered)
+        if match:
+            ops.append({"op": "trim_end", "seconds": float(match.group(1)), "raw": raw})
+            continue
+
+        match = re.search(r"(?:remove|delete|cut)\s+(?:clip|scene)\s*(\d+)", lowered)
+        if match:
+            ops.append({"op": "remove_clip", "index": int(match.group(1)), "raw": raw})
+            continue
+
+        match = re.search(r"swap\s+(?:clip|scene)?\s*(\d+)\s*(?:and|with)\s*(\d+)", lowered)
+        if not match:
+            match = re.search(r"swap\s+(\d+)\s+(\d+)", lowered)
+        if match:
+            ops.append({"op": "swap", "a": int(match.group(1)), "b": int(match.group(2)), "raw": raw})
+            continue
+
+        match = re.search(
+            r"replace\s+(?:clip|scene)?\s*(\d+)\s+(?:with|from)\s*(?:clip|scene)?\s*(\d+)",
+            lowered,
+        )
+        if match:
+            ops.append(
+                {"op": "replace_clip", "index": int(match.group(1)), "source": int(match.group(2)), "raw": raw}
+            )
+            continue
+
+        match = re.search(
+            r"(?:add\s+)?overlay\s+text(?:\s+for)?\s*(?:clip|scene)?\s*(\d+)?\s*(?:is|=|:)?\s*(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            index = int(match.group(1)) if match.group(1) else None
+            text = _sanitize_overlay_text(match.group(2))
+            if text:
+                ops.append({"op": "set_overlay_text", "index": index, "text": text, "raw": raw})
+    return ops
+
+
+def _reflow_timeline(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    cursor = 0.0
+    for index, row in enumerate(timeline, start=1):
+        duration = float(row.get("duration", row.get("length", 0.0)) or 0.0)
+        if duration <= 0:
+            continue
+        label = str(row.get("label", "")).strip()
+        if label.startswith("scene_"):
+            prefix = "scene"
+        elif label.startswith("ocr_"):
+            prefix = "ocr"
+        else:
+            prefix = "clip"
+        row["index"] = index
+        row["scene_id"] = int(row.get("scene_id", index))
+        row["label"] = f"{prefix}_{index:03d}"
+        row["start"] = cursor
+        row["end"] = cursor + duration
+        row["duration"] = duration
+        row["length"] = duration
+        row["text_start"] = row.get("text_start", row["start"])
+        row["text_end"] = row.get("text_end", row["end"])
+        cursor = row["end"]
+        output.append(row)
+    return output
+
+
+def _apply_edit_ops_to_timeline(
+    timeline: List[Dict[str, Any]],
+    ops: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not timeline or not ops:
+        return timeline, {"applied": [], "timing_changed": False, "count_changed": False}
+
+    rows = [dict(row) for row in timeline]
+    applied: List[Dict[str, Any]] = []
+    timing_changed = False
+    count_changed = False
+    overlay_queue: List[str] = []
+
+    def _valid_index(index: int) -> bool:
+        return 1 <= index <= len(rows)
+
+    for op in ops:
+        if op["op"] == "trim_end":
+            seconds = max(0.0, float(op.get("seconds", 0.0)))
+            if seconds <= 0 or not rows:
+                continue
+            last = rows[-1]
+            duration = float(last.get("duration", last.get("length", 0.0)) or 0.0)
+            new_duration = max(0.0, duration - seconds)
+            last["duration"] = new_duration
+            last["length"] = new_duration
+            timing_changed = True
+            if new_duration <= 0:
+                rows.pop()
+                count_changed = True
+            applied.append(op)
+            continue
+
+        if op["op"] == "remove_clip":
+            index = int(op.get("index", 0) or 0)
+            if _valid_index(index):
+                rows.pop(index - 1)
+                count_changed = True
+                applied.append(op)
+            continue
+
+        if op["op"] == "swap":
+            a = int(op.get("a", 0) or 0)
+            b = int(op.get("b", 0) or 0)
+            if _valid_index(a) and _valid_index(b) and a != b:
+                rows[a - 1], rows[b - 1] = rows[b - 1], rows[a - 1]
+                applied.append(op)
+            continue
+
+        if op["op"] == "replace_clip":
+            index = int(op.get("index", 0) or 0)
+            source_index = int(op.get("source", 0) or 0)
+            if _valid_index(index) and _valid_index(source_index) and index != source_index:
+                source_row = rows[source_index - 1]
+                dest_row = rows[index - 1]
+                for key in ("video_src", "videoSrc", "trim", "source_duration", "source_index"):
+                    if key in source_row:
+                        dest_row[key] = source_row.get(key)
+                applied.append(op)
+            continue
+
+        if op["op"] == "set_overlay_text":
+            index = op.get("index")
+            text = _sanitize_overlay_text(op.get("text", ""))
+            if not text:
+                continue
+            if index and _valid_index(int(index)):
+                row = rows[int(index) - 1]
+                row["text"] = text
+                row["text_start"] = row.get("start", 0.0)
+                row["text_end"] = row.get("end", row.get("start", 0.0))
+                applied.append(op)
+            else:
+                overlay_queue.append(text)
+                applied.append(op)
+            continue
+
+    if overlay_queue:
+        for row in rows:
+            if not overlay_queue:
+                break
+            if not str(row.get("text", "")).strip():
+                row["text"] = overlay_queue.pop(0)
+
+    rows = _reflow_timeline(rows)
+    return rows, {"applied": applied, "timing_changed": timing_changed, "count_changed": count_changed}
+
+
+def _build_reference_timeline(analysis: Dict[str, Any], sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    scenes = analysis.get("scenes") or []
+    if not scenes:
+        raise RuntimeError("Reference mimic mode requires analyzed scenes.")
+    durations = [float(scene.get("duration", 0.0)) for scene in scenes]
+    if any(duration <= 0 for duration in durations):
+        raise RuntimeError("Reference mimic mode requires positive analyzed scene durations.")
+    if not sources:
+        raise RuntimeError("No valid source clips available for reference mimic mode.")
+    if len(sources) < len(scenes):
+        raise RuntimeError(f"Reference mimic requires at least {len(scenes)} sources; received {len(sources)}.")
+
+    timeline = []
+    for index, scene in enumerate(scenes, start=1):
+        target_duration = float(scene.get("duration", 0.0))
+        source = sources[index - 1]
+        video_src = str(source.get("video_src", "")).strip()
+        probe_src = str(source.get("probe_src", "")).strip() or video_src
+        trim_start = max(0.0, float(source.get("trim", 0.0)))
+        source_duration = -1.0
+        if probe_src and not _is_http_url(probe_src):
+            source_duration = _probe_duration_any(probe_src)
+            if source_duration <= 0.0:
+                raise RuntimeError(f"Reference mimic source {index} duration could not be determined: {probe_src}")
+            if source_duration + 0.02 < trim_start + target_duration:
+                raise RuntimeError(
+                    f"Reference mimic assignment failed for scene {index}: source too short "
+                    f"(source={source_duration:.2f}s, trim={trim_start:.2f}s, required={target_duration:.2f}s)."
+                )
+        start = float(scene.get("start_time", sum(durations[: index - 1])))
+        end = float(scene.get("end_time", start + target_duration))
+        timeline.append(
+            {
+                "index": index,
+                "scene_id": int(scene.get("scene_id", index)),
+                "label": f"scene_{index:03d}",
+                "start": start,
+                "end": end,
+                "length": target_duration,
+                "duration": target_duration,
+                "videoSrc": video_src,
+                "video_src": video_src,
+                "trim": trim_start,
+                "transitionIn": None,
+                "transitionOut": None,
+                "text": "",
+                "text_start": start,
+                "text_end": end,
+                "source_duration": source_duration,
+            }
+        )
+    return timeline
+
+
+def _validate_reference_timeline(
+    analysis: Dict[str, Any],
+    timeline: List[Dict[str, Any]],
+    overlay_timing: List[Dict[str, Any]],
+    use_reference_audio: bool,
+    reference_audio_duration: Optional[float],
+) -> List[str]:
+    errors: List[str] = []
+    scenes = analysis.get("scenes") or []
+    tolerance = 0.05
+    if len(timeline) != len(scenes):
+        errors.append(f"scene_count mismatch: generated={len(timeline)} analyzed={len(scenes)}")
+    analyzed_durations = [float(scene.get("duration", 0.0)) for scene in scenes]
+    generated_durations = [float(row.get("duration", 0.0)) for row in timeline]
+    for index, (generated, analyzed) in enumerate(zip(generated_durations, analyzed_durations), start=1):
+        if abs(generated - analyzed) > tolerance:
+            errors.append(f"scene_duration mismatch at {index}: generated={generated:.3f}, analyzed={analyzed:.3f}")
+    analyzed_total = sum(analyzed_durations)
+    generated_total = sum(generated_durations)
+    if abs(generated_total - analyzed_total) > tolerance:
+        errors.append(f"total_duration mismatch: generated={generated_total:.3f}, analyzed={analyzed_total:.3f}")
+    if len(overlay_timing) != len(timeline):
+        errors.append(f"overlay_count mismatch: overlays={len(overlay_timing)} scenes={len(timeline)}")
+    for index, (overlay, scene_row) in enumerate(zip(overlay_timing, timeline), start=1):
+        start = float(overlay.get("start", 0.0))
+        end = float(overlay.get("end", 0.0))
+        scene_start = float(scene_row.get("start", 0.0))
+        scene_end = float(scene_row.get("end", scene_start + float(scene_row.get("duration", 0.0))))
+        if abs(start - scene_start) > tolerance:
+            errors.append(f"overlay_start mismatch at {index}: overlay={start:.3f}, scene={scene_start:.3f}")
+        if abs((end - start) - (scene_end - scene_start)) > tolerance:
+            errors.append(
+                f"overlay_length mismatch at {index}: overlay={(end-start):.3f}, scene={(scene_end-scene_start):.3f}"
+            )
+    last_end = -1.0
+    for row in sorted(overlay_timing, key=lambda item: float(item.get("start", 0.0))):
+        start = float(row.get("start", 0.0))
+        end = float(row.get("end", 0.0))
+        if end < start:
+            errors.append(f"overlay timing invalid: start={start:.3f}, end={end:.3f}")
+        if start < last_end - 1e-3:
+            errors.append(f"overlay overlap detected: start={start:.3f}, prev_end={last_end:.3f}")
+        last_end = max(last_end, end)
+    if timeline:
+        final_scene_end = float(timeline[-1].get("end", 0.0))
+        if abs(final_scene_end - generated_total) > tolerance:
+            errors.append(f"final_scene_end mismatch: final_end={final_scene_end:.3f}, total={generated_total:.3f}")
+    return errors
+
+
+def _build_overlay_timing_from_timeline(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    overlays = []
+    for index, row in enumerate(timeline, start=1):
+        start = float(row.get("text_start", row.get("start", 0.0)))
+        end = float(row.get("text_end", row.get("end", start)))
+        if end <= start:
+            continue
+        overlays.append(
+            {"index": index, "text": str(row.get("text", "")).strip(), "start": start, "end": end, "length": end - start}
+        )
+    return overlays
+
+
+def _build_ocr_timeline(
+    text_segments: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    strict_index_alignment: bool = False,
+) -> List[Dict[str, Any]]:
+    if not text_segments:
+        raise RuntimeError("OCR mode selected but no OCR text segments were produced from analysis keyframes.")
+    if not sources:
+        raise RuntimeError("OCR mode requires at least one source clip URL/path.")
+    ordered_segments = sorted(text_segments, key=lambda segment: float(segment.get("start", 0.0)))
+    if strict_index_alignment and len(sources) < len(ordered_segments):
+        raise RuntimeError(
+            f"OCR mode in reference mimic requires at least {len(ordered_segments)} sources; received {len(sources)}."
+        )
+    timeline: List[Dict[str, Any]] = []
+    duration_cache: Dict[str, float] = {}
+    for index, segment in enumerate(ordered_segments, start=1):
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        duration = end - start
+        if duration <= 0.0:
+            continue
+        source = sources[index - 1] if strict_index_alignment else sources[min(index - 1, len(sources) - 1)]
+        video_src = str(source.get("video_src", "")).strip()
+        probe_src = str(source.get("probe_src", "")).strip() or video_src
+        trim_start = max(0.0, float(source.get("trim", 0.0) or 0.0))
+        if not video_src:
+            raise RuntimeError(f"OCR timeline source {index} has no usable URL/path.")
+        cache_key = probe_src or video_src
+        if cache_key not in duration_cache:
+            if cache_key and _is_http_url(cache_key):
+                duration_cache[cache_key] = -1.0
+            else:
+                duration_cache[cache_key] = _probe_duration_any(cache_key)
+        source_duration = float(duration_cache.get(cache_key, 0.0))
+        if source_duration <= 0.0:
+            source_duration = -1.0
+        elif source_duration + 0.02 < trim_start + duration:
+            raise RuntimeError(
+                f"OCR timeline assignment failed for segment {index}: source too short "
+                f"(source={source_duration:.2f}s, trim={trim_start:.2f}s, required={duration:.2f}s)."
+            )
+        text = str(segment.get("text", "")).strip()
+        timeline.append(
+            {
+                "index": index,
+                "scene_id": index,
+                "label": f"ocr_{index:03d}",
+                "start": start,
+                "end": end,
+                "length": duration,
+                "duration": duration,
+                "videoSrc": video_src,
+                "video_src": video_src,
+                "trim": trim_start,
+                "transitionIn": None,
+                "transitionOut": None,
+                "text": text,
+                "text_start": start,
+                "text_end": end,
+                "source_duration": source_duration,
+            }
+        )
+    return timeline
+
+
+def _validate_ocr_timeline(
+    text_segments: List[Dict[str, Any]],
+    timeline: List[Dict[str, Any]],
+    overlay_timing: List[Dict[str, Any]],
+) -> List[str]:
+    errors: List[str] = []
+    tolerance = 0.05
+    ordered_segments = sorted(text_segments, key=lambda segment: float(segment.get("start", 0.0)))
+    if len(ordered_segments) != len(timeline):
+        errors.append(f"segment_count mismatch: text_segments={len(ordered_segments)} timeline={len(timeline)}")
+    for index, (segment, row) in enumerate(zip(ordered_segments, timeline), start=1):
+        segment_start = float(segment.get("start", 0.0))
+        segment_end = float(segment.get("end", segment_start))
+        row_start = float(row.get("start", 0.0))
+        row_end = float(row.get("end", row_start))
+        if abs(segment_start - row_start) > tolerance:
+            errors.append(f"segment_start mismatch at {index}: segment={segment_start:.3f}, timeline={row_start:.3f}")
+        if abs(segment_end - row_end) > tolerance:
+            errors.append(f"segment_end mismatch at {index}: segment={segment_end:.3f}, timeline={row_end:.3f}")
+    if len(overlay_timing) != len(timeline):
+        errors.append(f"overlay_count mismatch: overlays={len(overlay_timing)} timeline={len(timeline)}")
+    else:
+        for index, (overlay, row) in enumerate(zip(overlay_timing, timeline), start=1):
+            start = float(overlay.get("start", 0.0))
+            end = float(overlay.get("end", 0.0))
+            row_start = float(row.get("start", 0.0))
+            row_end = float(row.get("end", row_start))
+            if abs(start - row_start) > tolerance:
+                errors.append(f"overlay_start mismatch at {index}: overlay={start:.3f}, timeline={row_start:.3f}")
+            if abs(end - row_end) > tolerance:
+                errors.append(f"overlay_end mismatch at {index}: overlay={end:.3f}, timeline={row_end:.3f}")
+        total_timeline = sum(max(0.0, float(row.get("end", 0.0)) - float(row.get("start", 0.0))) for row in timeline)
+        total_ocr = sum(max(0.0, float(segment.get("end", 0.0)) - float(segment.get("start", 0.0))) for segment in ordered_segments)
+        if abs(total_timeline - total_ocr) > tolerance:
+            errors.append(f"total_duration mismatch: timeline={total_timeline:.3f}, ocr={total_ocr:.3f}")
+        timeline_end = max(float(row.get("end", 0.0)) for row in timeline)
+        overlay_end = max((float(row.get("end", 0.0)) for row in overlay_timing), default=0.0)
+        if abs(overlay_end - timeline_end) > tolerance:
+            errors.append(f"final_end mismatch: overlay_end={overlay_end:.3f}, timeline_end={timeline_end:.3f}")
+    return errors
+
+
+def _artifact_path_exists(registry: ArtifactRegistry, key: str) -> bool:
+    artifact = registry.get(key)
+    return bool(artifact and artifact.type == "file" and os.path.exists(artifact.path_or_url))
+
+
+def _validation_override_reason(parameters: Dict[str, Any]) -> str:
+    for key in ("validation_override_reason", "render_gate_override_reason"):
+        value = str((parameters or {}).get(key, "") or "").strip()
+        if value:
+            return value
+    return ""

@@ -20,13 +20,50 @@ from shotstack_sdk.model.output import Output
 from shotstack_sdk.model.edit import Edit
 from shotstack_sdk.model.transition import Transition
 from shotstack_sdk.model.offset import Offset
+from shotstack_sdk.rest import ApiException
 
 MIN_TEXT_DURATION = 1.2
 SAFE_OFFSET_LIMIT = 0.8
 
+SHOTSTACK_STAGE_HOST = "https://api.shotstack.io/stage"
+SHOTSTACK_PRODUCTION_HOST = "https://api.shotstack.io/production"
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _resolve_shotstack_host() -> str:
+    raw = (os.getenv("SHOTSTACK_HOST") or "").strip().lower()
+    if not raw:
+        return SHOTSTACK_STAGE_HOST
+    aliases = {
+        "stage": SHOTSTACK_STAGE_HOST,
+        "sandbox": SHOTSTACK_STAGE_HOST,
+        "staging": SHOTSTACK_STAGE_HOST,
+        "production": SHOTSTACK_PRODUCTION_HOST,
+        "prod": SHOTSTACK_PRODUCTION_HOST,
+    }
+    return aliases.get(raw, os.getenv("SHOTSTACK_HOST", SHOTSTACK_STAGE_HOST).strip())
+
+
+def _format_shotstack_error(exc: Exception, host: str) -> str:
+    base = str(exc)
+    if isinstance(exc, ApiException):
+        body = getattr(exc, "body", "") or ""
+        combined = f"{base}\n{body}".lower()
+        if "sandbox environment" in combined and "0' credits" in combined:
+            return (
+                "Shotstack rejected the render because the current account has 0 credits for the sandbox/stage "
+                f"environment ({host}). Add credits in Shotstack or switch to production with a production key "
+                "and SHOTSTACK_HOST=https://api.shotstack.io/production, then restart the backend."
+            )
+        if "forbidden" in combined:
+            return (
+                f"Shotstack returned 403 Forbidden for host {host}. Verify that the API key matches this "
+                "environment and that the account has available credits/plan access."
+            )
+    return base
 
 
 def _is_video_clip(clip: Dict[str, Any]) -> bool:
@@ -354,6 +391,11 @@ def create_and_render_video(
     canonical_timeline: Optional[List[Dict[str, Any]]] = None,
     force_mobile_safe_text: bool = False,
     mobile_safe_text_mode: bool = False,
+    caption_density_mode: str = "normal",
+    caption_style_preset: str = "default",
+    overlay_density_cap: Optional[int] = None,
+    text_placement_policy: str = "default",
+    text_readability_mode: str = "balanced",
     overlay_full_clip: bool = False,
     mute_source_audio: bool = False,
     disable_auto_transitions: bool = False,
@@ -381,7 +423,7 @@ def create_and_render_video(
     """
 
     # --- 1. Configuration & Constants ---
-    HOST = "https://api.shotstack.io/stage"  # Change to "production" if needed
+    HOST = _resolve_shotstack_host()
 
     def get_video_duration(api_key: str, url: str) -> float:
         """Fetches the duration of a remote video file using OpenCV.
@@ -671,9 +713,10 @@ def create_and_render_video(
         if debug_text_visibility:
             return {"x": 0.0, "y": 0.0}
         safe_for_9x16 = mobile_safe_text_mode or force_mobile_safe_text or output_mode == "crop_to_9x16"
-        if position == "top":
+        effective_position = "top" if text_placement_policy == "top_safe" else position
+        if effective_position == "top":
             y_default = -0.16 if safe_for_9x16 else -0.2
-        elif position == "bottom":
+        elif effective_position == "bottom":
             y_default = 0.16 if safe_for_9x16 else 0.2
         else:
             y_default = -0.0
@@ -694,6 +737,15 @@ def create_and_render_video(
         line_count = wrapped.count("<br/>") + 1
         raw_len = len(re.sub(r"<br/>", "", wrapped))
         font_size = 48 if output_mode == "crop_to_9x16" else 54
+        font_weight = 600
+        stroke = "2px rgba(0,0,0,0.85)"
+        if caption_style_preset == "bold_minimal":
+            font_weight = 700
+        elif caption_style_preset == "minimal":
+            font_weight = 500
+            stroke = "1.5px rgba(0,0,0,0.75)"
+        elif caption_style_preset == "compact":
+            font_size -= 4
         if line_count >= 4:
             font_size -= 6
         if line_count >= 5:
@@ -702,13 +754,15 @@ def create_and_render_video(
             font_size -= 4
         if raw_len >= 110:
             font_size -= 4
+        if text_readability_mode == "conservative":
+            font_size -= 2
         font_size = max(28, font_size)
         line_height = 1.2 if line_count <= 3 else (1.15 if line_count == 4 else 1.1)
         return (
             f"<div style=\"font-family:'Space Grotesk',sans-serif;"
-            f"font-size:{font_size}px;line-height:{line_height};font-weight:600;"
+            f"font-size:{font_size}px;line-height:{line_height};font-weight:{font_weight};"
             f"color:#ffffff;text-align:center;padding:2px 4px;"
-            f"-webkit-text-stroke:2px rgba(0,0,0,0.85);"
+            f"-webkit-text-stroke:{stroke};"
             f"text-shadow: 1px 1px 0 #000, -1px 1px 0 #000, "
             f"1px -1px 0 #000, -1px -1px 0 #000, 0 2px 8px rgba(0,0,0,0.55);"
             f"max-width:100%;box-sizing:border-box;\">{wrapped}</div>"
@@ -778,6 +832,11 @@ def create_and_render_video(
 
     if text_overlays:
         text_overlays.sort(key=lambda o: o.start_time)
+    if caption_density_mode == "sparse" and text_overlays:
+        sparse = [overlay for index, overlay in enumerate(text_overlays) if index % 2 == 0]
+        text_overlays = sparse or text_overlays[:1]
+    if overlay_density_cap is not None:
+        text_overlays = text_overlays[: max(0, int(overlay_density_cap))]
     if overlay_full_clip and text_overlays and not use_canonical_timeline:
         for overlay, vid_spec in zip(text_overlays, video_clip_specs):
             overlay.start_time = vid_spec["start"]
@@ -793,8 +852,8 @@ def create_and_render_video(
                 "css": "div{font-size:54px;letter-spacing:0.5px;font-family:'Space Grotesk',sans-serif;line-height:1.2;}",
                 "width": width,
                 "height": 220,
-                "background": "#00000052",
-                "position": overlay.position,
+                "background": "#00000066" if text_readability_mode == "conservative" else "#00000052",
+                "position": "top" if text_placement_policy == "top_safe" else overlay.position,
             }
             clip = {
                 "asset": html_asset,
@@ -1079,7 +1138,7 @@ def create_and_render_video(
 
             api_instance = edit_api.EditApi(api_client)
             
-            print("Submitting render job to Shotstack...")
+            print(f"Submitting render job to Shotstack ({HOST})...")
             api_response = api_instance.post_render(edit_object)
             
             render_id = api_response['response']['id']
@@ -1146,10 +1205,11 @@ def create_and_render_video(
             return result_data
 
     except Exception as e:
-        print(f"Error during rendering: {str(e)}")
+        friendly_error = _format_shotstack_error(e, HOST)
+        print(f"Error during rendering: {friendly_error}")
         return {
             "success": False,
-            "error": str(e)
+            "error": friendly_error
         }
 
 

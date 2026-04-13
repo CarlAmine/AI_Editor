@@ -12,7 +12,7 @@ opencv-python-headless
 # --- CHATBOT REQUIREMENTS ---
 python-dotenv
 requests
-groq
+openai>=1.0.0
 # --- EDITOR REQUIREMENTS ---
 pillow
 shotstack-sdk

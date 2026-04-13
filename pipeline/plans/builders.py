@@ -3,7 +3,14 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from ai_editor.planning import PlanRewriter, PlanValidator, StyleAwarePlanner
+from ai_editor.rendering import StyleDirectiveAdapter
+
 MIN_SEG_DUR = 0.7
+_STYLE_AWARE_PLANNER = StyleAwarePlanner()
+_PLAN_VALIDATOR = PlanValidator()
+_PLAN_REWRITER = PlanRewriter()
+_STYLE_DIRECTIVE_ADAPTER = StyleDirectiveAdapter()
 
 
 def _normalize_detected_text(value: Any) -> str:
@@ -436,13 +443,79 @@ def build_timeline_plan(
     analysis_scenes: List[Dict[str, Any]],
     source_durations: List[float],
     requirements: Dict[str, Any],
+    analysis: Optional[Dict[str, Any]] = None,
+    include_validation: bool = True,
+    include_rewrite: bool = True,
 ) -> Dict[str, Any]:
+    if analysis:
+        planned = _STYLE_AWARE_PLANNER.build_plan(analysis, source_durations, requirements)
+        if include_validation:
+            validation = _PLAN_VALIDATOR.validate(planned, analysis=analysis, requirements=requirements)
+            candidate = (
+                _PLAN_REWRITER.apply(planned, validation, analysis=analysis, requirements=requirements)
+                if include_rewrite
+                else planned
+            )
+            final_validation = _PLAN_VALIDATOR.validate(candidate, analysis=analysis, requirements=requirements)
+            planned_debug = dict(candidate.get("planning_debug") or {})
+            planned_debug["validation_ran"] = True
+            planned_debug["validator_strategy"] = final_validation.get("validator_strategy")
+            planned_debug["rewrite_applied"] = bool(planned_debug.get("rewrite_actions_applied"))
+            candidate["planning_debug"] = planned_debug
+            candidate["plan_validation"] = dict(final_validation)
+            candidate["plan_validation"]["pre_rewrite"] = validation
+            if candidate.get("scene_durations"):
+                return candidate
+        else:
+            planned_debug = dict(planned.get("planning_debug") or {})
+            planned_debug["validation_ran"] = False
+            planned_debug["validator_strategy"] = None
+            planned_debug["rewrite_applied"] = False
+            planned_debug.setdefault("rewrite_actions_applied", [])
+            planned["planning_debug"] = planned_debug
+            planned["plan_validation"] = {}
+            if planned.get("scene_durations"):
+                return planned
     scene_durations = [float(s.get("duration", 0.0)) for s in analysis_scenes if float(s.get("duration", 0.0)) > 0]
     return {
         "scene_durations": scene_durations,
         "source_durations": source_durations,
         "intent_mode": requirements.get("intent_mode", "video"),
         "edit_mode": requirements.get("edit_mode", "scene"),
+        "planning_strategy": "legacy_scene_duration_fallback",
+        "target_pacing": "medium",
+        "target_segment_duration": None,
+        "opening_segment_ids": [],
+        "support_segment_ids": [],
+        "selected_segments": [],
+        "support_segments": [],
+        "rejected_segments": [],
+        "style_profile_snapshot": {},
+        "plan_validation": {
+            "validation_score": 1.0,
+            "checks": {},
+            "warnings": [],
+            "recommendations": [],
+            "rewrite_actions": [],
+            "validator_strategy": "legacy_plan_fallback",
+        },
+        "planning_debug": {
+            "strategy_label": "legacy_scene_duration_fallback",
+            "selected_segment_ids": [],
+            "support_segment_ids": [],
+            "rejected_low_score_ids": [],
+            "target_pacing_signals": {
+                "target_pacing": "medium",
+                "target_segment_duration": None,
+                "target_segment_count": 0,
+                "density_profile": "unknown",
+            },
+            "candidate_rankings": {"narrative": [], "support": []},
+            "validation_ran": False,
+            "validator_strategy": "legacy_plan_fallback",
+            "rewrite_applied": False,
+            "rewrite_actions_applied": [],
+        },
     }
 
 
@@ -495,10 +568,29 @@ def build_render_spec(
     generation_mode = str(requirements.get("generation_mode", "free_generation_mode")).lower()
     if generation_mode not in {"free_generation_mode", "reference_mimic_mode"}:
         generation_mode = "free_generation_mode"
+    style_directive_result = _STYLE_DIRECTIVE_ADAPTER.adapt(
+        timeline_plan=timeline_plan,
+        overlay_plan=overlay_plan,
+        requirements=requirements,
+    )
+    render_settings = dict(style_directive_result.get("render_settings") or {})
     return {
         "resolution": resolution,
         "intent_mode": intent,
-        "overlay_plan": overlay_plan.get("overlays", []),
+        "timeline_plan": timeline_plan,
+        "planning_strategy": timeline_plan.get("planning_strategy", "legacy_scene_duration_fallback"),
+        "target_pacing": timeline_plan.get("target_pacing", "medium"),
+        "target_segment_duration": timeline_plan.get("target_segment_duration"),
+        "selected_segments": timeline_plan.get("selected_segments", []),
+        "support_segments": timeline_plan.get("support_segments", []),
+        "opening_segment_ids": timeline_plan.get("opening_segment_ids", []),
+        "rejected_segments": timeline_plan.get("rejected_segments", []),
+        "plan_validation": timeline_plan.get("plan_validation", {}),
+        "planning_debug": timeline_plan.get("planning_debug", {}),
+        "edit_directives": timeline_plan.get("edit_directives", []),
+        "style_directives_applied": style_directive_result.get("applied_directives", []),
+        "deferred_style_directives": style_directive_result.get("deferred_directives", []),
+        "overlay_plan": style_directive_result.get("overlay_plan", overlay_plan.get("overlays", [])),
         "overlay_script": overlay_plan.get("overlay_script"),
         "timing_mode": overlay_plan.get("timing_mode", "ocr_keyframe"),
         "edit_mode": edit_mode,
@@ -509,6 +601,11 @@ def build_render_spec(
         "mute_source_audio": bool(audio_plan.get("mute_source_audio", False)),
         "force_mobile_safe_text": intent == "shorts",
         "mobile_safe_text_mode": bool(requirements.get("mobile_safe_text_mode", intent == "shorts")),
+        "caption_density_mode": render_settings.get("caption_density_mode", "normal"),
+        "caption_style_preset": render_settings.get("caption_style_preset", "default"),
+        "overlay_density_cap": render_settings.get("overlay_density_cap"),
+        "text_placement_policy": render_settings.get("text_placement_policy", "default"),
+        "text_readability_mode": render_settings.get("text_readability_mode", "balanced"),
         "output_mode": output_mode,
         "refit_mode": "native_9x16" if output_mode == "native_9x16" else "crop_center",
         "overlay_full_clip": overlay_full_clip,

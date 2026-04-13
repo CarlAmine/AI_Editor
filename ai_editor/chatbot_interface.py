@@ -1,13 +1,8 @@
 import json
-import os
 import re
 from typing import Dict, List
 
-from groq import Groq
-
-GROQ_API_KEY = os.getenv("GROQ")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-MODEL_NAME = "llama-3.3-70b-versatile"
+from ai_editor.ai_client import chat_json, chat_text, get_active_model_name
 
 REQUIRED_FIELDS = [
     "video_topic",
@@ -122,6 +117,23 @@ def _extract_edit_mode(text: str) -> str:
     return ""
 
 
+def _summarize_pipeline_feedback(state: Dict) -> str:
+    feedback = state.get("pipeline_feedback")
+    if not isinstance(feedback, dict):
+        return ""
+    reason = str(feedback.get("reason", "")).strip()
+    error = str(feedback.get("error", "")).strip()
+    stage = str(feedback.get("stage", "")).strip()
+    if not reason and not error:
+        return ""
+    summary = f"stage={stage or 'UNKNOWN'}"
+    if reason:
+        summary += f", reason={reason}"
+    if error:
+        summary += f", error={error}"
+    return summary
+
+
 def process_ui_turn(
     user_input: str,
     current_state: Dict,
@@ -136,37 +148,31 @@ def process_ui_turn(
         if req not in state["edit_requests"]:
             state["edit_requests"].append(req)
 
-    extracted_data = {}
-    if client:
-        extraction_prompt = (
-            "Extract and normalize video preferences from the user message.\n"
-            "Use defaults if unclear; do not block on missing info.\n"
-            "Return a JSON object with keys:\n"
-            f"{REQUIRED_FIELDS}\n"
-            "Allowed intent_mode: video|shorts. Allowed refit_mode: crop|pad.\n"
-            "Allowed generation_mode: reference_mimic_mode|free_generation_mode.\n"
-            "Allowed edit_mode: scene|ocr.\n"
-            "If a value is unknown, return null.\n\n"
-            f"Current state: {json.dumps(state, ensure_ascii=False)}\n"
-            f"Analyzer context: {analyzer_output}\n"
-            f"User message: {user_input}\n"
-        )
-        try:
-            completion = client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You extract user preferences for a video editing assistant. Output JSON only.",
-                    },
-                    {"role": "user", "content": extraction_prompt},
-                ],
-                model=MODEL_NAME,
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            extracted_data = json.loads(completion.choices[0].message.content)
-        except Exception as e:
-            print(f"Groq Extraction Error: {e}")
+    extraction_prompt = (
+        "Extract and normalize video preferences from the user message.\n"
+        "Use defaults if unclear; do not block on missing info.\n"
+        "Return a JSON object with keys:\n"
+        f"{REQUIRED_FIELDS}\n"
+        "Allowed intent_mode: video|shorts. Allowed refit_mode: crop|pad.\n"
+        "Allowed generation_mode: reference_mimic_mode|free_generation_mode.\n"
+        "Allowed edit_mode: scene|ocr.\n"
+        "If a value is unknown, return null.\n\n"
+        f"Current state: {json.dumps(state, ensure_ascii=False)}\n"
+        f"Analyzer context: {analyzer_output}\n"
+        f"User message: {user_input}\n"
+    )
+    extracted_data = chat_json(
+        messages=[
+            {
+                "role": "system",
+                "content": "You extract user preferences for a video editing assistant. Output JSON only.",
+            },
+            {"role": "user", "content": extraction_prompt},
+        ],
+        temperature=0.2,
+    )
+    if extracted_data is None:
+        extracted_data = {}
 
     for key in REQUIRED_FIELDS:
         val = extracted_data.get(key)
@@ -193,17 +199,53 @@ def process_ui_turn(
     if str(state.get("edit_mode", "")).lower() not in {"scene", "ocr"}:
         state["edit_mode"] = "scene"
 
-    next_message = (
-        "Got it. I registered your request and updated the editing plan. "
-        "You can keep adding changes like remove/cut/trim/add, and I will keep tracking them."
+    latest_request = state["edit_requests"][-1] if state["edit_requests"] else ""
+    pipeline_feedback_summary = _summarize_pipeline_feedback(state)
+    state_summary = (
+        f"platform={state.get('platform')}, "
+        f"tone={state.get('tone')}, "
+        f"pacing={state.get('pacing')}, "
+        f"edit_mode={state.get('edit_mode')}, "
+        f"generation_mode={state.get('generation_mode')}"
     )
-    if state["edit_requests"]:
-        latest = state["edit_requests"][-1]
-        next_message += f" Latest edit request: {latest}."
+    if latest_request:
+        state_summary += f", latest_edit_request={latest_request}"
+    if pipeline_feedback_summary:
+        state_summary += f", latest_pipeline_feedback={pipeline_feedback_summary}"
+
+    next_message = chat_text(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful video editing assistant. "
+                    "Respond naturally to the user in 1-2 short sentences. "
+                    "Confirm what you understood, and if any edit_requests were captured, "
+                    "mention the latest one. Be concise and friendly."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User input: {user_input}\n"
+                    f"State summary: {state_summary}"
+                ),
+            },
+        ]
+    )
+    if not next_message:
+        next_message = (
+            "Got it. I registered your request and updated the editing plan. "
+            "You can keep adding changes like remove/cut/trim/add, and I will keep tracking them."
+        )
+        if state["edit_requests"]:
+            latest = state["edit_requests"][-1]
+            next_message += f" Latest edit request: {latest}."
 
     return {
         "updated_state": state,
         "next_message": next_message,
         "is_complete": False,
         "final_report": None,
+        "model_used": get_active_model_name(),
     }

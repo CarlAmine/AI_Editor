@@ -22,6 +22,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -30,6 +31,7 @@ venv/
 .venv/
 dist/
 build/
+static/
 *.egg-info/
 .eggs/
 
@@ -47,7 +49,9 @@ logs/
 # Frontend generated files
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
 frontend/.env
+*.tsbuildinfo
 
 # IDE / OS
 .vscode/

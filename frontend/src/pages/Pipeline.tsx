@@ -1,5 +1,5 @@
 /* ============================================================
-   Pipeline Page — Functional Pipeline UI
+   Pipeline Page - Functional Pipeline UI
    Uses VideoPipelinePanel + ChatPanel
    ============================================================ */
 
@@ -8,9 +8,39 @@ import { VideoPipelinePanel } from "../components/VideoPipelinePanel";
 import { ChatPanel } from "../components/ChatPanel";
 import "./Pipeline.css";
 
+type AssistantFeedback = {
+  route_to_chat?: boolean;
+  message?: string;
+  state_patch?: Record<string, unknown>;
+};
+
+type AssistantEvent = {
+  id: number;
+  message: string;
+  statePatch?: Record<string, unknown>;
+};
+
 export default function Pipeline() {
   const [briefState, setBriefState] = useState<Record<string, unknown>>({});
-  const apiBase = import.meta.env.VITE_API_BASE_URL || "http://localhost:10000";
+  const [assistantEvent, setAssistantEvent] = useState<AssistantEvent | null>(null);
+  const apiBase = (import.meta.env.VITE_API_BASE_URL || window.location.origin).replace(/\/$/, "");
+
+  const handleAssistantFeedback = (feedback: AssistantFeedback) => {
+    const statePatch = feedback.state_patch || {};
+    if (Object.keys(statePatch).length > 0) {
+      setBriefState((prev) => ({
+        ...prev,
+        ...statePatch,
+      }));
+    }
+    if (feedback.route_to_chat && feedback.message) {
+      setAssistantEvent({
+        id: Date.now(),
+        message: feedback.message,
+        statePatch,
+      });
+    }
+  };
 
   return (
     <div className="min-h-screen pt-24 pipeline-page">
@@ -50,12 +80,21 @@ export default function Pipeline() {
       <section className="pb-16">
         <div className="container mx-auto px-6 max-w-7xl">
           <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] gap-6">
-            <VideoPipelinePanel apiBase={apiBase} currentState={briefState} />
-            <ChatPanel apiBase={apiBase} analyzerOutput="" onStateUpdate={setBriefState} />
+            <VideoPipelinePanel
+              apiBase={apiBase}
+              currentState={briefState}
+              onAssistantFeedback={handleAssistantFeedback}
+            />
+            <ChatPanel
+              apiBase={apiBase}
+              analyzerOutput=""
+              currentState={briefState}
+              onStateUpdate={setBriefState}
+              assistantEvent={assistantEvent}
+            />
           </div>
         </div>
       </section>
     </div>
   );
 }
-

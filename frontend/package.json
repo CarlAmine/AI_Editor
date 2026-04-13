@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --host",
     "build": "vite build",
-    "start": "NODE_ENV=production node dist/index.js",
+    "start": "vite preview --host 0.0.0.0 --port 4173",
     "preview": "vite preview --host",
+    "test": "vitest run --config vitest.config.ts",
     "check": "tsc --noEmit",
     "format": "prettier --write ."
   },

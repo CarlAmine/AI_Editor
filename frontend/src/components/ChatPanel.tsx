@@ -1,9 +1,17 @@
-import React, { useState, FormEvent } from "react";
+import React, { useEffect, useRef, useState, FormEvent } from "react";
 
 type Props = {
   apiBase: string;
   analyzerOutput: string;
+  currentState?: Record<string, unknown>;
   onStateUpdate?: (state: Record<string, unknown>) => void;
+  assistantEvent?: AssistantEvent | null;
+};
+
+type AssistantEvent = {
+  id: number;
+  message: string;
+  statePatch?: Record<string, unknown>;
 };
 
 type ChatTurnRequest = {
@@ -25,13 +33,24 @@ type Message = {
   text: string;
 };
 
-export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpdate }) => {
+export const ChatPanel: React.FC<Props> = ({
+  apiBase,
+  analyzerOutput,
+  currentState: externalState = {},
+  onStateUpdate,
+  assistantEvent = null,
+}) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [currentState, setCurrentState] = useState<Record<string, unknown>>({});
+  const [currentState, setCurrentState] = useState<Record<string, unknown>>(externalState);
   const [isLoading, setIsLoading] = useState(false);
   const [finalReport, setFinalReport] = useState<string | null>(null);
   const [showState, setShowState] = useState(false);
+  const lastAssistantEventId = useRef<number | null>(null);
+
+  useEffect(() => {
+    setCurrentState(externalState || {});
+  }, [externalState]);
 
   const updateState = (newState: Record<string, unknown>) => {
     setCurrentState(newState);
@@ -46,6 +65,24 @@ export const ChatPanel: React.FC<Props> = ({ apiBase, analyzerOutput, onStateUpd
       { id: Date.now() + Math.random(), from, text },
     ]);
   };
+
+  useEffect(() => {
+    if (!assistantEvent || !assistantEvent.message) {
+      return;
+    }
+    if (lastAssistantEventId.current === assistantEvent.id) {
+      return;
+    }
+    lastAssistantEventId.current = assistantEvent.id;
+    if (assistantEvent.statePatch && Object.keys(assistantEvent.statePatch).length > 0) {
+      updateState({
+        ...currentState,
+        ...assistantEvent.statePatch,
+      });
+    }
+    appendMessage("assistant", assistantEvent.message);
+  }, [assistantEvent, currentState]);
+
   const handleClearChat = () => {
     setMessages([]);
     setInput("");
