@@ -1,4 +1,11 @@
-import React, { useEffect, useRef, useState, FormEvent } from "react";
+import React, {
+  useState,
+  FormEvent,
+  useEffect,
+  useRef,
+  KeyboardEvent,
+} from "react";
+import { Send } from "lucide-react";
 
 type Props = {
   apiBase: string;
@@ -33,6 +40,69 @@ type Message = {
   text: string;
 };
 
+function SyntaxHighlightedJSON({ value }: { value: Record<string, unknown> }) {
+  const lines = JSON.stringify(value, null, 2).split("\n");
+  return (
+    <pre className="state-preview">
+      {lines.map((line, i) => {
+        const keyMatch = line.match(/^(\s*)("[\w\s]+")\s*:/);
+        const strValMatch = line.match(/:\s*(".*")(,?)$/);
+        const numValMatch = line.match(/:\s*(-?\d+\.?\d*)(,?)$/);
+        const boolValMatch = line.match(/:\s*(true|false|null)(,?)$/);
+
+        if (keyMatch) {
+          const indent = keyMatch[1];
+          const key = keyMatch[2];
+          const rest = line.slice(keyMatch[0].length);
+          let valueNode: React.ReactNode = rest;
+
+          if (strValMatch) {
+            valueNode = (
+              <>
+                {": "}
+                <span className="json-string">{strValMatch[1]}</span>
+                {strValMatch[2]}
+              </>
+            );
+          } else if (numValMatch) {
+            valueNode = (
+              <>
+                {": "}
+                <span className="json-number">{numValMatch[1]}</span>
+                {numValMatch[2]}
+              </>
+            );
+          } else if (boolValMatch) {
+            valueNode = (
+              <>
+                {": "}
+                <span className="json-boolean">{boolValMatch[1]}</span>
+                {boolValMatch[2]}
+              </>
+            );
+          }
+
+          return (
+            <span key={i}>
+              {indent}
+              <span className="json-key">{key}</span>
+              {valueNode}
+              {"\n"}
+            </span>
+          );
+        }
+
+        return (
+          <span key={i}>
+            {line}
+            {"\n"}
+          </span>
+        );
+      })}
+    </pre>
+  );
+}
+
 export const ChatPanel: React.FC<Props> = ({
   apiBase,
   analyzerOutput,
@@ -42,21 +112,38 @@ export const ChatPanel: React.FC<Props> = ({
 }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [currentState, setCurrentState] = useState<Record<string, unknown>>(externalState);
+  const [currentState, setCurrentState] =
+    useState<Record<string, unknown>>(externalState);
   const [isLoading, setIsLoading] = useState(false);
   const [finalReport, setFinalReport] = useState<string | null>(null);
   const [showState, setShowState] = useState(false);
   const lastAssistantEventId = useRef<number | null>(null);
+  const chatWindowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setCurrentState(externalState || {});
   }, [externalState]);
 
+  useEffect(() => {
+    if (chatWindowRef.current) {
+      chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
+    }
+  }, [messages, isLoading]);
+
   const updateState = (newState: Record<string, unknown>) => {
     setCurrentState(newState);
-    if (onStateUpdate) {
-      onStateUpdate(newState);
-    }
+    onStateUpdate?.(newState);
+  };
+
+  const applyStatePatch = (patch: Record<string, unknown>) => {
+    setCurrentState((prev) => {
+      const merged = {
+        ...prev,
+        ...patch,
+      };
+      onStateUpdate?.(merged);
+      return merged;
+    });
   };
 
   const appendMessage = (from: "user" | "assistant", text: string) => {
@@ -74,14 +161,14 @@ export const ChatPanel: React.FC<Props> = ({
       return;
     }
     lastAssistantEventId.current = assistantEvent.id;
-    if (assistantEvent.statePatch && Object.keys(assistantEvent.statePatch).length > 0) {
-      updateState({
-        ...currentState,
-        ...assistantEvent.statePatch,
-      });
+    if (
+      assistantEvent.statePatch &&
+      Object.keys(assistantEvent.statePatch).length > 0
+    ) {
+      applyStatePatch(assistantEvent.statePatch);
     }
     appendMessage("assistant", assistantEvent.message);
-  }, [assistantEvent, currentState]);
+  }, [assistantEvent]);
 
   const handleClearChat = () => {
     setMessages([]);
@@ -126,27 +213,37 @@ export const ChatPanel: React.FC<Props> = ({
       if (data.is_complete && data.final_report) {
         setFinalReport(data.final_report);
       }
-    } catch (err: any) {
-      appendMessage(
-        "assistant",
-        err?.message || "Something went wrong while contacting the chat endpoint."
-      );
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Something went wrong while contacting the chat endpoint.";
+      appendMessage("assistant", message);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!isLoading && input.trim()) {
+        handleSubmit(e as unknown as FormEvent);
+      }
     }
   };
 
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2 className="panel-title">2. Brief the Assistant</h2>
+        <h2 className="panel-title">Brief the Assistant</h2>
         <p className="panel-caption">
           Refine the creative brief through a short conversation. The assistant
           tracks requirements and produces a final written brief.
         </p>
       </header>
 
-      <div className="chat-window">
+      <div className="chat-window" ref={chatWindowRef}>
         {messages.length === 0 && (
           <div className="chat-empty">
             <p>
@@ -169,7 +266,9 @@ export const ChatPanel: React.FC<Props> = ({
           <div
             key={m.id}
             className={
-              m.from === "user" ? "chat-bubble chat-bubble-user" : "chat-bubble"
+              m.from === "user"
+                ? "chat-bubble chat-bubble-user"
+                : "chat-bubble chat-bubble-assistant"
             }
           >
             <span className="chat-author">
@@ -179,22 +278,32 @@ export const ChatPanel: React.FC<Props> = ({
           </div>
         ))}
         {isLoading && (
-          <div className="chat-bubble">
+          <div className="chat-bubble chat-bubble-assistant">
             <span className="chat-author">Assistant</span>
-            <p className="chat-text">Thinking...</p>
+            <div className="typing-indicator">
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+            </div>
           </div>
         )}
       </div>
 
       <form className="chat-input-row" onSubmit={handleSubmit}>
-        <input
+        <textarea
           className="field-input chat-input"
-          placeholder="Type your next message..."
+          placeholder="Type your next message... (Enter to send, Shift+Enter for new line)"
           value={input}
           onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          rows={1}
         />
-        <button className="btn btn-primary chat-send" disabled={isLoading}>
-          Send
+        <button
+          className="btn btn-primary chat-send"
+          disabled={isLoading}
+          type="submit"
+        >
+          <Send size={16} />
         </button>
       </form>
 
@@ -209,16 +318,12 @@ export const ChatPanel: React.FC<Props> = ({
         </button>
         <button
           type="button"
-          className="btn btn-ghost"
+          className="btn btn-pill"
           onClick={() => setShowState((v) => !v)}
         >
-          {showState ? "Hide Collected Fields" : "Show Collected Fields"}
+          {showState ? "Hide Fields" : "Show Collected Fields"}
         </button>
-        {showState && (
-          <pre className="state-preview">
-            {JSON.stringify(currentState, null, 2)}
-          </pre>
-        )}
+        {showState && <SyntaxHighlightedJSON value={currentState} />}
       </div>
 
       {finalReport && (
@@ -230,4 +335,3 @@ export const ChatPanel: React.FC<Props> = ({
     </section>
   );
 };
-
