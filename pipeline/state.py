@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -125,6 +126,8 @@ class JobState:
     render_summary: Dict[str, Any] = field(default_factory=dict)
     revision_attempts: int = 0
     render_attempts: int = 0
+    stalled_revision_count: int = 0
+    last_revision_fingerprint: str = ""
     latest_user_feedback: str = ""
     applied_edit_requests: List[str] = field(default_factory=list)
     decision_trace: List[DecisionTraceEntry] = field(default_factory=list)
@@ -270,6 +273,63 @@ def summarize_plan_patch(plan: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_plan_change_fingerprint(plan: Dict[str, Any]) -> str:
+    if not plan:
+        return ""
+
+    def _segment_signature(segment: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "label": segment.get("label"),
+            "scene_id": segment.get("scene_id"),
+            "start": _round_optional(segment.get("start")),
+            "end": _round_optional(segment.get("end")),
+            "text": str(segment.get("text", "") or "").strip(),
+            "video_src": str(
+                segment.get("video_src")
+                or segment.get("videoSrc")
+                or ""
+            ).strip(),
+            "trim": _round_optional(segment.get("trim")),
+        }
+
+    overlay_entries = plan.get("overlay_plan") or []
+    if isinstance(overlay_entries, dict):
+        overlay_entries = overlay_entries.get("overlays") or []
+
+    fingerprint_payload = {
+        "plan_summary": summarize_plan(plan),
+        "plan_patch_summary": summarize_plan_patch(plan),
+        "selected_segments": [
+            _segment_signature(segment)
+            for segment in list(plan.get("selected_segments") or [])
+        ],
+        "support_segments": [
+            _segment_signature(segment)
+            for segment in list(plan.get("support_segments") or [])
+        ],
+        "edit_directives": list(plan.get("edit_directives") or []),
+        "overlay_plan": [
+            {
+                "timestamp": _round_optional(item.get("timestamp")),
+                "duration": _round_optional(item.get("duration")),
+                "text": str(item.get("text", "") or "").strip(),
+                "position": item.get("position"),
+            }
+            for item in list(overlay_entries or [])
+        ],
+        "rewrite_actions_applied": list(
+            ((plan.get("planning_debug") or {}).get("rewrite_actions_applied") or [])
+        ),
+    }
+    payload_text = json.dumps(
+        fingerprint_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(payload_text.encode("utf-8")).hexdigest()
+
+
 def pending_edit_requests(state: JobState) -> List[str]:
     applied = set(state.applied_edit_requests or [])
     return [item for item in extract_edit_requests(state.requirements) if item not in applied]
@@ -299,6 +359,7 @@ def build_decision_state_snapshot(state: JobState) -> Dict[str, Any]:
         "plan_needs_validation": state.plan_needs_validation,
         "revision_attempts": state.revision_attempts,
         "render_attempts": state.render_attempts,
+        "stalled_revision_count": state.stalled_revision_count,
         "latest_user_feedback": state.latest_user_feedback,
         "latest_edit_request": edit_requests[-1] if edit_requests else "",
         "pending_edit_request_count": len(pending_requests),
@@ -613,6 +674,8 @@ def _to_state(data: Dict[str, Any]) -> JobState:
         render_summary=data.get("render_summary") or {},
         revision_attempts=int(data.get("revision_attempts", 0) or 0),
         render_attempts=int(data.get("render_attempts", 0) or 0),
+        stalled_revision_count=int(data.get("stalled_revision_count", 0) or 0),
+        last_revision_fingerprint=str(data.get("last_revision_fingerprint", "") or ""),
         latest_user_feedback=data.get("latest_user_feedback", ""),
         applied_edit_requests=data.get("applied_edit_requests") or [],
         decision_trace=decision_trace,

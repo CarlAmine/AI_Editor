@@ -5,7 +5,8 @@ import React, {
   useRef,
   KeyboardEvent,
 } from "react";
-import { Send } from "lucide-react";
+import { AnimatePresence, motion } from "framer-motion";
+import { RotateCcw, Send, Sparkles } from "lucide-react";
 
 type Props = {
   apiBase: string;
@@ -38,6 +39,7 @@ type Message = {
   id: number;
   from: "user" | "assistant";
   text: string;
+  timestamp: Date;
 };
 
 function SyntaxHighlightedJSON({ value }: { value: Record<string, unknown> }) {
@@ -149,7 +151,7 @@ export const ChatPanel: React.FC<Props> = ({
   const appendMessage = (from: "user" | "assistant", text: string) => {
     setMessages((prev) => [
       ...prev,
-      { id: Date.now() + Math.random(), from, text },
+      { id: Date.now() + Math.random(), from, text, timestamp: new Date() },
     ]);
   };
 
@@ -236,57 +238,105 @@ export const ChatPanel: React.FC<Props> = ({
   return (
     <section className="panel">
       <header className="panel-header">
-        <h2 className="panel-title">Brief the Assistant</h2>
+        <div className="flex items-center gap-2">
+          <Sparkles size={18} className="text-amber-400" />
+          <h2 className="panel-title">Brief the Assistant</h2>
+        </div>
         <p className="panel-caption">
-          Refine the creative brief through a short conversation. The assistant
-          tracks requirements and produces a final written brief.
+          Refine the creative brief through conversation. The assistant tracks
+          requirements and produces a final written brief.
         </p>
       </header>
 
       <div className="chat-window" ref={chatWindowRef}>
-        {messages.length === 0 && (
-          <div className="chat-empty">
-            <p>
-              Start by telling the assistant what kind of video you&apos;re
-              creating, for example:
-            </p>
-            <ul>
-              <li>
-                &ldquo;I need a 60s TikTok ad for a fitness app aimed at busy
-                professionals.&rdquo;
-              </li>
-              <li>
-                &ldquo;Make a YouTube explainer for beginners about my AI
-                editor.&rdquo;
-              </li>
-            </ul>
-          </div>
-        )}
-        {messages.map((m) => (
-          <div
-            key={m.id}
-            className={
-              m.from === "user"
-                ? "chat-bubble chat-bubble-user"
-                : "chat-bubble chat-bubble-assistant"
-            }
-          >
-            <span className="chat-author">
-              {m.from === "user" ? "You" : "Assistant"}
-            </span>
-            <p className="chat-text">{m.text}</p>
-          </div>
-        ))}
-        {isLoading && (
-          <div className="chat-bubble chat-bubble-assistant">
-            <span className="chat-author">Assistant</span>
-            <div className="typing-indicator">
-              <span className="typing-dot" />
-              <span className="typing-dot" />
-              <span className="typing-dot" />
-            </div>
-          </div>
-        )}
+        <AnimatePresence>
+          {messages.length === 0 && (
+            <motion.div
+              className="chat-empty"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <div className="flex items-center justify-center mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-500/10 border border-blue-500/30 flex items-center justify-center">
+                  <Sparkles size={20} className="text-blue-400" />
+                </div>
+              </div>
+              <p className="text-center mb-4">
+                Start by telling the assistant what kind of video you&apos;re
+                creating, for example:
+              </p>
+              <ul className="space-y-2">
+                <li className="text-sm text-gray-400">
+                  &ldquo;I need a 60s TikTok ad for a fitness app aimed at busy
+                  professionals.&rdquo;
+                </li>
+                <li className="text-sm text-gray-400">
+                  &ldquo;Make a YouTube explainer for beginners about my AI
+                  editor.&rdquo;
+                </li>
+              </ul>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence mode="popLayout">
+          {messages.map((message, idx) => (
+            <motion.div
+              key={message.id}
+              className={
+                message.from === "user"
+                  ? "chat-bubble chat-bubble-user"
+                  : "chat-bubble chat-bubble-assistant"
+              }
+              initial={{ opacity: 0, y: 10, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -10, scale: 0.96 }}
+              transition={{ duration: 0.25, delay: idx * 0.04 }}
+            >
+              <span className="chat-author">
+                {message.from === "user" ? "You" : "Assistant"}
+              </span>
+              <p className="chat-text">{message.text}</p>
+              <span className="text-xs text-gray-600 mt-1">
+                {message.timestamp.toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </span>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {isLoading && (
+            <motion.div
+              className="chat-bubble chat-bubble-assistant"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <span className="chat-author">Assistant</span>
+              <div className="typing-indicator">
+                <motion.span
+                  className="typing-dot"
+                  animate={{ y: [0, -8, 0] }}
+                  transition={{ duration: 0.6, repeat: Infinity, delay: 0 }}
+                />
+                <motion.span
+                  className="typing-dot"
+                  animate={{ y: [0, -8, 0] }}
+                  transition={{ duration: 0.6, repeat: Infinity, delay: 0.2 }}
+                />
+                <motion.span
+                  className="typing-dot"
+                  animate={{ y: [0, -8, 0] }}
+                  transition={{ duration: 0.6, repeat: Infinity, delay: 0.4 }}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       <form className="chat-input-row" onSubmit={handleSubmit}>
@@ -298,40 +348,68 @@ export const ChatPanel: React.FC<Props> = ({
           onKeyDown={handleKeyDown}
           rows={1}
         />
-        <button
+        <motion.button
           className="btn btn-primary chat-send"
           disabled={isLoading}
           type="submit"
+          whileHover={{ scale: 1.04 }}
+          whileTap={{ scale: 0.96 }}
         >
           <Send size={16} />
-        </button>
+        </motion.button>
       </form>
 
       <div className="chat-meta">
-        <button
+        <motion.button
           type="button"
           className="btn btn-ghost"
           onClick={handleClearChat}
           disabled={isLoading}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
         >
+          <RotateCcw size={14} />
           Clear Chat
-        </button>
-        <button
+        </motion.button>
+        <motion.button
           type="button"
           className="btn btn-pill"
           onClick={() => setShowState((v) => !v)}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
         >
           {showState ? "Hide Fields" : "Show Collected Fields"}
-        </button>
-        {showState && <SyntaxHighlightedJSON value={currentState} />}
+        </motion.button>
+        <AnimatePresence>
+          {showState && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.25 }}
+            >
+              <SyntaxHighlightedJSON value={currentState} />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
-      {finalReport && (
-        <div className="final-report">
-          <h3>Final Video Brief</h3>
-          <div className="final-report-body">{finalReport}</div>
-        </div>
-      )}
+      <AnimatePresence>
+        {finalReport && (
+          <motion.div
+            className="final-report"
+            initial={{ opacity: 0, y: 18 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -18 }}
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <Sparkles size={16} className="text-amber-400" />
+              <h3 className="text-sm font-semibold">Final Video Brief</h3>
+            </div>
+            <div className="final-report-body">{finalReport}</div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </section>
   );
 };

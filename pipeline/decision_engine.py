@@ -68,7 +68,7 @@ class PipelineDecisionEngine:
         ] = None,
         preferred_provider: Optional[str] = None,
         minimum_validation_score: float = 0.74,
-        max_revision_attempts: int = 3,
+        max_revision_attempts: int = 5,
     ) -> None:
         self._json_client = json_client or self._default_json_client
         self._uses_model_provider = json_client is None

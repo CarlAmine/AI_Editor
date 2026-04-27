@@ -19,6 +19,8 @@ from .state import (
     StageName,
     StageStatus,
     add_error,
+    add_warning,
+    build_plan_change_fingerprint,
     build_controller_status_payload,
     clear_requested_user_input,
     is_terminal,
@@ -43,7 +45,8 @@ class RunnerGuardrails:
     destructive_action_confidence: float = 0.82
     preview_action_confidence: float = 0.55
     controller_action_confidence: float = 0.45
-    max_revision_attempts: int = 3
+    max_revision_attempts: int = 5
+    max_stalled_revision_attempts: int = 2
     max_render_attempts: int = 2
     max_invalid_decisions: int = 1
     max_low_confidence_decisions: int = 3
@@ -142,6 +145,45 @@ def _save(ctx: ExecutionContext) -> None:
         "application/json",
     )
     ctx.artifacts.save(ctx.dirs["job"])
+
+
+def _track_revision_progress(
+    state: JobState,
+    *,
+    previous_fingerprint: str,
+    guardrails: RunnerGuardrails,
+) -> None:
+    current_fingerprint = build_plan_change_fingerprint(state.current_plan)
+    state.last_revision_fingerprint = current_fingerprint
+
+    if not current_fingerprint or current_fingerprint != previous_fingerprint:
+        state.stalled_revision_count = 0
+        return
+
+    state.stalled_revision_count += 1
+    add_warning(
+        state,
+        "STALLED_REVISION_LOOP",
+        "Plan revision did not make a meaningful structural change.",
+        {
+            "stalled_revision_count": state.stalled_revision_count,
+            "max_stalled_revision_attempts": guardrails.max_stalled_revision_attempts,
+            "revision_attempts": state.revision_attempts,
+        },
+    )
+    if state.stalled_revision_count < guardrails.max_stalled_revision_attempts:
+        return
+
+    set_requested_user_input(
+        state,
+        {
+            "reason": "stalled_revision_loop",
+            "question": (
+                "I revised the plan multiple times without a meaningful change. "
+                "Please clarify the single highest-priority edit or provide stronger source guidance."
+            ),
+        },
+    )
 
 
 def _request_user_input_decision(reason: str, question: str) -> PipelineDecision:
@@ -485,6 +527,9 @@ def _sync_state_with_request(state: JobState, request_payload: Dict[str, Any], r
     incoming_feedback = _latest_feedback(requirements)
     if state.waiting_for_user_input and incoming_feedback and incoming_feedback != state.latest_user_feedback:
         clear_requested_user_input(state)
+    if incoming_feedback and incoming_feedback != state.latest_user_feedback:
+        state.stalled_revision_count = 0
+        state.last_revision_fingerprint = build_plan_change_fingerprint(state.current_plan)
 
     state.input_summary = {
         "primary_url": request_payload.get("primary_url"),
@@ -659,6 +704,10 @@ def run_job(
             ctx.state.failure_reason = None
         _save(ctx)
 
+        revision_fingerprint_before = ""
+        if decision.next_action == "revise_plan":
+            revision_fingerprint_before = build_plan_change_fingerprint(ctx.state.current_plan)
+
         try:
             executor.execute(ctx, decision)
         except ProviderFailure as exc:
@@ -677,6 +726,14 @@ def run_job(
                 mark_terminal(ctx.state, JobStatus.FAILED, reason=str(exc), code="PIPELINE_EXECUTION_FAILED")
                 _save(ctx)
             break
+
+        if decision.next_action == "revise_plan" and not is_terminal(ctx.state):
+            _track_revision_progress(
+                ctx.state,
+                previous_fingerprint=revision_fingerprint_before,
+                guardrails=guardrails,
+            )
+            _save(ctx)
 
         iterations += 1
 

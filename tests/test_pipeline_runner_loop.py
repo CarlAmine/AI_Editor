@@ -259,13 +259,50 @@ def test_runner_stops_after_max_revision_loops():
             ]
         )
         executor = _FakeExecutor(validation_scores=[0.4, 0.35, 0.3])
-        guardrails = RunnerGuardrails(max_revision_attempts=2)
+        guardrails = RunnerGuardrails(max_revision_attempts=2, max_stalled_revision_attempts=99)
 
         result = run_job(job_id, _job_request(), decision_engine=engine, executor=executor, guardrails=guardrails)
 
         assert result["success"] is False
         assert result["status"] == "needs_user_input"
         assert executor.actions[-1] == "request_user_input"
+    finally:
+        _cleanup(job_id)
+
+
+def test_runner_requests_input_when_revisions_repeat_without_plan_change():
+    job_id = _job_id("runner-stalled")
+    try:
+        engine = _SequenceDecisionEngine(
+            [
+                DecisionOutcome(PipelineDecision(next_action="run_analysis", confidence=0.9, rationale="analyze", parameters={})),
+                DecisionOutcome(PipelineDecision(next_action="generate_plan", confidence=0.9, rationale="plan", parameters={})),
+                DecisionOutcome(PipelineDecision(next_action="validate_plan", confidence=0.9, rationale="validate", parameters={})),
+                DecisionOutcome(PipelineDecision(next_action="revise_plan", confidence=0.9, rationale="revise 1", parameters={})),
+                DecisionOutcome(PipelineDecision(next_action="validate_plan", confidence=0.9, rationale="validate 2", parameters={})),
+                DecisionOutcome(PipelineDecision(next_action="revise_plan", confidence=0.9, rationale="revise 2", parameters={})),
+            ]
+        )
+        executor = _FakeExecutor(validation_scores=[0.4, 0.35])
+        guardrails = RunnerGuardrails(max_revision_attempts=5, max_stalled_revision_attempts=2)
+
+        result = run_job(job_id, _job_request(), decision_engine=engine, executor=executor, guardrails=guardrails)
+        state = load_state(str(Path("tmp") / "jobs" / job_id))
+
+        assert result["success"] is False
+        assert result["status"] == "needs_user_input"
+        assert "without a meaningful change" in result["error"].lower()
+        assert executor.actions == [
+            "run_analysis",
+            "generate_plan",
+            "validate_plan",
+            "revise_plan",
+            "validate_plan",
+            "revise_plan",
+        ]
+        assert state is not None
+        assert state.stalled_revision_count == 2
+        assert any(warning["code"] == "STALLED_REVISION_LOOP" for warning in state.warnings)
     finally:
         _cleanup(job_id)
 

@@ -1,0 +1,108 @@
+.pipeline-page-redesigned {
+  background:
+    radial-gradient(circle at top, rgba(245, 158, 11, 0.08), transparent 26%),
+    linear-gradient(135deg, oklch(0.09 0.015 265) 0%, oklch(0.11 0.015 270) 100%);
+  position: relative;
+  overflow-x: hidden;
+}
+
+.pipeline-page-redesigned::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image:
+    radial-gradient(circle at 20% 50%, oklch(0.75 0.18 70 / 0.05) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, oklch(0.55 0.22 255 / 0.03) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.pipeline-page-redesigned .panel,
+.pipeline-page-redesigned .pipeline-step-wrapper {
+  position: relative;
+  z-index: 1;
+}
+
+.pipeline-page-redesigned .panel {
+  backdrop-filter: blur(14px);
+}
+
+.pipeline-page-redesigned .step-badge {
+  box-shadow: 0 10px 30px rgba(59, 130, 246, 0.18);
+}
+
+.pipeline-page-redesigned .chat-window,
+.pipeline-page-redesigned .yt-video-preview,
+.pipeline-page-redesigned .render-preview-video {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.pipeline-page-redesigned .chat-bubble {
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.28);
+}
+
+.pipeline-page-redesigned .chat-bubble-user {
+  box-shadow: 0 18px 36px rgba(37, 99, 235, 0.28);
+}
+
+.pipeline-page-redesigned .btn-primary {
+  position: relative;
+  overflow: hidden;
+}
+
+.pipeline-page-redesigned .btn-primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.14),
+    transparent
+  );
+  transform: translateX(-100%);
+  transition: transform 0.6s ease;
+}
+
+.pipeline-page-redesigned .btn-primary:hover::before {
+  transform: translateX(100%);
+}
+
+.pipeline-page-redesigned .source-item {
+  position: relative;
+  overflow: hidden;
+}
+
+.pipeline-page-redesigned .source-item::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(59, 130, 246, 0.06),
+    transparent
+  );
+  transform: translateX(-100%);
+  transition: transform 0.6s ease;
+}
+
+.pipeline-page-redesigned .source-item:hover::before {
+  transform: translateX(100%);
+}
+
+.pipeline-page-redesigned .state-preview {
+  width: 100%;
+}
+
+@media (max-width: 1024px) {
+  .pipeline-page-redesigned .panel {
+    backdrop-filter: blur(10px);
+  }
+}
+
+@media (max-width: 768px) {
+  .pipeline-page-redesigned .hero-header h1 {
+    font-size: 2.75rem;
+  }
+}
