@@ -265,9 +265,6 @@ See [docs/API_EXAMPLES.md](docs/API_EXAMPLES.md) for full request/response examp
 ### Job Status
 ![Job Status](docs/assets/screenshot-job-status.png)
 
-### Timeline Plan
-![Timeline Plan](docs/assets/screenshot-timeline.png)
-
 ### Render Flow
 ![Render Flow](docs/assets/screenshot-render.png)
 
