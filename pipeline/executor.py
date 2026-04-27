@@ -12,6 +12,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from ai_editor.analyzer import analyze_video_content_with_results
+from ai_editor.vision_template.renderer_adapter import build_render_spec_from_vision_template
+from ai_editor.vision_template.schemas import EditTemplate, SlotMapping
+from ai_editor.vision_template.train_reference import train_reference_adapter
 from ai_editor.downloader import (
     VideoDownloadError,
     _is_youtube_url,
@@ -180,6 +183,7 @@ class PipelineExecutor:
             raise
 
     def _handle_run_analysis(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
         self._run_stage(ctx, StageName.INGEST, lambda: self._stage_ingest(ctx))
         self._run_stage(
             ctx,
@@ -187,24 +191,33 @@ class PipelineExecutor:
             lambda: self._stage_fetch_primary(ctx),
             done_check=lambda: _artifact_path_exists(ctx.artifacts, "primary.video"),
         )
-        self._run_stage(
-            ctx,
-            StageName.ANALYZE_PRIMARY,
-            lambda: self._stage_analyze_primary(ctx),
-            done_check=lambda: bool(ctx.state.analysis_available and ctx.artifacts.exists("analysis.json")),
-        )
+        if generation_mode == "vision_template_learning":
+            update_stage(
+                ctx.state,
+                StageName.ANALYZE_PRIMARY,
+                StageStatus.SKIPPED,
+                {"reason": "vision_template_learning"},
+            )
+            self._save(ctx)
+        else:
+            self._run_stage(
+                ctx,
+                StageName.ANALYZE_PRIMARY,
+                lambda: self._stage_analyze_primary(ctx),
+                done_check=lambda: bool(ctx.state.analysis_available and ctx.artifacts.exists("analysis.json")),
+            )
         self._run_stage(
             ctx,
             StageName.FETCH_SOURCES,
             lambda: self._stage_fetch_sources(ctx),
             done_check=lambda: ctx.artifacts.exists("sources.raw.1") or ctx.artifacts.exists("sources.fetch.1"),
         )
-        if ctx.requirements.get("generation_mode") == "reference_mimic_mode":
+        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
             update_stage(
                 ctx.state,
                 StageName.ALIGN_SOURCES,
                 StageStatus.SKIPPED,
-                {"reason": "reference_mimic_mode"},
+                {"reason": generation_mode},
             )
             self._save(ctx)
         else:
@@ -217,6 +230,26 @@ class PipelineExecutor:
         self._refresh_source_status(ctx)
 
     def _handle_generate_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
+        if ctx.requirements.get("generation_mode") == "vision_template_learning":
+            self._run_stage(
+                ctx,
+                StageName.AUDIO_PLAN,
+                lambda: self._stage_audio_plan(ctx),
+                done_check=lambda: bool(ctx.state.audio_plan),
+            )
+            self._run_stage(
+                ctx,
+                StageName.VISION_TEMPLATE_TRAIN,
+                lambda: self._stage_vision_template_train(ctx),
+                done_check=lambda: ctx.artifacts.exists("vision.template.json"),
+            )
+            self._run_stage(
+                ctx,
+                StageName.VISION_TEMPLATE_TRANSFER,
+                lambda: self._stage_vision_template_transfer(ctx),
+                done_check=lambda: bool((ctx.state.render_spec or {}).get("canonical_timeline")),
+            )
+            return
         if not ctx.state.analysis_available:
             raise RuntimeError("Analysis must complete before generating a plan.")
         self._run_stage(
@@ -501,16 +534,22 @@ class PipelineExecutor:
                     trim_start = 0.0
                 else:
                     local = download_video(url, ctx.dirs["media"], f"source_raw_{index:03d}.mp4")
+                meta = {
+                    "backend": "url",
+                    "source_url": url,
+                    "trim_start": trim_start,
+                    "clip_id": source.get("clip_id") or source.get("id") or source.get("label") or str(index),
+                }
                 ctx.artifacts.register_file(
                     f"sources.raw.{index}",
                     local,
-                    {"backend": "url", "source_url": url, "trim_start": trim_start},
+                    meta,
                     "video/mp4",
                 )
                 ctx.artifacts.register_file(
                     f"sources.fetch.{index}",
                     local,
-                    {"backend": "local", "source_url": url, "trim_start": trim_start},
+                    {**meta, "backend": "local"},
                     "video/mp4",
                 )
             return
@@ -523,8 +562,11 @@ class PipelineExecutor:
             raise RuntimeError("No source clips found.")
         for index, clip in enumerate(clips, start=1):
             path = clip["path"]
-            ctx.artifacts.register_file(f"sources.raw.{index}", path, {"backend": "url"}, "video/mp4")
-            ctx.artifacts.register_file(f"sources.fetch.{index}", path, {"backend": "local"}, "video/mp4")
+            source = sources[index - 1] if index - 1 < len(sources) else {}
+            clip_id = source.get("clip_id") or source.get("id") or source.get("label") or str(index)
+            meta = {"backend": "url", "clip_id": clip_id, "source_url": source.get("url")}
+            ctx.artifacts.register_file(f"sources.raw.{index}", path, meta, "video/mp4")
+            ctx.artifacts.register_file(f"sources.fetch.{index}", path, {**meta, "backend": "local"}, "video/mp4")
 
     def _stage_align_sources(self, ctx: ExecutionContext) -> None:
         analysis = self._load_analysis(ctx)
@@ -611,7 +653,10 @@ class PipelineExecutor:
                 soundtrack_file = extract_audio(custom_video, ctx.dirs["media"], "custom_music.mp3")
             ctx.artifacts.register_file("audio.soundtrack", soundtrack_file, {"mode": "custom"}, "audio/mpeg")
             soundtrack_url = soundtrack_file
-        elif music_mode == "original" and ctx.requirements.get("generation_mode") == "reference_mimic_mode":
+        elif music_mode == "original" and ctx.requirements.get("generation_mode") in {
+            "reference_mimic_mode",
+            "vision_template_learning",
+        }:
             primary = ctx.artifacts.get("primary.video")
             if primary is None:
                 raise RuntimeError("Primary video is required to extract reference audio.")
@@ -699,9 +744,218 @@ class PipelineExecutor:
         self._record_overlay_warnings(ctx, overlay_plan)
         self._save(ctx)
 
+    def _stage_vision_template_train(self, ctx: ExecutionContext) -> None:
+        primary = ctx.artifacts.get("primary.video")
+        if primary is None:
+            add_error(
+                ctx.state,
+                StageName.VISION_TEMPLATE_TRAIN,
+                "VISION_TEMPLATE_VIDEO_READ_FAILED",
+                "Primary reference video is missing for vision template training.",
+            )
+            raise RuntimeError("Primary reference video is missing.")
+        config = dict(ctx.requirements.get("vision_template") or {})
+        expected_slots = ctx.requirements.get("expected_slots")
+        set_controller_status(
+            ctx.state,
+            ControllerStatus.VISION_TEMPLATE_TRAINING,
+            detail="Training experimental vision edit template from reference video.",
+        )
+        try:
+            result = train_reference_adapter(
+                reference_video_path=primary.path_or_url,
+                out_dir=ctx.dirs["plans"],
+                epochs=int(config.get("epochs", 5) or 5),
+                fps=float(config.get("fps", 8.0) or 8.0),
+                size=int(config.get("size", 224) or 224),
+                device=str(config.get("device", "auto") or "auto"),
+                max_seconds=config.get("max_seconds"),
+                expected_slots=int(expected_slots) if expected_slots is not None else None,
+                use_pretrained_backbone=bool(config.get("use_pretrained_backbone", False)),
+            )
+        except Exception as exc:
+            add_error(
+                ctx.state,
+                StageName.VISION_TEMPLATE_TRAIN,
+                "VISION_TEMPLATE_TRAINING_FAILED",
+                str(exc),
+            )
+            raise
+
+        ctx.artifacts.register_file("vision.template.model", result.model_path, {}, "application/octet-stream")
+        ctx.artifacts.register_file("vision.template.json", result.template_path, {}, "application/json")
+        ctx.artifacts.register_file("vision.template.raw_output", result.raw_output_path, {}, "application/octet-stream")
+        ctx.artifacts.register_file(
+            "vision.template.training_summary",
+            result.training_summary_path,
+            {},
+            "application/json",
+        )
+        for warning in result.template.warnings:
+            code = "VISION_TEMPLATE_LOW_CONFIDENCE" if "low confidence" in warning.lower() else "VISION_TEMPLATE_WARNING"
+            add_warning(ctx.state, code, warning)
+        update_stage(ctx.state, StageName.VISION_TEMPLATE_DECODE, StageStatus.SUCCEEDED, {"slot_count": len(result.template.slots)})
+        self._save(ctx)
+
+    def _resolve_slot_mapping(self, ctx: ExecutionContext) -> SlotMapping:
+        payload = (
+            ctx.request_payload.get("slot_mapping")
+            or ctx.requirements.get("slot_mapping")
+            or (ctx.requirements.get("vision_template") or {}).get("slot_mapping")
+        )
+        if not payload:
+            add_error(
+                ctx.state,
+                StageName.VISION_TEMPLATE_TRANSFER,
+                "VISION_TEMPLATE_SLOT_MAPPING_MISSING",
+                "vision_template_learning requires slot_mapping.",
+            )
+            raise RuntimeError("vision_template_learning requires slot_mapping.")
+        normalized = {"items": payload} if isinstance(payload, list) else payload
+        if hasattr(SlotMapping, "model_validate"):
+            return SlotMapping.model_validate(normalized)
+        return SlotMapping.parse_obj(normalized)
+
+    def _source_artifacts_by_clip_id(self, ctx: ExecutionContext) -> Dict[str, Any]:
+        source_map: Dict[str, Any] = {}
+        for index, source in enumerate(ctx.request_payload.get("sources") or [], start=1):
+            clip_id = source.get("clip_id") or source.get("id") or source.get("label") or str(index)
+            artifact = (
+                ctx.artifacts.get(f"sources.aligned.{index}")
+                or ctx.artifacts.get(f"sources.raw.{index}")
+                or ctx.artifacts.get(f"sources.fetch.{index}")
+            )
+            if artifact is not None:
+                source_map[str(clip_id)] = artifact
+        return source_map
+
+    def _stage_vision_template_transfer(self, ctx: ExecutionContext) -> None:
+        template_artifact = ctx.artifacts.get("vision.template.json")
+        if template_artifact is None:
+            add_error(
+                ctx.state,
+                StageName.VISION_TEMPLATE_TRANSFER,
+                "VISION_TEMPLATE_DECODE_FAILED",
+                "Missing decoded vision template artifact.",
+            )
+            raise RuntimeError("Missing decoded vision template artifact.")
+        set_controller_status(
+            ctx.state,
+            ControllerStatus.VISION_TEMPLATE_TRANSFERRING,
+            detail="Transferring learned edit template onto replacement clips.",
+        )
+        template = EditTemplate.from_json_file(template_artifact.path_or_url)
+        slot_mapping = self._resolve_slot_mapping(ctx)
+        source_artifacts = self._source_artifacts_by_clip_id(ctx)
+        try:
+            canonical_timeline, overlay_timing, edit_summary = build_render_spec_from_vision_template(
+                template,
+                slot_mapping,
+                source_artifacts,
+                ctx.requirements,
+                existing_overlay_plan=ctx.state.overlay_plan or None,
+                existing_audio_plan=ctx.state.audio_plan or None,
+            )
+        except Exception as exc:
+            add_error(
+                ctx.state,
+                StageName.VISION_TEMPLATE_TRANSFER,
+                "VISION_TEMPLATE_TRANSFER_FAILED",
+                str(exc),
+            )
+            raise
+
+        timeline_plan = {
+            "planning_strategy": "vision_template_learning",
+            "target_pacing": template.global_style.pacing_label,
+            "target_segment_duration": template.global_style.avg_slot_duration,
+            "target_segment_count": len(template.slots),
+            "selected_segments": [],
+            "support_segments": [],
+            "rejected_segments": [],
+            "scene_durations": [slot.duration for slot in template.slots],
+            "source_durations": [],
+            "edit_directives": [],
+            "plan_validation": {
+                "validation_score": 1.0,
+                "checks": {"vision_template": True},
+                "warnings": [],
+                "recommendations": [],
+                "rewrite_actions": [],
+                "validator_strategy": "vision_template_learning",
+            },
+            "planning_debug": {
+                "strategy_label": "vision_template_learning",
+                "vision_template_slot_count": len(template.slots),
+                "validation_ran": True,
+                "validator_strategy": "vision_template_learning",
+                "rewrite_applied": False,
+                "rewrite_actions_applied": [],
+            },
+        }
+        overlay_plan = {
+            "overlays": overlay_timing.get("overlays", []),
+            "text_segments": [],
+            "warnings": [],
+            "overlay_script": None,
+            "timing_mode": "vision_template",
+            "montage_mode": False,
+        }
+        audio_plan = ctx.state.audio_plan or {}
+        render_spec = build_render_spec(timeline_plan, overlay_plan, audio_plan, ctx.requirements)
+        render_spec["canonical_timeline"] = canonical_timeline
+        render_spec["overlay_timing"] = overlay_timing.get("overlays", [])
+        render_spec["edit_summary"] = edit_summary
+        render_spec["generation_mode"] = "vision_template_learning"
+        render_spec["vision_template_path"] = template_artifact.path_or_url
+        apply_plan(
+            ctx.state,
+            timeline_plan,
+            overlay_plan=overlay_plan,
+            audio_plan=audio_plan,
+            render_spec=render_spec,
+            needs_validation=False,
+        )
+        apply_plan_validation(ctx.state, timeline_plan["plan_validation"])
+        self._write_plan_bundle(
+            ctx,
+            timeline_plan=timeline_plan,
+            overlay_plan=overlay_plan,
+            audio_plan=audio_plan,
+            render_spec=render_spec,
+            postprocess_plan=build_postprocess_plan(ctx.requirements),
+            analysis_duration=float(template.total_duration),
+            render_duration=float(template.total_duration),
+        )
+        write_plan(ctx.dirs["job"], "vision_template.json", template.model_dump() if hasattr(template, "model_dump") else template.dict())
+        write_plan(
+            ctx.dirs["job"],
+            "vision_template_timeline.json",
+            {"generation_mode": "vision_template_learning", "timeline": canonical_timeline},
+        )
+        self._save(ctx)
+
     def _stage_render_plan(self, ctx: ExecutionContext) -> None:
         if not ctx.state.current_plan:
             raise RuntimeError("No plan is available to render.")
+
+        if ctx.requirements.get("generation_mode") == "vision_template_learning":
+            render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
+            if not render_spec.get("canonical_timeline"):
+                raise RuntimeError("vision_template_learning requires a canonical_timeline before rendering.")
+            ctx.state.render_spec = render_spec
+            touch(ctx.state)
+            self._write_plan_bundle(
+                ctx,
+                timeline_plan=ctx.state.current_plan,
+                overlay_plan=ctx.state.overlay_plan or {"overlays": [], "text_segments": [], "warnings": [], "overlay_script": None},
+                audio_plan=ctx.state.audio_plan or {},
+                render_spec=render_spec,
+                postprocess_plan=build_postprocess_plan(ctx.requirements),
+                analysis_duration=float(render_spec.get("edit_summary", {}).get("preserved_total_duration", 0.0) or 0.0),
+                render_duration=float(render_spec.get("edit_summary", {}).get("preserved_total_duration", 0.0) or 0.0),
+            )
+            return
 
         analysis = self._load_analysis(ctx)
         overlay_plan = ctx.state.overlay_plan
@@ -1155,7 +1409,7 @@ class PipelineExecutor:
 
     def _source_keys_for_generation(self, ctx: ExecutionContext) -> List[str]:
         generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
-        if generation_mode == "reference_mimic_mode":
+        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
             return _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
         source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
         if not source_keys:
@@ -1164,7 +1418,7 @@ class PipelineExecutor:
 
     def _source_durations_for_plan(self, ctx: ExecutionContext, analysis: Dict[str, Any]) -> List[float]:
         generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
-        if generation_mode == "reference_mimic_mode":
+        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
             return []
         source_keys = self._source_keys_for_generation(ctx)
         source_paths = [ctx.artifacts.get(key).path_or_url for key in source_keys if ctx.artifacts.get(key)]

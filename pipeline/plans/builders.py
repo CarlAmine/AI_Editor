@@ -45,7 +45,7 @@ def _split_segment_by_scenes(segment: Dict[str, Any], scenes: List[Dict[str, Any
 
     out: List[Dict[str, Any]] = []
     cursor = start
-    for s in scenes:
+    for scene_index, s in enumerate(scenes, start=1):
         s_start = float(s.get("start_time", 0.0))
         s_end = float(s.get("end_time", 0.0))
         if s_end <= cursor:
@@ -55,12 +55,12 @@ def _split_segment_by_scenes(segment: Dict[str, Any], scenes: List[Dict[str, Any
         cut_start = max(cursor, s_start)
         cut_end = min(end, s_end)
         if cut_end > cut_start:
-            out.append({"start": cut_start, "end": cut_end, "text": text})
+            out.append({"start": cut_start, "end": cut_end, "text": text, "scene_index": scene_index})
             cursor = cut_end
         if cursor >= end:
             break
     if not out:
-        out.append({"start": start, "end": end, "text": text})
+        out.append({"start": start, "end": end, "text": text, "scene_index": None})
     return out
 
 
@@ -150,11 +150,17 @@ def build_text_segments(
             continue
 
         nxt = segments[i + 1] if i + 1 < len(segments) else None
-        if nxt and _compatible_text(cur["text"], nxt["text"]) and float(nxt["start"]) - float(cur["end"]) < 0.05:
+        if (
+            nxt
+            and _compatible_text(cur["text"], nxt["text"])
+            and float(nxt["start"]) - float(cur["end"]) < 0.05
+            and cur.get("scene_index") == nxt.get("scene_index")
+        ):
             merged = {
                 "start": float(cur["start"]),
                 "end": float(nxt["end"]),
                 "text": str(nxt["text"]).strip(),
+                "scene_index": cur.get("scene_index"),
             }
             fixed.append(merged)
             merged_count += 1
@@ -181,6 +187,7 @@ def build_text_segments(
         if (
             str(prev.get("text", "")).strip().lower() == str(seg.get("text", "")).strip().lower()
             and float(seg["start"]) - float(prev["end"]) <= 0.1
+            and prev.get("scene_index") == seg.get("scene_index")
         ):
             prev["end"] = max(float(prev["end"]), float(seg["end"]))
             merged_count += 1
@@ -566,7 +573,7 @@ def build_render_spec(
 
     overlay_full_clip = bool(requirements.get("overlay_full_clip", False))
     generation_mode = str(requirements.get("generation_mode", "free_generation_mode")).lower()
-    if generation_mode not in {"free_generation_mode", "reference_mimic_mode"}:
+    if generation_mode not in {"free_generation_mode", "reference_mimic_mode", "vision_template_learning"}:
         generation_mode = "free_generation_mode"
     style_directive_result = _STYLE_DIRECTIVE_ADAPTER.adapt(
         timeline_plan=timeline_plan,
@@ -610,7 +617,7 @@ def build_render_spec(
         "refit_mode": "native_9x16" if output_mode == "native_9x16" else "crop_center",
         "overlay_full_clip": overlay_full_clip,
         "generation_mode": generation_mode,
-        "disable_auto_transitions": generation_mode == "reference_mimic_mode",
+        "disable_auto_transitions": generation_mode in {"reference_mimic_mode", "vision_template_learning"},
     }
 
 

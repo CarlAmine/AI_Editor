@@ -137,10 +137,22 @@ class VideoSegment(BaseModel):
 
 class VideoSource(BaseModel):
     """Source video specification."""
-    label: int
+    label: Optional[int] = None
     url: str
+    id: Optional[str] = None
+    clip_id: Optional[str] = None
     start: Optional[float] = None
+    end: Optional[float] = None
     segments: Optional[List[VideoSegment]] = None
+
+
+class SlotMappingRequestItem(BaseModel):
+    slot_id: int
+    clip_id: Optional[str] = None
+    clip_path: Optional[str] = None
+    clip_url: Optional[str] = None
+    source_start: Optional[float] = None
+    source_end: Optional[float] = None
 
 
 class ProcessVideoURLRequest(BaseModel):
@@ -158,6 +170,7 @@ class ProcessVideoURLRequest(BaseModel):
     edit_mode: Optional[str] = None
     job_id: Optional[str] = None
     requirements_state: Optional[dict] = {}
+    slot_mapping: Optional[List[SlotMappingRequestItem]] = None
 
 
 def extract_drive_folder_id(link_or_id: Optional[str]) -> Optional[str]:
@@ -231,9 +244,12 @@ async def process_video_url(request: ProcessVideoURLRequest):
             if source.segments:
                 segments = [{"start": s.start, "end": s.end} for s in source.segments]
             sources_list.append({
-                "label": source.label,
+                "label": source.label if source.label is not None else len(sources_list) + 1,
+                "id": source.id,
+                "clip_id": source.clip_id,
                 "url": source.url,
                 "start": source.start,
+                "end": source.end,
                 "segments": segments,
             })
         
@@ -258,6 +274,19 @@ async def process_video_url(request: ProcessVideoURLRequest):
             requirements_state=requirements_state,
             job_id=request.job_id,
             gdrive_folder_id=folder_id,
+            slot_mapping=(
+                [
+                    {
+                        "slot_id": item.slot_id,
+                        "clip_id": item.clip_id,
+                        "clip_path": item.clip_path,
+                        "clip_url": item.clip_url,
+                        "source_start": item.source_start,
+                        "source_end": item.source_end,
+                    }
+                    for item in (request.slot_mapping or [])
+                ]
+            ),
         )
         return result
         

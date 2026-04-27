@@ -17,6 +17,7 @@ def Assemble_Pipeline(
     requirements_state: dict = None,
     job_id: str = None,
     gdrive_folder_id: str = None,
+    slot_mapping: list = None,
 ) -> Dict:
     """
     Backwards-compatible entrypoint.
@@ -34,6 +35,7 @@ def Assemble_Pipeline(
         "custom_music_segments": custom_music_segments,
         "requirements_state": requirements_state or {},
         "gdrive_folder_id": gdrive_folder_id,
+        "slot_mapping": slot_mapping or [],
     }
     jid = job_id or str(uuid.uuid4())[:8]
     return run_job(jid, payload)

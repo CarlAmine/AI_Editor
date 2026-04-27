@@ -28,6 +28,9 @@ class StageName(str, Enum):
     FETCH_SOURCES = "FETCH_SOURCES"
     ALIGN_SOURCES = "ALIGN_SOURCES"
     AUDIO_PLAN = "AUDIO_PLAN"
+    VISION_TEMPLATE_TRAIN = "VISION_TEMPLATE_TRAIN"
+    VISION_TEMPLATE_DECODE = "VISION_TEMPLATE_DECODE"
+    VISION_TEMPLATE_TRANSFER = "VISION_TEMPLATE_TRANSFER"
     RENDER_PLAN = "RENDER_PLAN"
     SHOTSTACK_RENDER = "SHOTSTACK_RENDER"
     POSTPROCESS = "POSTPROCESS"
@@ -55,6 +58,8 @@ class ControllerStatus(str, Enum):
     INITIALIZING = "initializing"
     ANALYZING = "analyzing"
     PLANNING = "planning"
+    VISION_TEMPLATE_TRAINING = "vision_template_training"
+    VISION_TEMPLATE_TRANSFERRING = "vision_template_transferring"
     REVISING = "revising"
     VALIDATING = "validating"
     RENDERING = "rendering"
@@ -791,6 +796,8 @@ def controller_status_category(status: ControllerStatus | str) -> str:
         ControllerStatus.INITIALIZING.value,
         ControllerStatus.ANALYZING.value,
         ControllerStatus.PLANNING.value,
+        ControllerStatus.VISION_TEMPLATE_TRAINING.value,
+        ControllerStatus.VISION_TEMPLATE_TRANSFERRING.value,
         ControllerStatus.REVISING.value,
         ControllerStatus.VALIDATING.value,
         ControllerStatus.RENDERING.value,

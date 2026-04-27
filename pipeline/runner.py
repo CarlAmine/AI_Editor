@@ -89,8 +89,27 @@ def _normalize_requirements(request_payload: Dict[str, Any]) -> Dict[str, Any]:
     requirements["custom_music_segment"] = request_payload.get("custom_music_segment")
     requirements["custom_music_segments"] = request_payload.get("custom_music_segments")
     requirements["generation_mode"] = str(requirements.get("generation_mode", "free_generation_mode")).lower()
-    if requirements["generation_mode"] not in {"free_generation_mode", "reference_mimic_mode"}:
+    if requirements["generation_mode"] not in {
+        "free_generation_mode",
+        "reference_mimic_mode",
+        "vision_template_learning",
+    }:
         requirements["generation_mode"] = "free_generation_mode"
+    if "slot_mapping" not in requirements and request_payload.get("slot_mapping") is not None:
+        requirements["slot_mapping"] = request_payload.get("slot_mapping")
+    if "expected_slots" not in requirements and request_payload.get("expected_slots") is not None:
+        requirements["expected_slots"] = request_payload.get("expected_slots")
+    vision_template = dict(requirements.get("vision_template") or {})
+    default_vision_template = {
+        "fps": 8.0,
+        "size": 224,
+        "epochs": 5,
+        "device": "auto",
+        "max_seconds": None,
+        "use_pretrained_backbone": False,
+    }
+    default_vision_template.update(vision_template)
+    requirements["vision_template"] = default_vision_template
     requirements["edit_mode"] = str(requirements.get("edit_mode", "scene")).lower().strip()
     if requirements["edit_mode"] not in {"scene", "ocr"}:
         requirements["edit_mode"] = "scene"

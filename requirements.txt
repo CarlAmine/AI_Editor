@@ -8,6 +8,8 @@ pandas
 scenedetect
 scikit-image
 opencv-python-headless
+torch
+torchvision
 
 # --- CHATBOT REQUIREMENTS ---
 python-dotenv
