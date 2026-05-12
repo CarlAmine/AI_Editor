@@ -2,7 +2,7 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
-from ai_editor.vision_template.synthetic_dataset import SyntheticEditDataset, generate_synthetic_edit_sample
+from ai_editor.vision_template.synthetic_dataset import SyntheticEditDataset, build_frame_targets_from_template, generate_synthetic_edit_sample
 
 
 def _temp_dir(name: str) -> Path:
@@ -35,5 +35,19 @@ def test_synthetic_edit_dataset_returns_training_labels():
         assert sample["frames"].shape[1] == 3
         assert sample["boundary_labels"].shape[0] == sample["frames"].shape[0]
         assert sample["ground_truth_template"].total_duration > 0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_boundary_targets_align_with_synthetic_template():
+    tmp_dir = _temp_dir("vision-boundaries")
+    try:
+        dataset = SyntheticEditDataset(out_dir=str(tmp_dir), num_slots=4, fps=8, seed=13)
+        sample = dataset[0]
+        targets = build_frame_targets_from_template(dataset.sampled, dataset.template)
+        peaks = [index for index, value in enumerate(targets["boundary"].tolist()) if value >= 0.99]
+
+        assert len(peaks) == 3
+        assert sample["slot_id_per_frame"].shape[0] == sample["frames"].shape[0]
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

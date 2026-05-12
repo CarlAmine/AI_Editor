@@ -116,6 +116,127 @@ class StyleProfile:
 
 
 @dataclass
+class MotionCurve:
+    """
+    A time-series of per-frame transform parameters extracted from a video
+    segment. All values are normalised to the frame dimensions so curves are
+    resolution-independent and can be applied to clips of any size.
+
+    - dx_norm, dy_norm: translation as fraction of frame width/height
+    - scale: uniform scale factor (1.0 = no zoom, 1.1 = 10% zoom in)
+    - rotation_deg: rotation in degrees (small values typical for shake)
+    - residual: mean homography fit error; high values indicate non-rigid
+      effects (glitch, distortion, dissolve smear)
+    """
+
+    dx_norm: List[float] = field(default_factory=list)
+    dy_norm: List[float] = field(default_factory=list)
+    scale: List[float] = field(default_factory=list)
+    rotation_deg: List[float] = field(default_factory=list)
+    residual: List[float] = field(default_factory=list)
+    frame_indices: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class EffectType(str, Enum):
+    SHAKE = "shake"
+    ZOOM_IN = "zoom_in"
+    ZOOM_OUT = "zoom_out"
+    PAN = "pan"
+    FREEZE = "freeze"
+    SPEED_RAMP = "speed_ramp"
+    BLUR_SMEAR = "blur_smear"
+    GLITCH = "glitch"
+    STATIC = "static"
+
+
+@dataclass
+class MotionEffect:
+    """
+    A single detected applied effect event tied to a specific shot and a
+    specific temporal position within that shot.
+
+    onset_frac and offset_frac are fractional positions within the shot
+    (0.0 = shot start, 1.0 = shot end). Using fractions rather than absolute
+    timestamps means the effect scales correctly when applied to a replacement
+    clip of different duration.
+    """
+
+    shot_index: int
+    effect_type: EffectType
+    onset_frac: float
+    offset_frac: float
+    intensity: float
+    curve: MotionCurve = field(default_factory=MotionCurve)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["effect_type"] = self.effect_type.value
+        return payload
+
+
+@dataclass
+class MotionEffectManifest:
+    """
+    Complete motion effect layer for an entire reference video.
+    One manifest per reference video. Stored as motion_effects.json artifact.
+    """
+
+    video_path: str
+    fps: float
+    total_frames: int
+    effects: List[MotionEffect] = field(default_factory=list)
+    rhythm_pattern: List[float] = field(default_factory=list)
+    global_motion_budget: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "video_path": self.video_path,
+            "fps": self.fps,
+            "total_frames": self.total_frames,
+            "effects": [effect.to_dict() for effect in self.effects],
+            "rhythm_pattern": self.rhythm_pattern,
+            "global_motion_budget": self.global_motion_budget,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MotionEffectManifest":
+        effects: List[MotionEffect] = []
+        for effect_data in data.get("effects", []):
+            curve_data = effect_data.get("curve", {})
+            curve = MotionCurve(
+                dx_norm=curve_data.get("dx_norm", []),
+                dy_norm=curve_data.get("dy_norm", []),
+                scale=curve_data.get("scale", []),
+                rotation_deg=curve_data.get("rotation_deg", []),
+                residual=curve_data.get("residual", []),
+                frame_indices=curve_data.get("frame_indices", []),
+            )
+            effects.append(
+                MotionEffect(
+                    shot_index=int(effect_data.get("shot_index", 0)),
+                    effect_type=EffectType(effect_data.get("effect_type", "static")),
+                    onset_frac=float(effect_data.get("onset_frac", 0.0)),
+                    offset_frac=float(effect_data.get("offset_frac", 1.0)),
+                    intensity=float(effect_data.get("intensity", 0.0)),
+                    curve=curve,
+                    metadata=dict(effect_data.get("metadata") or {}),
+                )
+            )
+        return cls(
+            video_path=data.get("video_path", ""),
+            fps=float(data.get("fps", 0.0)),
+            total_frames=int(data.get("total_frames", 0)),
+            effects=effects,
+            rhythm_pattern=list(data.get("rhythm_pattern", [])),
+            global_motion_budget=float(data.get("global_motion_budget", 0.0)),
+        )
+
+
+@dataclass
 class TranscriptResult:
     status: str = AnalysisStatus.UNAVAILABLE.value
     backend: Optional[str] = None
@@ -142,6 +263,7 @@ class AnalysisResult:
     black_frames: List[Dict[str, Any]] = field(default_factory=list)
     transitions: List[Dict[str, Any]] = field(default_factory=list)
     style_profile: StyleProfile = field(default_factory=StyleProfile)
+    motion_effects: Optional[MotionEffectManifest] = None
     analysis_profile: Dict[str, Any] = field(default_factory=dict)
 
     def to_canonical_dict(self) -> Dict[str, Any]:
@@ -156,6 +278,7 @@ class AnalysisResult:
             "black_frames": list(self.black_frames),
             "transitions": list(self.transitions),
             "style_profile": self.style_profile.to_dict(),
+            "motion_effects": self.motion_effects.to_dict() if self.motion_effects else None,
             "analysis_profile": dict(self.analysis_profile),
         }
 

@@ -522,3 +522,71 @@ def test_decision_trace_entries_accumulate_with_step_indexes():
         assert (Path("tmp") / "jobs" / job_id / "decision_trace.json").exists()
     finally:
         _cleanup(job_id)
+
+
+def test_runner_resumes_existing_waiting_job_with_same_job_id():
+    job_id = _job_id("runner-resume")
+    try:
+        initial_request = _job_request()
+        initial_request["requirements_state"] = {
+            "edit_requests": ["Initial direction"],
+        }
+        paused = run_job(
+            job_id,
+            initial_request,
+            decision_engine=_SequenceDecisionEngine(
+                [
+                    DecisionOutcome(
+                        PipelineDecision(
+                            next_action="request_user_input",
+                            confidence=0.9,
+                            rationale="Need clarification",
+                            parameters={
+                                "reason": "max_loop_iterations",
+                                "question": "Please confirm the next edit priority before I continue.",
+                            },
+                        )
+                    )
+                ]
+            ),
+            executor=_FakeExecutor(),
+        )
+        assert paused["status"] == "needs_user_input"
+
+        resumed_request = _job_request()
+        resumed_request["requirements_state"] = {
+            "edit_requests": [
+                "Initial direction",
+                "Continue. Prioritize rendering the current plan.",
+            ],
+        }
+        executor = _FakeExecutor(validation_scores=[0.93], apply_pending_feedback_on_revise=True)
+        result = run_job(
+            job_id,
+            resumed_request,
+            decision_engine=_SequenceDecisionEngine(
+                [
+                    DecisionOutcome(PipelineDecision(next_action="run_analysis", confidence=0.9, rationale="reanalyze", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="generate_plan", confidence=0.9, rationale="plan", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="validate_plan", confidence=0.9, rationale="validate", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="revise_plan", confidence=0.9, rationale="apply feedback", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="validate_plan", confidence=0.9, rationale="validate revised", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="render_final", confidence=0.95, rationale="render", parameters={})),
+                    DecisionOutcome(PipelineDecision(next_action="finish", confidence=0.95, rationale="done", parameters={})),
+                ]
+            ),
+            executor=executor,
+        )
+        state = load_state(str(Path("tmp") / "jobs" / job_id))
+
+        assert result["success"] is True
+        assert result["project_id"] == job_id
+        assert executor.actions[0] == "run_analysis"
+        assert state is not None
+        assert state.waiting_for_user_input is False
+        assert state.requested_user_input == {}
+        assert state.latest_user_feedback == "Continue. Prioritize rendering the current plan."
+        assert state.requirements["edit_requests"][-1] == "Continue. Prioritize rendering the current plan."
+        assert state.status == JobStatus.RUNNING
+    finally:
+        _cleanup(job_id)

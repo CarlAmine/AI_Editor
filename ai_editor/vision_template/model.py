@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -34,7 +33,7 @@ class VisionEditOutput:
 
 
 class TinyVisionEditModel(nn.Module):
-    def __init__(self, hidden_size: int = 64, style_dim: int = 16) -> None:
+    def __init__(self, hidden_size: int = 72, style_dim: int = 16) -> None:
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
@@ -42,11 +41,24 @@ class TinyVisionEditModel(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
+            nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.temporal = nn.GRU(input_size=32, hidden_size=hidden_size, batch_first=True, bidirectional=True)
+        self.delta_projection = nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU())
+        self.temporal_prep = nn.Sequential(
+            nn.Conv1d(56, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.temporal = nn.GRU(input_size=64, hidden_size=hidden_size, batch_first=True, bidirectional=True)
         temporal_dim = hidden_size * 2
-        self.boundary_head = nn.Linear(temporal_dim, 1)
+        self.boundary_pair = nn.Sequential(
+            nn.Linear(temporal_dim * 2 + 1, temporal_dim),
+            nn.ReLU(),
+            nn.Linear(temporal_dim, 1),
+        )
         self.motion_head = nn.Linear(temporal_dim, len(MOTION_LABELS))
         self.transition_head = nn.Linear(temporal_dim, len(TRANSITION_LABELS))
         self.overlay_head = nn.Linear(temporal_dim, len(OVERLAY_LABELS))
@@ -63,11 +75,28 @@ class TinyVisionEditModel(nn.Module):
 
         batch, steps, channels, height, width = frames.shape
         encoded = self.encoder(frames.reshape(batch * steps, channels, height, width)).flatten(1)
-        sequence = encoded.reshape(batch, steps, -1)
-        temporal_features, _ = self.temporal(sequence)
+        frame_embeddings = encoded.reshape(batch, steps, -1)
+
+        if steps > 1:
+            frame_delta = torch.abs(frames[:, 1:] - frames[:, :-1]).mean(dim=(2, 3, 4), keepdim=False).unsqueeze(-1)
+            frame_delta = torch.cat([torch.zeros((batch, 1, 1), device=frames.device, dtype=frames.dtype), frame_delta], dim=1)
+        else:
+            frame_delta = torch.zeros((batch, steps, 1), device=frames.device, dtype=frames.dtype)
+        delta_features = self.delta_projection(frame_delta)
+
+        sequence = torch.cat([frame_embeddings, delta_features], dim=-1)
+        prepped = self.temporal_prep(sequence.transpose(1, 2)).transpose(1, 2)
+        temporal_features, _ = self.temporal(prepped)
         pooled = temporal_features.mean(dim=1)
 
-        boundary = self.boundary_head(temporal_features).squeeze(-1)
+        if steps > 1:
+            prev_features = torch.cat([temporal_features[:, :1], temporal_features[:, :-1]], dim=1)
+            pair_delta = torch.norm(frame_embeddings - torch.cat([frame_embeddings[:, :1], frame_embeddings[:, :-1]], dim=1), dim=-1, keepdim=True)
+        else:
+            prev_features = temporal_features
+            pair_delta = torch.zeros((batch, steps, 1), device=frames.device, dtype=temporal_features.dtype)
+        boundary_features = torch.cat([prev_features, temporal_features, pair_delta], dim=-1)
+        boundary = self.boundary_pair(boundary_features).squeeze(-1)
         motion = self.motion_head(temporal_features)
         transition = self.transition_head(temporal_features)
         overlay = self.overlay_head(temporal_features)
@@ -81,10 +110,8 @@ class TinyVisionEditModel(nn.Module):
             overlay = overlay.squeeze(0)
             crop = crop.squeeze(0)
             style = style.squeeze(0)
-            encoded = encoded.reshape(batch, steps, -1).squeeze(0)
+            frame_embeddings = frame_embeddings.squeeze(0)
             temporal_features = temporal_features.squeeze(0)
-        else:
-            encoded = encoded.reshape(batch, steps, -1)
 
         return VisionEditOutput(
             boundary_logits=boundary,
@@ -93,7 +120,7 @@ class TinyVisionEditModel(nn.Module):
             overlay_logits=overlay,
             crop_params=crop,
             style_embedding=style,
-            frame_embeddings=encoded,
+            frame_embeddings=frame_embeddings,
             temporal_features=temporal_features,
         )
 

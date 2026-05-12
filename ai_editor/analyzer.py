@@ -5,6 +5,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
+import logging
 from typing import Dict, Optional, Tuple
 
 try:
@@ -25,6 +26,7 @@ except Exception:  # pragma: no cover - dependency availability varies by enviro
 from ai_editor.analysis import (
     AnalysisResult,
     OCRAnalyzer,
+    MotionEffectAnalyzer,
     SceneAnalyzer,
     SegmentBuilder,
     SegmentScorer,
@@ -33,6 +35,8 @@ from ai_editor.analysis import (
     VideoMetadata,
     VisualSignatureAnalyzer,
 )
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -83,6 +87,7 @@ class VideoEditAnalyzer:
         self.segment_scorer = segment_scorer or SegmentScorer()
         self.style_profiler = style_profiler or StyleProfiler()
         self.visual_signature_analyzer = visual_signature_analyzer or VisualSignatureAnalyzer()
+        self._motion_effect_analyzer = MotionEffectAnalyzer()
         self.analysis = AnalysisResult(metadata=self.metadata)
         self.results: Dict = self.analysis.to_dict()
         self._keyframes: list[dict] = []
@@ -170,12 +175,36 @@ class VideoEditAnalyzer:
         )
         self._refresh_results()
 
+    def analyze_motion_effects(self) -> None:
+        """
+        Analyze editor-applied global motion effects against the already-detected
+        scene list and store the manifest on the analysis result.
+        """
+        if not self.analysis.scenes:
+            log.warning("analyze_motion_effects called before scenes were available")
+            return
+        if not self.video_path:
+            return
+        manifest = self._motion_effect_analyzer.analyze(self.video_path, self.analysis.scenes)
+        self.analysis.motion_effects = manifest
+        log.info(
+            "Motion effect analysis complete: %d effects across %d shots",
+            len(manifest.effects),
+            len(self.analysis.scenes),
+        )
+        self._refresh_results()
+
     def run_full_analysis(self) -> AnalysisContext:
         scene_output = self.scene_analyzer.analyze(self.video_path, self.metadata)
         self.analysis.scenes = scene_output.scenes
         self.analysis.pacing = scene_output.pacing
         self.analysis.black_frames = scene_output.black_frames
         self.analysis.transitions = scene_output.transitions
+
+        try:
+            self.analyze_motion_effects()
+        except Exception as exc:
+            log.warning("Motion effect analysis failed but full analysis continued: %s", exc)
 
         ocr_output = self.ocr_analyzer.analyze(self.video_path, self.metadata)
         self.analysis.ocr_spans = ocr_output.ocr_spans

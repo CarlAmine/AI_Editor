@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 from .schemas import EditTemplate, SlotMapping, validate_slot_mapping
+
+
+def _probe_source_duration(path: str) -> float:
+    if not path or str(path).startswith(("http://", "https://")) or not os.path.exists(path):
+        return 0.0
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            return 0.0
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        capture.release()
+        return (frames / fps) if fps > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
 def apply_template_to_clips(
@@ -27,6 +45,11 @@ def apply_template_to_clips(
         trim_start = float(item.source_start or 0.0)
         trim_end = float(item.source_end) if item.source_end is not None else None
         trim = trim_start
+        slot_warnings = []
+        source_duration = _probe_source_duration(resolved)
+        effective_available_duration = source_duration - trim_start if source_duration > trim_start else 0.0
+        if trim_end is not None and source_duration > 0:
+            effective_available_duration = max(0.0, min(effective_available_duration, trim_end - trim_start))
         metadata = {
             "source_slot_id": slot.slot_id,
             "clip_id": item.clip_id,
@@ -41,10 +64,28 @@ def apply_template_to_clips(
             "vision_template_confidence": slot.boundary_confidence,
             "source_start": item.source_start,
             "source_end": item.source_end,
+            "visible_objects": list(slot.visible_objects or []),
+            "visible_layers": list(slot.visible_layers or []),
+            "semantic_events": list(slot.semantic_events or []),
+            "semantic_metadata": dict(slot.semantic_metadata or {}),
+            "object_constraints": dict((slot.semantic_metadata or {}).get("object_constraints", {})),
+            "source_duration": source_duration or None,
+            "slot_warnings": slot_warnings,
         }
         if trim_end is not None and trim_end <= trim_start:
-            warnings.append(f"Slot {slot.slot_id} trim range was invalid; falling back to trim_start only.")
+            message = f"Slot {slot.slot_id} trim range was invalid; falling back to trim_start only."
+            warnings.append(message)
+            slot_warnings.append(message)
             trim_end = None
+        if source_duration > 0 and effective_available_duration + 1e-6 < float(slot.duration):
+            message = (
+                f"Slot {slot.slot_id} source clip appears shorter than learned slot duration "
+                f"({effective_available_duration:.2f}s available vs {float(slot.duration):.2f}s required)."
+            )
+            warnings.append(message)
+            slot_warnings.append(message)
+            metadata["short_source_strategy"] = "preserve_template_duration"
+            metadata["renderer_fallback_hint"] = "hold_last_frame_or_provider_default"
 
         timeline.append(
             {
@@ -70,6 +111,10 @@ def apply_template_to_clips(
                 if slot.overlay
                 else None,
                 "metadata": metadata,
+                "visible_objects": list(slot.visible_objects or []),
+                "visible_layers": list(slot.visible_layers or []),
+                "semantic_events": list(slot.semantic_events or []),
+                "semantic_metadata": dict(slot.semantic_metadata or {}),
                 "text": "",
                 "text_start": slot.start,
                 "text_end": slot.end,

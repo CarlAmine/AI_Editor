@@ -107,9 +107,21 @@ def _normalize_requirements(request_payload: Dict[str, Any]) -> Dict[str, Any]:
         "device": "auto",
         "max_seconds": None,
         "use_pretrained_backbone": False,
+        "synthetic_pretrain": False,
+        "synthetic_pretrain_samples": 16,
+        "synthetic_pretrain_epochs": 1,
     }
     default_vision_template.update(vision_template)
     requirements["vision_template"] = default_vision_template
+    semantic_edit = dict(requirements.get("semantic_edit") or {})
+    default_semantic_edit = {
+        "enabled": False,
+        "backend": "auto",
+        "text_queries": ["person", "chair", "table", "product"],
+        "attach_to_template": True,
+    }
+    default_semantic_edit.update(semantic_edit)
+    requirements["semantic_edit"] = default_semantic_edit
     requirements["edit_mode"] = str(requirements.get("edit_mode", "scene")).lower().strip()
     if requirements["edit_mode"] not in {"scene", "ocr"}:
         requirements["edit_mode"] = "scene"
@@ -556,6 +568,7 @@ def _sync_state_with_request(state: JobState, request_payload: Dict[str, Any], r
         "sources_count": len(request_payload.get("sources") or []),
     }
     state.requirements = requirements
+    state.request_payload = dict(request_payload or {})
     state.user_goal = str(requirements.get("prompt", "") or "")
     state.work_dir = job_dir
     set_latest_user_feedback(state, incoming_feedback)

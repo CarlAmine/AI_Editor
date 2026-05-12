@@ -101,6 +101,7 @@ class JobState:
     created_at: str
     updated_at: str
     input_summary: Dict[str, Any]
+    request_payload: Dict[str, Any]
     requirements: Dict[str, Any]
     user_goal: str = ""
     status: JobStatus = JobStatus.RUNNING
@@ -129,6 +130,7 @@ class JobState:
     audio_plan: Dict[str, Any] = field(default_factory=dict)
     render_spec: Dict[str, Any] = field(default_factory=dict)
     render_summary: Dict[str, Any] = field(default_factory=dict)
+    motion_effects_path: Optional[str] = None
     revision_attempts: int = 0
     render_attempts: int = 0
     stalled_revision_count: int = 0
@@ -146,6 +148,14 @@ class JobState:
     stages: Dict[str, StageEntry] = field(default_factory=dict)
     warnings: List[Dict[str, Any]] = field(default_factory=list)
     errors: List[Dict[str, Any]] = field(default_factory=list)
+
+    def set_motion_effects_path(self, path: str) -> None:
+        self.motion_effects_path = path
+        touch(self)
+
+    def is_vision_mode(self) -> bool:
+        generation_mode = str(self.requirements.get("generation_mode", "") or "").strip().lower()
+        return generation_mode in {"reference_mimic_mode", "vision_template_learning"}
 
 
 def default_stages() -> Dict[str, StageEntry]:
@@ -193,6 +203,7 @@ def new_state(job_id: str, input_summary: Dict[str, Any], requirements: Dict[str
         created_at=now,
         updated_at=now,
         input_summary=input_summary,
+        request_payload={},
         requirements=requirements,
         user_goal=str(requirements.get("prompt", "") or ""),
         latest_user_feedback=_extract_latest_feedback(requirements),
@@ -649,6 +660,7 @@ def _to_state(data: Dict[str, Any]) -> JobState:
         created_at=data.get("created_at", utc_now_iso()),
         updated_at=data.get("updated_at", data.get("created_at", utc_now_iso())),
         input_summary=data.get("input_summary") or {},
+        request_payload=data.get("request_payload") or {},
         requirements=data.get("requirements") or {},
         user_goal=data.get("user_goal", ""),
         status=status,
@@ -677,6 +689,7 @@ def _to_state(data: Dict[str, Any]) -> JobState:
         audio_plan=data.get("audio_plan") or {},
         render_spec=data.get("render_spec") or {},
         render_summary=data.get("render_summary") or {},
+        motion_effects_path=data.get("motion_effects_path"),
         revision_attempts=int(data.get("revision_attempts", 0) or 0),
         render_attempts=int(data.get("render_attempts", 0) or 0),
         stalled_revision_count=int(data.get("stalled_revision_count", 0) or 0),

@@ -11,7 +11,7 @@ import json
 import time
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from urllib.parse import parse_qs, urlparse
 
 from ai_editor.pipeline import Assemble_Pipeline
@@ -23,6 +23,7 @@ from ai_editor.google_auth import (
     resolve_drive_token_path,
 )
 from pipeline.providers import get_provider_health
+from pipeline.runner import run_job
 from pipeline.state import (
     JobStatus,
     build_controller_status_payload,
@@ -87,6 +88,40 @@ def _resolve_frontend_asset_path(relative_path: str) -> Optional[Path]:
 
 def _state_file_path(project_id: str) -> str:
     return str(TMP_JOBS_DIR / project_id / "state.json")
+
+
+def _append_resume_feedback(requirements_state: Dict[str, Any], message: str) -> Dict[str, Any]:
+    feedback = str(message or "").strip()
+    updated = dict(requirements_state or {})
+    updated["latest_user_feedback"] = feedback
+    edit_requests = list(updated.get("edit_requests") or [])
+    if feedback:
+        edit_requests.append(feedback)
+    updated["edit_requests"] = edit_requests
+    return updated
+
+
+def _build_resume_request_payload(state: Any, message: str) -> Dict[str, Any]:
+    payload = dict(state.request_payload or {})
+    if not payload:
+        payload = {
+            "primary_url": (state.input_summary or {}).get("primary_url"),
+            "sources": [],
+            "prompt": (state.requirements or {}).get("prompt", ""),
+            "music_mode": (state.requirements or {}).get("music_mode", "original"),
+            "custom_music_url": (state.requirements or {}).get("custom_music_url"),
+            "custom_music_start": (state.requirements or {}).get("custom_music_start"),
+            "custom_music_end": (state.requirements or {}).get("custom_music_end"),
+            "custom_music_segment": (state.requirements or {}).get("custom_music_segment"),
+            "custom_music_segments": (state.requirements or {}).get("custom_music_segments"),
+            "gdrive_folder_id": (state.requirements or {}).get("gdrive_folder_id"),
+            "slot_mapping": (state.requirements or {}).get("slot_mapping") or [],
+        }
+    payload["requirements_state"] = _append_resume_feedback(
+        payload.get("requirements_state") or state.requirements or {},
+        message,
+    )
+    return payload
 
 
 def _mark_youtube_uploaded_and_cleanup(project_id: str) -> None:
@@ -442,6 +477,10 @@ class ChatTurn(BaseModel):
     current_state: dict = {} 
     analyzer_output: str = ""
 
+
+class ResumeJobRequest(BaseModel):
+    message: str
+
 @app.post("/chat")
 async def handle_chat(turn: ChatTurn):
     # This calls the logic we wrote previously
@@ -452,6 +491,24 @@ async def handle_chat(turn: ChatTurn):
         GROQ_API_KEY
     )
     return result # This sends the JSON back to your UI
+
+
+@app.post("/jobs/{project_id}/resume")
+async def resume_job(project_id: str, request: ResumeJobRequest):
+    job_dir = TMP_JOBS_DIR / project_id
+    state = load_state(str(job_dir))
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job state not found.")
+    if not state.waiting_for_user_input or state.status != JobStatus.WAITING_USER_INPUT:
+        raise HTTPException(status_code=409, detail="Job is not waiting for user input.")
+
+    message = str(request.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="Resume message cannot be empty.")
+
+    payload = _build_resume_request_payload(state, message)
+    print(f"Resuming job {project_id} from waiting_for_user_input.")
+    return run_job(project_id, payload)
 
 
 # ============= YOUTUBE CLIPPER ENDPOINTS =============

@@ -14,6 +14,9 @@ type Props = {
   currentState?: Record<string, unknown>;
   onStateUpdate?: (state: Record<string, unknown>) => void;
   assistantEvent?: AssistantEvent | null;
+  activeJobId?: string | null;
+  activeJobStatusCategory?: string | null;
+  onPipelineResult?: (result: Record<string, unknown>) => void;
 };
 
 type AssistantEvent = {
@@ -34,6 +37,32 @@ type ChatTurnResponse = {
   is_complete?: boolean;
   final_report?: string | null;
 };
+
+type ResumeTarget = {
+  endpoint: string;
+  isResume: boolean;
+};
+
+export function resolveChatSubmitTarget(
+  apiBase: string,
+  jobStatusCategory?: string | null,
+  jobId?: string | null
+): ResumeTarget {
+  if (
+    jobId &&
+    (jobStatusCategory === "waiting_for_user_input" ||
+      jobStatusCategory === "blocked")
+  ) {
+    return {
+      endpoint: `${apiBase}/jobs/${jobId}/resume`,
+      isResume: true,
+    };
+  }
+  return {
+    endpoint: `${apiBase}/chat`,
+    isResume: false,
+  };
+}
 
 type Message = {
   id: number;
@@ -111,6 +140,9 @@ export const ChatPanel: React.FC<Props> = ({
   currentState: externalState = {},
   onStateUpdate,
   assistantEvent = null,
+  activeJobId = null,
+  activeJobStatusCategory = null,
+  onPipelineResult,
 }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -194,15 +226,27 @@ export const ChatPanel: React.FC<Props> = ({
       current_state: currentState,
       analyzer_output: analyzerOutput || "",
     };
+    const target = resolveChatSubmitTarget(
+      apiBase,
+      activeJobStatusCategory,
+      activeJobId
+    );
 
     try {
-      const response = await fetch(`${apiBase}/chat`, {
+      const response = await fetch(target.endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(
+          target.isResume ? { message: userText } : payload
+        ),
       });
 
-      const data: ChatTurnResponse = await response.json();
+      const data: ChatTurnResponse & Record<string, unknown> =
+        await response.json();
+
+      if (target.isResume) {
+        onPipelineResult?.(data);
+      }
 
       if (data.updated_state) {
         updateState(data.updated_state);

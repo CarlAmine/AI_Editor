@@ -12,9 +12,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from ai_editor.analyzer import analyze_video_content_with_results
+from ai_editor.analysis.analysis_schema import MotionEffectManifest
+from ai_editor.semantic_edit.edit_event_classifier import classify_semantic_edit_events
+from ai_editor.semantic_edit.layer_stack import build_layer_stack
+from ai_editor.semantic_edit.object_detector import detect_objects
+from ai_editor.semantic_edit.object_segmenter import segment_objects
+from ai_editor.semantic_edit.object_tracker import track_objects
+from ai_editor.semantic_edit.scene_graph import build_semantic_video_graph
+from ai_editor.semantic_edit.template_integration import attach_semantic_graph_to_template
+from ai_editor.semantic_edit.schemas import SemanticVideoGraph
 from ai_editor.vision_template.renderer_adapter import build_render_spec_from_vision_template
+from ai_editor.vision_template.frame_sampler import sample_video_frames
 from ai_editor.vision_template.schemas import EditTemplate, SlotMapping
 from ai_editor.vision_template.train_reference import train_reference_adapter
+from ai_editor.rendering.motion_effect_applier import MotionEffectApplier
 from ai_editor.downloader import (
     VideoDownloadError,
     _is_youtube_url,
@@ -437,6 +448,12 @@ class PipelineExecutor:
             handle.write(summary)
         ctx.artifacts.register_file("analysis.json", analysis_path, {}, "application/json")
         ctx.artifacts.register_file("analysis.summary", summary_path, {}, "text/plain")
+        motion_effects = analysis.get("motion_effects")
+        if motion_effects:
+            manifest_path = os.path.join(ctx.dirs["job"], "motion_effects.json")
+            self._write_json(manifest_path, motion_effects)
+            ctx.artifacts.register_file("motion_effects.json", manifest_path, {}, "application/json")
+            ctx.state.set_motion_effects_path(manifest_path)
         apply_analysis(ctx.state, analysis, summary)
 
     def _stage_fetch_sources(self, ctx: ExecutionContext) -> None:
@@ -772,6 +789,9 @@ class PipelineExecutor:
                 max_seconds=config.get("max_seconds"),
                 expected_slots=int(expected_slots) if expected_slots is not None else None,
                 use_pretrained_backbone=bool(config.get("use_pretrained_backbone", False)),
+                synthetic_pretrain=bool(config.get("synthetic_pretrain", False)),
+                synthetic_pretrain_samples=int(config.get("synthetic_pretrain_samples", 16) or 16),
+                synthetic_pretrain_epochs=int(config.get("synthetic_pretrain_epochs", 1) or 1),
             )
         except Exception as exc:
             add_error(
@@ -794,8 +814,76 @@ class PipelineExecutor:
         for warning in result.template.warnings:
             code = "VISION_TEMPLATE_LOW_CONFIDENCE" if "low confidence" in warning.lower() else "VISION_TEMPLATE_WARNING"
             add_warning(ctx.state, code, warning)
+        self._maybe_attach_semantic_edit(ctx, result.template_path)
         update_stage(ctx.state, StageName.VISION_TEMPLATE_DECODE, StageStatus.SUCCEEDED, {"slot_count": len(result.template.slots)})
         self._save(ctx)
+
+    def _maybe_attach_semantic_edit(self, ctx: ExecutionContext, template_path: str) -> None:
+        semantic_config = dict(ctx.requirements.get("semantic_edit") or {})
+        if not semantic_config.get("enabled", False):
+            return
+        primary = ctx.artifacts.get("primary.video")
+        if primary is None:
+            add_warning(
+                ctx.state,
+                "SEMANTIC_EDIT_ANALYSIS_FAILED",
+                "Primary video missing; semantic analysis could not run.",
+            )
+            return
+        try:
+            sampled = sample_video_frames(
+                primary.path_or_url,
+                fps=float((ctx.requirements.get("vision_template") or {}).get("fps", 8.0) or 8.0),
+                size=int((ctx.requirements.get("vision_template") or {}).get("size", 224) or 224),
+                max_seconds=(ctx.requirements.get("vision_template") or {}).get("max_seconds"),
+            )
+            detections = detect_objects(
+                sampled.frames,
+                sampled.timestamps,
+                text_queries=list(semantic_config.get("text_queries") or []),
+                backend=str(semantic_config.get("backend", "auto") or "auto"),
+            )
+            if not detections and str(semantic_config.get("backend", "auto")) not in {"auto", "synthetic_color", "mock"}:
+                add_warning(
+                    ctx.state,
+                    "SEMANTIC_EDIT_BACKEND_UNAVAILABLE",
+                    "Requested semantic backend returned no detections; continuing without semantic attachment.",
+                )
+                return
+            segment_objects(sampled.frames, detections, backend="bbox_mask")
+            tracks = track_objects(detections, sampled.timestamps)
+            layers = build_layer_stack(tracks)
+            graph = build_semantic_video_graph(
+                primary.path_or_url,
+                sampled.frames,
+                sampled.timestamps,
+                detections,
+                tracks,
+                layers,
+            )
+            classify_semantic_edit_events(graph)
+            if not tracks:
+                graph.warnings.append("Semantic analysis produced no tracked objects.")
+                add_warning(
+                    ctx.state,
+                    "SEMANTIC_EDIT_LOW_CONFIDENCE",
+                    "Semantic analysis produced no tracked objects.",
+                )
+            graph_path = os.path.join(ctx.dirs["plans"], "semantic_video_graph.json")
+            graph.to_json_file(graph_path)
+            ctx.artifacts.register_file("semantic.video_graph", graph_path, {}, "application/json")
+            if semantic_config.get("attach_to_template", True):
+                template = EditTemplate.from_json_file(template_path)
+                attach_semantic_graph_to_template(template, graph)
+                template.to_json_file(template_path)
+                ctx.artifacts.register_file("vision.template.json", template_path, {"semantic_attached": True}, "application/json")
+        except Exception as exc:
+            add_warning(
+                ctx.state,
+                "SEMANTIC_EDIT_ANALYSIS_FAILED",
+                f"Semantic analysis failed but the pipeline continued: {exc}",
+                {"exception": repr(exc)},
+            )
 
     def _resolve_slot_mapping(self, ctx: ExecutionContext) -> SlotMapping:
         payload = (
@@ -943,6 +1031,7 @@ class PipelineExecutor:
             render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
             if not render_spec.get("canonical_timeline"):
                 raise RuntimeError("vision_template_learning requires a canonical_timeline before rendering.")
+            render_spec = self._apply_motion_effects_to_render_spec(ctx, render_spec)
             ctx.state.render_spec = render_spec
             touch(ctx.state)
             self._write_plan_bundle(
@@ -1009,6 +1098,7 @@ class PipelineExecutor:
                 render_spec["edit_summary"] = edit_summary
                 render_spec["edit_ops"] = edit_ops
 
+        render_spec = self._apply_motion_effects_to_render_spec(ctx, render_spec)
         ctx.state.render_spec = render_spec
         touch(ctx.state)
         self._write_plan_bundle(
@@ -1448,6 +1538,47 @@ class PipelineExecutor:
                 warning.get("message", "Overlay warning"),
                 warning.get("detail"),
             )
+
+    def _apply_motion_effects_to_render_spec(
+        self,
+        ctx: ExecutionContext,
+        render_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not ctx.state.motion_effects_path or not ctx.state.is_vision_mode():
+            return render_spec
+        canonical_timeline = list(render_spec.get("canonical_timeline") or [])
+        if not canonical_timeline or not os.path.exists(ctx.state.motion_effects_path):
+            return render_spec
+
+        manifest = MotionEffectManifest.from_dict(self._load_json_if_exists(ctx.state.motion_effects_path))
+        applier = MotionEffectApplier()
+        updated_timeline: List[Dict[str, Any]] = []
+        stylized_count = 0
+
+        for index, row in enumerate(canonical_timeline):
+            entry = dict(row)
+            clip_path = str(entry.get("video_src") or entry.get("videoSrc") or "").strip()
+            if not clip_path or _is_http_url(clip_path) or not os.path.exists(clip_path):
+                updated_timeline.append(entry)
+                continue
+
+            base, ext = os.path.splitext(clip_path)
+            output_path = f"{base}_stylized{ext or '.mp4'}"
+            applied_path = applier.apply_to_clip(clip_path, index, manifest, output_path)
+            entry["video_src"] = applied_path
+            entry["videoSrc"] = applied_path
+            if applied_path != clip_path:
+                stylized_count += 1
+                entry.setdefault("metadata", {})
+                entry["metadata"]["motion_effects_applied"] = True
+                entry["metadata"]["original_video_src"] = clip_path
+            updated_timeline.append(entry)
+
+        updated_spec = dict(render_spec)
+        updated_spec["canonical_timeline"] = updated_timeline
+        updated_spec.setdefault("edit_summary", {})
+        updated_spec["edit_summary"]["motion_effect_clips_stylized"] = stylized_count
+        return updated_spec
 
     def _write_plan_bundle(
         self,

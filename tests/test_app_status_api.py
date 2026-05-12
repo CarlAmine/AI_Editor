@@ -4,15 +4,18 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+import app as app_module
 from app import TMP_JOBS_DIR, app
 from pipeline.state import (
     ControllerStatus,
     JobStatus,
+    clear_requested_user_input,
     mark_terminal,
     new_state,
     record_decision,
     save_state,
     set_controller_status,
+    set_latest_user_feedback,
     set_provider_status,
     set_requested_user_input,
 )
@@ -195,3 +198,70 @@ def test_process_video_url_surfaces_structured_provider_readiness_failure(monkey
     assert payload["status"] == "failed"
     assert payload["failure_code"] == "PROVIDER_READINESS_FAILED"
     assert payload["controller_status"] == "failed"
+
+
+def test_resume_endpoint_continues_existing_waiting_job(monkeypatch):
+    job_id = _job_id("api-resume")
+    resumed_message = "Continue. Prioritize rendering the current plan."
+    calls = []
+
+    def fake_run_job(resume_job_id, payload):
+        calls.append((resume_job_id, payload))
+        state = app_module.load_state(str(_job_dir(job_id)))
+        assert state is not None
+        clear_requested_user_input(state)
+        set_latest_user_feedback(state, resumed_message)
+        state.requirements = payload["requirements_state"]
+        state.request_payload = payload
+        save_state(str(_job_dir(job_id)), state)
+        return {
+            "success": False,
+            "status": "running",
+            "project_id": resume_job_id,
+            "job_status": "running",
+            "controller_status": "initializing",
+            "controller_status_category": "working",
+            "waiting_for_user_input": False,
+            "requested_user_input": {},
+        }
+
+    monkeypatch.setattr(app_module, "run_job", fake_run_job)
+
+    try:
+        state = _state(job_id)
+        state.request_payload = {
+            "primary_url": "https://example.com/ref.mp4",
+            "sources": [{"label": 1, "url": "https://example.com/source.mp4"}],
+            "prompt": "Make a polished highlight edit",
+            "music_mode": "original",
+            "requirements_state": {"edit_mode": "scene", "edit_requests": ["Initial direction"]},
+        }
+        set_requested_user_input(
+            state,
+            {
+                "reason": "max_loop_iterations",
+                "question": "Please confirm the next edit priority before I continue.",
+            },
+        )
+        save_state(str(_job_dir(job_id)), state)
+
+        response = client.post(f"/jobs/{job_id}/resume", json={"message": resumed_message})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["project_id"] == job_id
+        assert payload["job_status"] == "running"
+        assert payload["waiting_for_user_input"] is False
+        assert calls and calls[0][0] == job_id
+        assert calls[0][1]["requirements_state"]["edit_requests"][-1] == resumed_message
+        assert calls[0][1]["requirements_state"]["latest_user_feedback"] == resumed_message
+
+        reloaded = app_module.load_state(str(_job_dir(job_id)))
+        assert reloaded is not None
+        assert reloaded.waiting_for_user_input is False
+        assert reloaded.requested_user_input == {}
+        assert reloaded.latest_user_feedback == resumed_message
+        assert reloaded.requirements["edit_requests"][-1] == resumed_message
+        assert not (_job_dir(f"{job_id}-new")).exists()
+    finally:
+        _cleanup(job_id)

@@ -88,3 +88,19 @@ def test_executor_routes_vision_template_learning_through_new_stages(monkeypatch
         assert ctx.state.render_spec["canonical_timeline"][0]["duration"] == 1.0
     finally:
         shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_semantic_edit_disabled_is_silent(monkeypatch):
+    ctx = _ctx()
+    ctx.requirements["semantic_edit"] = {"enabled": False}
+    template_path = Path(ctx.dirs["plans"]) / "edit_template.json"
+    template_path.write_text(
+        '{"version":"0.1","fps":8.0,"total_duration":1.0,"slots":[],"global_style":{"avg_slot_duration":0.0,"rhythm":[],"pacing_label":"medium","dominant_transition":"cut"},"warnings":[]}',
+        encoding="utf-8",
+    )
+    try:
+        executor = PipelineExecutor()
+        executor._maybe_attach_semantic_edit(ctx, str(template_path))
+        assert not any(item.get("code") == "SEMANTIC_EDIT_DISABLED" for item in ctx.state.warnings)
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)

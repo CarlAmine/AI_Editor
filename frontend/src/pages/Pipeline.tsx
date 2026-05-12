@@ -308,6 +308,11 @@ export default function Pipeline() {
                 currentState={briefState}
                 onStateUpdate={setBriefState}
                 assistantEvent={assistantEvent}
+                activeJobId={displayResult?.project_id || null}
+                activeJobStatusCategory={displayResult?.controller_status_category || null}
+                onPipelineResult={(result) =>
+                  handleRenderResult(result as PipelineResult | null)
+                }
               />
             </div>
           </motion.div>

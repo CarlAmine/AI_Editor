@@ -2,6 +2,8 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+import torch
+
 from ai_editor.vision_template.frame_sampler import sample_video_frames
 from ai_editor.vision_template.model import OVERLAY_LABELS, TRANSITION_LABELS, TinyVisionEditModel
 from ai_editor.vision_template.synthetic_dataset import generate_synthetic_edit_sample
@@ -22,5 +24,9 @@ def test_tiny_vision_edit_model_output_shapes():
         assert output.transition_logits.shape == (steps, len(TRANSITION_LABELS))
         assert output.overlay_logits.shape == (steps, len(OVERLAY_LABELS))
         assert output.crop_params.shape == (steps, 4)
+        assert not torch.isnan(output.boundary_logits).any()
+
+        batched = model(sampled.frames.unsqueeze(0))
+        assert batched.boundary_logits.shape == (1, steps)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

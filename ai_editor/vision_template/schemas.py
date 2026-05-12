@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field
+
+try:  # pragma: no cover - import compatibility
+    from pydantic import model_validator
+except ImportError:  # pragma: no cover
+    model_validator = None
 
 MotionKind = Literal[
     "static",
@@ -32,18 +37,18 @@ class CropSpec(BaseModel):
     width: float = 1.0
     height: float = 1.0
 
-    @root_validator(skip_on_failure=True)
-    def _clamp(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        x = min(max(float(values.get("x", 0.0)), 0.0), 1.0)
-        y = min(max(float(values.get("y", 0.0)), 0.0), 1.0)
-        width = min(max(float(values.get("width", 1.0)), 1e-6), 1.0)
-        height = min(max(float(values.get("height", 1.0)), 1e-6), 1.0)
-        if x + width > 1.0:
-            x = max(0.0, 1.0 - width)
-        if y + height > 1.0:
-            y = max(0.0, 1.0 - height)
-        values.update({"x": x, "y": y, "width": width, "height": height})
-        return values
+    if model_validator:
+        @model_validator(mode="after")
+        def _clamp(self):
+            self.x = min(max(float(self.x), 0.0), 1.0)
+            self.y = min(max(float(self.y), 0.0), 1.0)
+            self.width = min(max(float(self.width), 1e-6), 1.0)
+            self.height = min(max(float(self.height), 1e-6), 1.0)
+            if self.x + self.width > 1.0:
+                self.x = max(0.0, 1.0 - self.width)
+            if self.y + self.height > 1.0:
+                self.y = max(0.0, 1.0 - self.height)
+            return self
 
 
 class MotionSpec(BaseModel):
@@ -59,13 +64,13 @@ class OverlaySpec(BaseModel):
     end_rel: float = 0.0
     mask_confidence: float = 0.0
 
-    @root_validator(skip_on_failure=True)
-    def _normalize(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        start_rel = min(max(float(values.get("start_rel", 0.0)), 0.0), 1.0)
-        end_rel = min(max(float(values.get("end_rel", 0.0)), start_rel), 1.0)
-        mask_confidence = min(max(float(values.get("mask_confidence", 0.0)), 0.0), 1.0)
-        values.update({"start_rel": start_rel, "end_rel": end_rel, "mask_confidence": mask_confidence})
-        return values
+    if model_validator:
+        @model_validator(mode="after")
+        def _normalize(self):
+            self.start_rel = min(max(float(self.start_rel), 0.0), 1.0)
+            self.end_rel = min(max(float(self.end_rel), self.start_rel), 1.0)
+            self.mask_confidence = min(max(float(self.mask_confidence), 0.0), 1.0)
+            return self
 
 
 class EditSlot(BaseModel):
@@ -80,23 +85,21 @@ class EditSlot(BaseModel):
     crop: CropSpec = Field(default_factory=CropSpec)
     overlay: Optional[OverlaySpec] = None
     style_vector: Optional[List[float]] = None
+    visible_objects: List[str] = Field(default_factory=list)
+    visible_layers: List[str] = Field(default_factory=list)
+    semantic_events: List[Dict[str, Any]] = Field(default_factory=list)
+    semantic_metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    @root_validator(skip_on_failure=True)
-    def _normalize(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        start = float(values.get("start", 0.0))
-        end = float(values.get("end", start))
-        duration = float(values.get("duration", 0.0))
-        if duration <= 0 and end > start:
-            duration = end - start
-        values.update(
-            {
-                "start": start,
-                "end": end,
-                "duration": duration,
-                "boundary_confidence": min(max(float(values.get("boundary_confidence", 0.0)), 0.0), 1.0),
-            }
-        )
-        return values
+    if model_validator:
+        @model_validator(mode="after")
+        def _normalize(self):
+            self.start = float(self.start)
+            self.end = float(self.end)
+            self.duration = float(self.duration)
+            if self.duration <= 0 and self.end > self.start:
+                self.duration = self.end - self.start
+            self.boundary_confidence = min(max(float(self.boundary_confidence), 0.0), 1.0)
+            return self
 
 
 class GlobalStyle(BaseModel):
@@ -192,6 +195,17 @@ def validate_monotonic_slots(template: EditTemplate) -> None:
 
 def validate_slot_mapping(template: EditTemplate, mapping: SlotMapping | Sequence[SlotMappingItem]) -> None:
     slot_items = mapping.items if isinstance(mapping, SlotMapping) else list(mapping)
+    seen_slot_ids = set()
+    duplicate_slot_ids = []
+    for item in slot_items:
+        slot_id = int(item.slot_id)
+        if slot_id in seen_slot_ids:
+            duplicate_slot_ids.append(slot_id)
+        seen_slot_ids.add(slot_id)
+    if duplicate_slot_ids:
+        duplicates = sorted(set(duplicate_slot_ids))
+        raise ValueError(f"Duplicate slot mapping entries found for slots: {duplicates}")
+
     by_id = {int(item.slot_id): item for item in slot_items}
     missing = [slot.slot_id for slot in template.slots if slot.slot_id not in by_id]
     if missing:
@@ -202,3 +216,13 @@ def validate_slot_mapping(template: EditTemplate, mapping: SlotMapping | Sequenc
             continue
         if not any([item.clip_id, item.clip_path, item.clip_url]):
             raise ValueError(f"Slot {slot.slot_id} mapping must include clip_id, clip_path, or clip_url.")
+        if item.source_start is not None and item.source_start < 0:
+            raise ValueError(f"Slot {slot.slot_id} source_start must be non-negative.")
+        if item.source_end is not None and item.source_end < 0:
+            raise ValueError(f"Slot {slot.slot_id} source_end must be non-negative.")
+        if (
+            item.source_start is not None
+            and item.source_end is not None
+            and float(item.source_end) <= float(item.source_start)
+        ):
+            raise ValueError(f"Slot {slot.slot_id} source_end must be greater than source_start.")

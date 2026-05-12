@@ -3,6 +3,10 @@
 from .analysis_schema import (
     AnalysisResult,
     AnalysisStatus,
+    EffectType,
+    MotionCurve,
+    MotionEffect,
+    MotionEffectManifest,
     OCRSpan,
     Scene,
     Segment,
@@ -11,6 +15,7 @@ from .analysis_schema import (
     TranscriptSpan,
     VideoMetadata,
 )
+from .motion_effect_analyzer import MotionEffectAnalyzer
 from .segment_builder import SegmentBuilder
 from .segment_scorer import SegmentScorer
 from .style_profiler import StyleProfiler
@@ -30,6 +35,11 @@ except Exception:  # pragma: no cover - optional runtime dependency
 __all__ = [
     "AnalysisResult",
     "AnalysisStatus",
+    "EffectType",
+    "MotionCurve",
+    "MotionEffect",
+    "MotionEffectAnalyzer",
+    "MotionEffectManifest",
     "OCRAnalyzer",
     "OCRSpan",
     "Scene",

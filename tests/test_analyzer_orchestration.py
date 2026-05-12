@@ -134,6 +134,7 @@ def test_video_edit_analyzer_orchestrates_sub_analyzers(monkeypatch):
     assert "visual_signature" in payload["segments"][0]
     assert payload["style_profile"]["scene_count"] == 1
     assert "pacing_label" in payload["style_profile"]
+    assert "motion_effects" in payload
 
 
 def test_transcript_analyzer_falls_back_gracefully(monkeypatch):
