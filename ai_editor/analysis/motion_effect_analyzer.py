@@ -18,9 +18,13 @@ from .analysis_schema import EffectType, MotionCurve, MotionEffect, MotionEffect
 log = logging.getLogger(__name__)
 
 _SHAKE_FREQ_MIN_HZ = 3.0
-_SHAKE_AMP_MIN_NORM = 0.008
-_ZOOM_SCALE_DELTA_MIN = 0.004
-_PAN_SMOOTHNESS_MAX = 0.30
+_SHAKE_AMP_MIN_NORM = 0.018
+_SHAKE_CONSISTENCY_MIN = 0.6
+_ZOOM_SCALE_DELTA_MIN = 0.006
+_ZOOM_TOTAL_CHANGE_MIN = 0.03
+_ZOOM_MONOTONIC_FRACTION_MIN = 0.65
+_PAN_ANGLE_STD_MAX = 0.6
+_PAN_DISPLACEMENT_MIN = 0.04
 _FREEZE_MOTION_MAX = 0.001
 _RESIDUAL_GLITCH_MIN = 8.0
 _RESIDUAL_SMEAR_MIN = 4.0
@@ -317,10 +321,14 @@ class MotionEffectAnalyzer:
                     offset_frac=round(offset_frac, 4),
                     intensity=round(intensity, 4),
                     curve=self._sub_curve(curve, span),
+                    metadata={
+                        "curve_frame_count": len(span),
+                        "reference_fps": fps,
+                    },
                 )
             )
 
-        if sc:
+        if sc and len(sc) >= 3:
             scale_deltas = [sc[i + 1] - sc[i] for i in range(len(sc) - 1)]
             zoom_in_frames = [i for i, delta in enumerate(scale_deltas) if delta > _ZOOM_SCALE_DELTA_MIN]
             zoom_out_frames = [i for i, delta in enumerate(scale_deltas) if delta < -_ZOOM_SCALE_DELTA_MIN]
@@ -330,7 +338,22 @@ class MotionEffectAnalyzer:
                     offset_frac = self._frame_frac(span[-1], fidx, fps, scene)
                     if (offset_frac - onset_frac) * duration < _MIN_EFFECT_DURATION_SEC:
                         continue
-                    total_scale_change = abs(sc[span[-1]] - sc[span[0]]) if span else 0.0
+                    span_scale = [sc[i] for i in span if i < len(sc)]
+                    if not span_scale:
+                        continue
+                    total_scale_change = abs(span_scale[-1] - span_scale[0])
+                    if total_scale_change < _ZOOM_TOTAL_CHANGE_MIN:
+                        continue
+                    span_deltas = [sc[i + 1] - sc[i] for i in span if i + 1 < len(sc)]
+                    if not span_deltas:
+                        continue
+                    if effect_type == EffectType.ZOOM_IN:
+                        monotonic_count = sum(1 for delta in span_deltas if delta > 0)
+                    else:
+                        monotonic_count = sum(1 for delta in span_deltas if delta < 0)
+                    monotonic_fraction = monotonic_count / len(span_deltas)
+                    if monotonic_fraction < _ZOOM_MONOTONIC_FRACTION_MIN:
+                        continue
                     effects.append(
                         MotionEffect(
                             shot_index=shot_index,
@@ -339,6 +362,10 @@ class MotionEffectAnalyzer:
                             offset_frac=round(offset_frac, 4),
                             intensity=round(min(total_scale_change / 0.3, 1.0), 4),
                             curve=self._sub_curve(curve, span),
+                            metadata={
+                                "total_scale_change": round(total_scale_change, 4),
+                                "monotonic_fraction": round(monotonic_fraction, 3),
+                            },
                         )
                     )
 
@@ -380,16 +407,47 @@ class MotionEffectAnalyzer:
         return effects
 
     def _detect_shake_frames(self, dx: List[float], dy: List[float], fps: float) -> List[int]:
-        if not dx or not np:
+        """
+        Detects frames belonging to an intentional shake effect.
+
+        Requirements (all must pass):
+        1. Peak amplitude >= _SHAKE_AMP_MIN_NORM
+        2. Global reversal frequency >= _SHAKE_FREQ_MIN_HZ
+        3. Sustained across enough sub-windows of the shot
+        """
+        if not dx or not np or len(dx) < 6:
             return []
 
         dx_arr = np.array(dx, dtype=np.float32)
         dy_arr = np.array(dy, dtype=np.float32)
+
+        peak_amp = float(np.max(np.abs(dx_arr))) + float(np.max(np.abs(dy_arr)))
+        if peak_amp < _SHAKE_AMP_MIN_NORM:
+            return []
+
         dx_reversals = np.where(np.diff(np.sign(dx_arr)) != 0)[0]
         duration_sec = len(dx) / max(fps, 1.0)
         reversal_freq = len(dx_reversals) / max(duration_sec, 0.01)
-        amplitude = float(np.max(np.abs(dx_arr))) + float(np.max(np.abs(dy_arr)))
-        if reversal_freq < _SHAKE_FREQ_MIN_HZ or amplitude < _SHAKE_AMP_MIN_NORM:
+        if reversal_freq < _SHAKE_FREQ_MIN_HZ:
+            return []
+
+        n = len(dx)
+        window_size = max(n // 4, 3)
+        windows_passed = 0
+        windows_total = 0
+        for start in range(0, n - window_size + 1, window_size):
+            end = min(start + window_size, n)
+            window = dx_arr[start:end]
+            w_reversals = len(np.where(np.diff(np.sign(window)) != 0)[0])
+            w_dur = len(window) / max(fps, 1.0)
+            w_freq = w_reversals / max(w_dur, 0.01)
+            windows_total += 1
+            if w_freq >= _SHAKE_FREQ_MIN_HZ * 0.7:
+                windows_passed += 1
+
+        if windows_total == 0:
+            return []
+        if (windows_passed / windows_total) < _SHAKE_CONSISTENCY_MIN:
             return []
 
         half_thresh = _SHAKE_AMP_MIN_NORM / 2.0
@@ -405,33 +463,42 @@ class MotionEffectAnalyzer:
         scene: Scene,
         duration: float,
     ) -> Optional[MotionEffect]:
-        del fps, scene, duration
+        del fps, duration
         if not np or len(dx) < 5:
             return None
 
         dx_arr = np.array(dx, dtype=np.float32)
         dy_arr = np.array(dy, dtype=np.float32)
-        mean_dx = float(np.mean(dx_arr))
-        mean_dy = float(np.mean(dy_arr))
-        total_displacement = abs(mean_dx) + abs(mean_dy)
-        if total_displacement < _SHAKE_AMP_MIN_NORM:
+
+        net_dx = float(np.sum(dx_arr))
+        net_dy = float(np.sum(dy_arr))
+        net_displacement = abs(net_dx) + abs(net_dy)
+        if net_displacement < _PAN_DISPLACEMENT_MIN:
             return None
 
-        velocity_variance = float(np.var(dx_arr) + np.var(dy_arr))
-        if velocity_variance > _PAN_SMOOTHNESS_MAX:
+        angles = np.arctan2(dy_arr, dx_arr)
+        angles_unwrapped = np.unwrap(angles)
+        angle_std = float(np.std(angles_unwrapped))
+        if angle_std > _PAN_ANGLE_STD_MAX:
             return None
 
+        intensity = round(min(net_displacement / 0.15, 1.0), 4)
         return MotionEffect(
             shot_index=shot_index,
             effect_type=EffectType.PAN,
             onset_frac=0.0,
             offset_frac=1.0,
-            intensity=round(min(total_displacement * 20.0, 1.0), 4),
+            intensity=intensity,
             curve=MotionCurve(
                 dx_norm=list(dx),
                 dy_norm=list(dy),
                 frame_indices=list(fidx),
             ),
+            metadata={
+                "net_dx_norm": round(net_dx, 4),
+                "net_dy_norm": round(net_dy, 4),
+                "angle_std_rad": round(angle_std, 4),
+            },
         )
 
     def _frame_frac(self, curve_idx: int, frame_indices: List[int], fps: float, scene: Scene) -> float:

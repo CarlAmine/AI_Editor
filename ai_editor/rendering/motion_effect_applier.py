@@ -53,6 +53,9 @@ class MotionEffectApplier:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*fourcc), fps, (width, height))
+        clip_duration_sec = n_frames / max(fps, 1.0)
+        for effect in active_effects:
+            effect.metadata["clip_duration_sec"] = clip_duration_sec
 
         frozen_frame = None
         try:
@@ -122,7 +125,25 @@ class MotionEffectApplier:
         return result, current_frozen
 
     def _apply_shake(self, frame: Any, local_frac: float, effect: MotionEffect, width: int, height: int) -> Any:
-        dx_px, dy_px = self._sample_curve(effect.curve, local_frac, width, height)
+        dx_list = effect.curve.dx_norm
+        dy_list = effect.curve.dy_norm
+        if not dx_list:
+            return frame
+
+        curve_frame_count = int(effect.metadata.get("curve_frame_count", len(dx_list)))
+        ref_fps = float(effect.metadata.get("reference_fps", 25.0))
+        window_duration = max(effect.offset_frac - effect.onset_frac, 1e-6)
+        clip_duration = float(effect.metadata.get("clip_duration_sec", window_duration))
+        effect_duration_sec = window_duration * clip_duration
+        elapsed_sec = local_frac * effect_duration_sec
+        curve_frame_idx = int(elapsed_sec * ref_fps)
+        if curve_frame_idx >= curve_frame_count or curve_frame_idx >= len(dx_list):
+            return frame
+
+        dx_norm = dx_list[min(curve_frame_idx, len(dx_list) - 1)]
+        dy_norm = dy_list[min(curve_frame_idx, len(dy_list) - 1)] if dy_list else 0.0
+        dx_px = dx_norm * width
+        dy_px = dy_norm * height
         dx_px = max(-width * 0.05, min(width * 0.05, dx_px))
         dy_px = max(-height * 0.05, min(height * 0.05, dy_px))
         matrix = np.float32([[1, 0, dx_px], [0, 1, dy_px]])

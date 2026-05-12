@@ -1544,27 +1544,64 @@ class PipelineExecutor:
         ctx: ExecutionContext,
         render_spec: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Applies motion effects from the manifest to each clip in the canonical
+        timeline using scene_id -> shot_index alignment.
+        """
         if not ctx.state.motion_effects_path or not ctx.state.is_vision_mode():
             return render_spec
         canonical_timeline = list(render_spec.get("canonical_timeline") or [])
         if not canonical_timeline or not os.path.exists(ctx.state.motion_effects_path):
             return render_spec
 
-        manifest = MotionEffectManifest.from_dict(self._load_json_if_exists(ctx.state.motion_effects_path))
+        manifest = MotionEffectManifest.from_dict(
+            self._load_json_if_exists(ctx.state.motion_effects_path)
+        )
+        effects_by_shot: Dict[int, List[Any]] = {}
+        for effect in manifest.effects:
+            if effect.effect_type.value == "static":
+                continue
+            effects_by_shot.setdefault(effect.shot_index, []).append(effect)
+
+        if not effects_by_shot:
+            log.debug("No non-static effects in manifest; skipping motion effect application")
+            return render_spec
+
         applier = MotionEffectApplier()
         updated_timeline: List[Dict[str, Any]] = []
         stylized_count = 0
 
-        for index, row in enumerate(canonical_timeline):
+        for row in canonical_timeline:
             entry = dict(row)
             clip_path = str(entry.get("video_src") or entry.get("videoSrc") or "").strip()
+            scene_id = entry.get("scene_id")
+            if scene_id is not None:
+                shot_index = int(scene_id) - 1
+            else:
+                shot_index = int(entry.get("index", 1)) - 1
+
+            if shot_index not in effects_by_shot:
+                updated_timeline.append(entry)
+                continue
             if not clip_path or _is_http_url(clip_path) or not os.path.exists(clip_path):
                 updated_timeline.append(entry)
                 continue
 
             base, ext = os.path.splitext(clip_path)
             output_path = f"{base}_stylized{ext or '.mp4'}"
-            applied_path = applier.apply_to_clip(clip_path, index, manifest, output_path)
+
+            shot_manifest = MotionEffectManifest(
+                video_path=manifest.video_path,
+                fps=manifest.fps,
+                total_frames=manifest.total_frames,
+                effects=effects_by_shot[shot_index],
+                rhythm_pattern=manifest.rhythm_pattern,
+                global_motion_budget=manifest.global_motion_budget,
+            )
+            for effect in shot_manifest.effects:
+                effect.shot_index = 0
+
+            applied_path = applier.apply_to_clip(clip_path, 0, shot_manifest, output_path)
             entry["video_src"] = applied_path
             entry["videoSrc"] = applied_path
             if applied_path != clip_path:
@@ -1572,6 +1609,7 @@ class PipelineExecutor:
                 entry.setdefault("metadata", {})
                 entry["metadata"]["motion_effects_applied"] = True
                 entry["metadata"]["original_video_src"] = clip_path
+                entry["metadata"]["shot_index_used"] = shot_index
             updated_timeline.append(entry)
 
         updated_spec = dict(render_spec)
