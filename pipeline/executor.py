@@ -1692,6 +1692,88 @@ class PipelineExecutor:
                 },
             )
 
+    def _get_edit_operations_from_state(self, ctx: ExecutionContext) -> List[EditOperation]:
+        """
+        Returns EditOperation objects from the current job state.
+
+        Priority order:
+        1. state.parsed_operations — freshly parsed by IntentParser this turn
+        2. state.edit_requests     — accumulated history (may be dicts or legacy strings)
+        """
+        from ai_editor.editing.edit_operations import EditOperation, TimeWindowTarget
+        from ai_editor.editing.instruction_parser import InstructionParser
+
+        operations: List[EditOperation] = []
+
+        # 1. Freshly parsed operations from this turn (already EditOperation dicts)
+        parsed = ctx.state.get("parsed_operations") or []
+        for item in parsed:
+            if isinstance(item, dict) and item.get("operation"):
+                try:
+                    tw_raw = item.get("time_window")
+                    tw = None
+                    if isinstance(tw_raw, dict):
+                        tw = TimeWindowTarget(
+                            start=tw_raw.get("start"),
+                            end=tw_raw.get("end"),
+                            label=str(tw_raw.get("label") or "global"),
+                        )
+                    operations.append(EditOperation(
+                        operation=str(item.get("operation") or "custom"),
+                        target=item.get("target"),
+                        value=item.get("value"),
+                        intensity=float(item.get("intensity") or 1.0),
+                        scope=str(item.get("scope") or "global"),
+                        time_window=tw,
+                        source_target=item.get("source_target"),
+                        segment_target=item.get("segment_target"),
+                        section_label=item.get("section_label"),
+                        position=item.get("position"),
+                        metadata=dict(item.get("metadata") or {}),
+                    ))
+                except Exception as exc:
+                    log.warning("Executor: failed to reconstruct EditOperation from %r: %s", item, exc)
+
+        if operations:
+            return operations
+
+        # 2. Fall back to accumulated edit_requests history
+        # Handles both new-style dicts and legacy strings
+        _parser = InstructionParser()
+        for request in (ctx.state.get("edit_requests") or []):
+            if isinstance(request, dict) and request.get("operation"):
+                # New-style dict — reconstruct directly (same as above)
+                try:
+                    tw_raw = request.get("time_window")
+                    tw = None
+                    if isinstance(tw_raw, dict):
+                        tw = TimeWindowTarget(
+                            start=tw_raw.get("start"),
+                            end=tw_raw.get("end"),
+                            label=str(tw_raw.get("label") or "global"),
+                        )
+                    operations.append(EditOperation(
+                        operation=str(request.get("operation") or "custom"),
+                        target=request.get("target"),
+                        value=request.get("value"),
+                        intensity=float(request.get("intensity") or 1.0),
+                        scope=str(request.get("scope") or "global"),
+                        time_window=tw,
+                        source_target=request.get("source_target"),
+                        segment_target=request.get("segment_target"),
+                        section_label=request.get("section_label"),
+                        position=request.get("position"),
+                        metadata=dict(request.get("metadata") or {}),
+                    ))
+                except Exception:
+                    pass
+            elif isinstance(request, str) and request.strip():
+                # Legacy string format — parse with InstructionParser
+                parsed_legacy = _parser.parse(request)
+                operations.extend(parsed_legacy)
+
+        return operations
+
     def _apply_edit_requests(
         self,
         ctx: ExecutionContext,
@@ -1710,14 +1792,17 @@ class PipelineExecutor:
         )
         processed_requests: List[str] = []
         unstructured_requests: List[str] = []
+        
+        operations = self._get_edit_operations_from_state(ctx)
 
-        for request in requests:
-            operations = self.instruction_parser.parse(request)
-            processed_requests.append(request)
-            if not operations:
+        if not operations:
+            for request in requests:
                 unstructured_requests.append(request)
-                continue
-            session.apply_operations(operations, raw_instruction=request)
+        else:
+            for request in requests:
+                processed_requests.append(request)
+            for operation in operations:
+                session.apply_operations([operation], raw_instruction=operation.operation)
 
         if processed_requests:
             mark_edit_requests_applied(ctx.state, processed_requests)
