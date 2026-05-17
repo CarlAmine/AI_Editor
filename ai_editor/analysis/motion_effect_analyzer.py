@@ -79,6 +79,10 @@ class MotionEffectAnalyzer:
             shot_curve = self._slice_curve(raw_curves, scene, fps)
             effects.extend(self._classify_shot(shot_idx, shot_curve, fps, scene))
 
+        from .transition_analyzer import TransitionAnalyzer as _TransitionAnalyzer
+
+        transitions = _TransitionAnalyzer().analyze(video_path, scenes)
+
         all_dx = raw_curves.get("dx_norm", [])
         all_dy = raw_curves.get("dy_norm", [])
         if all_dx and all_dy:
@@ -93,6 +97,7 @@ class MotionEffectAnalyzer:
             fps=fps,
             total_frames=total_frames,
             effects=effects,
+            transitions_detected=transitions,
             rhythm_pattern=[round(float(scene.duration), 4) for scene in scenes],
             global_motion_budget=round(global_motion_budget, 6),
         )

@@ -10,10 +10,13 @@ import torch
 from . import VisionTemplateError
 from .decode_template import decode_edit_template
 from .frame_sampler import sample_video_frames
-from .losses import compute_reference_adaptation_loss, compute_supervised_synthetic_loss
 from .model import build_vision_edit_model, save_model_or_adapter
 from .schemas import EditTemplate, TrainingSummary
-from .synthetic_dataset import SyntheticEditDataset
+from scripts.generate_synthetic import SyntheticEditDataset
+from scripts.vision_template_losses import (
+    compute_reference_adaptation_loss,
+    compute_supervised_synthetic_loss,
+)
 
 
 @dataclass

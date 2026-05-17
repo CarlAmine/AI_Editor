@@ -7,6 +7,8 @@ from .analysis_schema import (
     MotionCurve,
     MotionEffect,
     MotionEffectManifest,
+    TransitionEvent,
+    TransitionType,
     OCRSpan,
     Scene,
     Segment,
@@ -16,10 +18,9 @@ from .analysis_schema import (
     VideoMetadata,
 )
 from .motion_effect_analyzer import MotionEffectAnalyzer
-from .segment_builder import SegmentBuilder
-from .segment_scorer import SegmentScorer
+from .segment_builder import SegmentBuilder, SegmentScorer
 from .style_profiler import StyleProfiler
-from .transcript_analyzer import TranscriptAnalyzer
+from .transition_analyzer import TransitionAnalyzer
 from .visual_signature import VisualSignatureAnalyzer
 
 try:
@@ -40,6 +41,9 @@ __all__ = [
     "MotionEffect",
     "MotionEffectAnalyzer",
     "MotionEffectManifest",
+    "TransitionAnalyzer",
+    "TransitionEvent",
+    "TransitionType",
     "OCRAnalyzer",
     "OCRSpan",
     "Scene",
@@ -49,7 +53,6 @@ __all__ = [
     "Segment",
     "StyleProfile",
     "StyleProfiler",
-    "TranscriptAnalyzer",
     "TranscriptResult",
     "TranscriptSpan",
     "VideoMetadata",

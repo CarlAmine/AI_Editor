@@ -1255,7 +1255,7 @@ class PipelineExecutor:
         return canonical_timeline, overlay_timing, edit_summary, edit_ops
 
     def _stage_shotstack_render(self, ctx: ExecutionContext) -> None:
-        from ai_editor.editor import create_and_render_video
+        from ai_editor.shotstack_renderer import create_and_render_video
 
         shotstack_key = str(os.getenv("SHOTSTACK_KEY", "") or "").strip()
         if not shotstack_key:
@@ -1611,6 +1611,28 @@ class PipelineExecutor:
                 entry["metadata"]["original_video_src"] = clip_path
                 entry["metadata"]["shot_index_used"] = shot_index
             updated_timeline.append(entry)
+
+        if manifest.transitions_detected:
+            for transition in manifest.transitions_detected:
+                out_idx = transition.outgoing_shot_index
+                in_idx = transition.incoming_shot_index
+
+                if out_idx < len(updated_timeline):
+                    row = updated_timeline[out_idx]
+                    clip = str(row.get("video_src") or "").strip()
+                    if clip and not _is_http_url(clip) and os.path.exists(clip):
+                        base, ext = os.path.splitext(clip)
+                        tail_out = f"{base}_trans_tail{ext or '.mp4'}"
+                        applied = applier.apply_transition_to_clip(clip, transition, tail_out, position="end")
+                        if applied != clip:
+                            updated_timeline[out_idx]["video_src"] = applied
+                            updated_timeline[out_idx]["videoSrc"] = applied
+                            updated_timeline[out_idx].setdefault("metadata", {})
+                            updated_timeline[out_idx]["metadata"]["transition_out"] = transition.transition_type.value
+
+                if in_idx < len(updated_timeline):
+                    updated_timeline[in_idx].setdefault("metadata", {})
+                    updated_timeline[in_idx]["metadata"]["transition_in"] = transition.transition_type.value
 
         updated_spec = dict(render_spec)
         updated_spec["canonical_timeline"] = updated_timeline

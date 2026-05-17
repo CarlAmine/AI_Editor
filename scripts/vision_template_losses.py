@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
-from .model import VisionEditOutput
+from ai_editor.vision_template.model import VisionEditOutput
 
 
 def _finite(value: torch.Tensor) -> torch.Tensor:

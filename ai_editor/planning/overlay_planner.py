@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from ai_editor.ai_client import chat_json, get_active_model_name
+from ai_editor.llm_client import chat_json, get_active_model_name
 
 
 def generate_overlay_plan(

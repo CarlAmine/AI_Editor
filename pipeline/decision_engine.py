@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
 
-from ai_editor.ai_client import chat_json
+from ai_editor.llm_client import chat_json
 from .provider_errors import ProviderFailure
 
 from .state import JobState, build_decision_state_snapshot

@@ -201,3 +201,87 @@ class MotionEffectApplier:
         dx_norm = dx_list[idx_lo] * (1 - t) + dx_list[idx_hi] * t
         dy_norm = (dy_list[idx_lo] * (1 - t) + dy_list[idx_hi] * t) if dy_list else 0.0
         return dx_norm * width, dy_norm * height
+
+    def apply_transition_to_clip(
+        self,
+        clip_path: str,
+        transition: Any,
+        output_path: str,
+        position: str = "end",
+        fourcc: str = "mp4v",
+    ) -> str:
+        from ai_editor.analysis.analysis_schema import TransitionType
+
+        del position
+        transition_type = transition.transition_type
+        n_frames = max(1, transition.duration_frames)
+
+        if transition_type in (
+            TransitionType.HARD_CUT,
+            TransitionType.CROSS_DISSOLVE,
+            TransitionType.ZOOM_PUNCH,
+            TransitionType.UNKNOWN,
+        ):
+            return clip_path
+        if not _CV2_AVAILABLE:
+            return clip_path
+
+        cap = cv2.VideoCapture(clip_path)
+        if not cap.isOpened():
+            return clip_path
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+
+        if not frames:
+            return clip_path
+
+        if transition_type in (TransitionType.FADE_TO_BLACK, TransitionType.FADE_TO_WHITE):
+            target = 0 if transition_type == TransitionType.FADE_TO_BLACK else 255
+            for index in range(min(n_frames, len(frames))):
+                frame_index = len(frames) - n_frames + index
+                if frame_index < 0:
+                    continue
+                alpha = index / max(n_frames - 1, 1)
+                frames[frame_index] = cv2.addWeighted(
+                    frames[frame_index],
+                    1.0 - alpha,
+                    np.full_like(frames[frame_index], target),
+                    alpha,
+                    0,
+                )
+        elif transition_type in (TransitionType.FADE_FROM_BLACK, TransitionType.FADE_FROM_WHITE):
+            source = 0 if transition_type == TransitionType.FADE_FROM_BLACK else 255
+            for index in range(min(n_frames, len(frames))):
+                alpha = index / max(n_frames - 1, 1)
+                frames[index] = cv2.addWeighted(
+                    frames[index],
+                    alpha,
+                    np.full_like(frames[index], source),
+                    1.0 - alpha,
+                    0,
+                )
+        elif transition_type == TransitionType.WHIP_PAN:
+            blur_size = max(int(transition.intensity * 31), 3) | 1
+            kernel = np.zeros((blur_size, blur_size), dtype=np.float32)
+            kernel[blur_size // 2, :] = 1.0 / blur_size
+            for index in range(min(n_frames, len(frames))):
+                frame_index = len(frames) - n_frames + index
+                if frame_index >= 0:
+                    frames[frame_index] = cv2.filter2D(frames[frame_index], -1, kernel)
+        elif transition_type == TransitionType.FLASH_CUT:
+            frames[-1] = np.full_like(frames[-1], 255)
+
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*fourcc), fps, (width, height))
+        for frame in frames:
+            writer.write(frame)
+        writer.release()
+        return output_path

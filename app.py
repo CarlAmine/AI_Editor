@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from typing import Any, Dict, Optional, List
 from urllib.parse import parse_qs, urlparse
 
-from ai_editor.pipeline import Assemble_Pipeline
 from ai_editor.chatbot_interface import process_ui_turn
 from ai_editor.google_auth import (
     build_drive_service_oauth,
@@ -46,6 +45,40 @@ TMP_JOBS_DIR = APP_DIR / "tmp" / "jobs"
 TMP_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(TMP_JOBS_DIR)), name="files")
 DRIVE_OAUTH_PENDING = {}
+
+
+def _assemble_pipeline(
+    *,
+    primary_url: str,
+    sources: Optional[List[Dict[str, Any]]] = None,
+    prompt: str = "",
+    music_mode: str = "original",
+    custom_music_url: Optional[str] = None,
+    custom_music_start: Optional[float] = None,
+    custom_music_end: Optional[float] = None,
+    custom_music_segment: Optional[Dict[str, Any]] = None,
+    custom_music_segments: Optional[List[Dict[str, Any]]] = None,
+    requirements_state: Optional[Dict[str, Any]] = None,
+    job_id: Optional[str] = None,
+    gdrive_folder_id: Optional[str] = None,
+    slot_mapping: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "primary_url": primary_url,
+        "sources": sources or [],
+        "prompt": prompt,
+        "music_mode": music_mode,
+        "custom_music_url": custom_music_url,
+        "custom_music_start": custom_music_start,
+        "custom_music_end": custom_music_end,
+        "custom_music_segment": custom_music_segment,
+        "custom_music_segments": custom_music_segments,
+        "requirements_state": requirements_state or {},
+        "gdrive_folder_id": gdrive_folder_id,
+        "slot_mapping": slot_mapping or [],
+    }
+    resolved_job_id = str(job_id or f"job_{int(time.time() * 1000)}")
+    return run_job(resolved_job_id, payload)
 
 
 def _find_frontend_dist() -> Optional[Path]:
@@ -292,7 +325,7 @@ async def process_video_url(request: ProcessVideoURLRequest):
         if request.edit_mode and not requirements_state.get("edit_mode"):
             requirements_state["edit_mode"] = request.edit_mode
 
-        result = Assemble_Pipeline(
+        result = _assemble_pipeline(
             primary_url=request.primary_url,
             sources=sources_list,
             prompt=request.prompt,

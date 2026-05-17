@@ -1,5 +1,5 @@
 from ai_editor.analysis.analysis_schema import Segment, VideoMetadata
-from ai_editor.analysis.segment_scorer import SegmentScorer
+from ai_editor.analysis.segment_builder import SegmentScorer
 
 
 def test_segment_scores_are_deterministic_and_populated():

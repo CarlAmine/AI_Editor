@@ -152,6 +152,42 @@ class EffectType(str, Enum):
     STATIC = "static"
 
 
+class TransitionType(str, Enum):
+    HARD_CUT = "hard_cut"
+    FADE_TO_BLACK = "fade_to_black"
+    FADE_FROM_BLACK = "fade_from_black"
+    FADE_TO_WHITE = "fade_to_white"
+    FADE_FROM_WHITE = "fade_from_white"
+    CROSS_DISSOLVE = "cross_dissolve"
+    ZOOM_PUNCH = "zoom_punch"
+    WHIP_PAN = "whip_pan"
+    FLASH_CUT = "flash_cut"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class TransitionEvent:
+    """
+    A detected transition between two consecutive shots.
+    Stored in MotionEffectManifest.transitions_detected.
+    """
+
+    boundary_frame_index: int
+    outgoing_shot_index: int
+    incoming_shot_index: int
+    transition_type: TransitionType
+    duration_frames: int
+    duration_sec: float
+    intensity: float
+    luminance_curve: List[float] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["transition_type"] = self.transition_type.value
+        return payload
+
+
 @dataclass
 class MotionEffect:
     """
@@ -189,6 +225,7 @@ class MotionEffectManifest:
     fps: float
     total_frames: int
     effects: List[MotionEffect] = field(default_factory=list)
+    transitions_detected: List[TransitionEvent] = field(default_factory=list)
     rhythm_pattern: List[float] = field(default_factory=list)
     global_motion_budget: float = 0.0
 
@@ -198,6 +235,7 @@ class MotionEffectManifest:
             "fps": self.fps,
             "total_frames": self.total_frames,
             "effects": [effect.to_dict() for effect in self.effects],
+            "transitions_detected": [transition.to_dict() for transition in self.transitions_detected],
             "rhythm_pattern": self.rhythm_pattern,
             "global_motion_budget": self.global_motion_budget,
         }
@@ -226,11 +264,27 @@ class MotionEffectManifest:
                     metadata=dict(effect_data.get("metadata") or {}),
                 )
             )
+        transitions_detected: List[TransitionEvent] = []
+        for transition_data in data.get("transitions_detected", []):
+            transitions_detected.append(
+                TransitionEvent(
+                    boundary_frame_index=int(transition_data.get("boundary_frame_index", 0)),
+                    outgoing_shot_index=int(transition_data.get("outgoing_shot_index", 0)),
+                    incoming_shot_index=int(transition_data.get("incoming_shot_index", 0)),
+                    transition_type=TransitionType(transition_data.get("transition_type", "hard_cut")),
+                    duration_frames=int(transition_data.get("duration_frames", 1)),
+                    duration_sec=float(transition_data.get("duration_sec", 0.0)),
+                    intensity=float(transition_data.get("intensity", 0.0)),
+                    luminance_curve=list(transition_data.get("luminance_curve", [])),
+                    metadata=dict(transition_data.get("metadata") or {}),
+                )
+            )
         return cls(
             video_path=data.get("video_path", ""),
             fps=float(data.get("fps", 0.0)),
             total_frames=int(data.get("total_frames", 0)),
             effects=effects,
+            transitions_detected=transitions_detected,
             rhythm_pattern=list(data.get("rhythm_pattern", [])),
             global_motion_budget=float(data.get("global_motion_budget", 0.0)),
         )

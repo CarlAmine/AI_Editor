@@ -4,7 +4,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .schemas import EditTemplate
+from ai_editor.vision_template.schemas import EditTemplate
 
 
 def _durations(template: EditTemplate) -> list[float]:

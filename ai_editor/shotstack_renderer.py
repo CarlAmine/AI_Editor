@@ -8,25 +8,45 @@ import re
 from datetime import datetime
 from typing import List, Dict, Optional, Union, Any
 from dataclasses import dataclass, asdict
-import shotstack_sdk as shotstack
-from shotstack_sdk.api import edit_api
-from shotstack_sdk.model.soundtrack import Soundtrack
-from shotstack_sdk.model.video_asset import VideoAsset
-from shotstack_sdk.model.html_asset import HtmlAsset
-from shotstack_sdk.model.clip import Clip
-from shotstack_sdk.model.track import Track
-from shotstack_sdk.model.timeline import Timeline
-from shotstack_sdk.model.output import Output
-from shotstack_sdk.model.edit import Edit
-from shotstack_sdk.model.transition import Transition
-from shotstack_sdk.model.offset import Offset
-from shotstack_sdk.rest import ApiException
+try:
+    import shotstack_sdk as shotstack
+    from shotstack_sdk.api import edit_api
+    from shotstack_sdk.model.soundtrack import Soundtrack
+    from shotstack_sdk.model.video_asset import VideoAsset
+    from shotstack_sdk.model.html_asset import HtmlAsset
+    from shotstack_sdk.model.clip import Clip
+    from shotstack_sdk.model.track import Track
+    from shotstack_sdk.model.timeline import Timeline
+    from shotstack_sdk.model.output import Output
+    from shotstack_sdk.model.edit import Edit
+    from shotstack_sdk.model.transition import Transition
+    from shotstack_sdk.model.offset import Offset
+    from shotstack_sdk.rest import ApiException
+except Exception:  # pragma: no cover - optional SDK in test environments
+    shotstack = None  # type: ignore
+    edit_api = None  # type: ignore
+    Soundtrack = VideoAsset = HtmlAsset = Clip = Track = Timeline = Output = Edit = Transition = Offset = object  # type: ignore
+
+    class ApiException(Exception):
+        pass
 
 MIN_TEXT_DURATION = 1.2
 SAFE_OFFSET_LIMIT = 0.8
 
 SHOTSTACK_STAGE_HOST = "https://api.shotstack.io/stage"
 SHOTSTACK_PRODUCTION_HOST = "https://api.shotstack.io/production"
+_SHOTSTACK_TRANSITION_MAP = {
+    "cross_dissolve": "fade",
+    "fade_to_black": "fade",
+    "fade_from_black": "fade",
+    "fade_to_white": "fade",
+    "fade_from_white": "fade",
+    "zoom_punch": "zoom",
+    "whip_pan": "slideLeft",
+    "flash_cut": "fade",
+    "hard_cut": None,
+    "unknown": None,
+}
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -789,6 +809,20 @@ def create_and_render_video(
     current_time = 0.0
     for i, clip in enumerate(clips):
         start_time = float(clip.start_time) if use_canonical_timeline else float(current_time)
+        transition_value = None if use_canonical_timeline else _get_transition(i, len(clips))
+        if use_canonical_timeline and canonical_timeline and i < len(canonical_timeline):
+            row = canonical_timeline[i]
+            metadata = row.get("metadata") or {}
+            transition_in_type = metadata.get("transition_in")
+            transition_out_type = metadata.get("transition_out")
+            mapped_in = _SHOTSTACK_TRANSITION_MAP.get(str(transition_in_type or ""), None)
+            mapped_out = _SHOTSTACK_TRANSITION_MAP.get(str(transition_out_type or ""), None)
+            existing_in = row.get("transitionIn")
+            existing_out = row.get("transitionOut")
+            transition_in = mapped_in if transition_in_type is not None else existing_in
+            transition_out = mapped_out if transition_out_type is not None else existing_out
+            if transition_in or transition_out:
+                transition_value = {"in": transition_in, "out": transition_out}
         video_clip_specs.append(
             {
                 "asset": {"type": "video", "src": clip.url, "trim": float(clip.trim_start)},
@@ -796,7 +830,7 @@ def create_and_render_video(
                 "length": float(clip.duration),
                 "fit": "cover",
                 "position": "center",
-                "transition": None if use_canonical_timeline else _get_transition(i, len(clips)),
+                "transition": transition_value,
             }
         )
         current_time += float(clip.duration)

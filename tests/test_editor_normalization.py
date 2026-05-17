@@ -1,4 +1,4 @@
-from ai_editor.editor import (
+from ai_editor.shotstack_renderer import (
     MIN_TEXT_DURATION,
     normalize_text_clips,
     normalize_tracks,

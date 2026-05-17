@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-from ai_editor.vision_template.real_benchmark import discover_real_benchmark_cases, run_real_benchmark_suite
-from ai_editor.vision_template.synthetic_dataset import generate_synthetic_edit_sample
+from scripts.benchmark_real import discover_real_benchmark_cases, run_real_benchmark_suite
+from scripts.generate_synthetic import SyntheticEditDataset, build_frame_targets_from_template, generate_synthetic_edit_sample
 
 
 def _temp_dir(name: str) -> Path:
@@ -20,7 +20,7 @@ def _build_benchmark_case(root: Path, case_name: str = "example_001") -> Path:
     case_dir.mkdir(parents=True, exist_ok=True)
     synth_dir = case_dir / "_synth"
     synth_dir.mkdir(parents=True, exist_ok=True)
-    reference_path, template = generate_synthetic_edit_sample(str(synth_dir), num_slots=3, fps=8, size=(96, 96), seed=7)
+    reference_path, _template = generate_synthetic_edit_sample(str(synth_dir), num_slots=3, fps=8, size=(96, 96), seed=7)
     shutil.copy(reference_path, case_dir / "reference.mp4")
     shutil.copy(synth_dir / "slot_mapping.json", case_dir / "slot_mapping.json")
     shutil.copy(synth_dir / "ground_truth_template.json", case_dir / "ground_truth_template.json")
@@ -28,6 +28,112 @@ def _build_benchmark_case(root: Path, case_name: str = "example_001") -> Path:
         shutil.copy(clip_path, case_dir / clip_path.name)
     (case_dir / "notes.md").write_text("benchmark notes", encoding="utf-8")
     return case_dir
+
+
+def test_generate_synthetic_edit_sample():
+    tmp_dir = _temp_dir("vision-synth")
+    try:
+        reference_path, template = generate_synthetic_edit_sample(str(tmp_dir), num_slots=4, fps=10, seed=7)
+
+        assert reference_path.endswith("reference.mp4")
+        assert (tmp_dir / "reference.mp4").exists()
+        assert (tmp_dir / "ground_truth_template.json").exists()
+        assert (tmp_dir / "slot_mapping.json").exists()
+        assert len(template.slots) == 4
+        assert all(slot.duration > 0 for slot in template.slots)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_synthetic_edit_dataset_returns_training_labels():
+    tmp_dir = _temp_dir("vision-dataset")
+    try:
+        dataset = SyntheticEditDataset(out_dir=str(tmp_dir), num_slots=3, fps=8, seed=11)
+        sample = dataset[0]
+
+        assert sample["frames"].shape[1] == 3
+        assert sample["boundary_labels"].shape[0] == sample["frames"].shape[0]
+        assert sample["ground_truth_template"].total_duration > 0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_boundary_targets_align_with_synthetic_template():
+    tmp_dir = _temp_dir("vision-boundaries")
+    try:
+        dataset = SyntheticEditDataset(out_dir=str(tmp_dir), num_slots=4, fps=8, seed=13)
+        sample = dataset[0]
+        targets = build_frame_targets_from_template(dataset.sampled, dataset.template)
+        peaks = [index for index, value in enumerate(targets["boundary"].tolist()) if value >= 0.99]
+
+        assert len(peaks) == 3
+        assert sample["slot_id_per_frame"].shape[0] == sample["frames"].shape[0]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_vision_template_cli_smoke_demo():
+    out_dir = Path("tmp") / "tests" / f"vision-cli-{uuid4().hex[:8]}"
+    try:
+        cmd = [
+            sys.executable,
+            "-m",
+            "scripts.vision_template_cli",
+            "smoke-demo",
+            "--out",
+            str(out_dir),
+            "--num-slots",
+            "4",
+            "--epochs",
+            "2",
+            "--fps",
+            "8",
+            "--size",
+            "96",
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        assert (out_dir / "edit_template.json").exists()
+        assert (out_dir / "canonical_timeline.json").exists()
+        assert (out_dir / "training_summary.json").exists()
+        assert (out_dir / "metrics.json").exists()
+        metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+        assert "slot_count_error" in metrics
+        assert "boundary_precision_05s" in metrics
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def test_vision_template_cli_quality_demo_structural_smoke():
+    out_dir = Path("tmp") / "tests" / f"vision-quality-{uuid4().hex[:8]}"
+    try:
+        cmd = [
+            sys.executable,
+            "-m",
+            "scripts.vision_template_cli",
+            "quality-demo",
+            "--out",
+            str(out_dir),
+            "--num-slots",
+            "4",
+            "--pretrain-samples",
+            "8",
+            "--pretrain-epochs",
+            "1",
+            "--adapt-epochs",
+            "3",
+            "--fps",
+            "8",
+            "--size",
+            "96",
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        assert (out_dir / "edit_template.json").exists()
+        assert (out_dir / "ground_truth_template.json").exists()
+        assert (out_dir / "boundary_debug.json").exists()
+        assert (out_dir / "metrics.json").exists()
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def test_benchmark_discovery_finds_cases():
@@ -81,7 +187,7 @@ def test_eval_real_cli_on_synthetic_benchmark_produces_outputs():
         cmd = [
             sys.executable,
             "-m",
-            "ai_editor.vision_template.cli",
+            "scripts.vision_template_cli",
             "eval-real",
             "--benchmark-dir",
             str(tmp_dir),

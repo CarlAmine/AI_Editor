@@ -2,7 +2,7 @@ import json
 import re
 from typing import Dict, List
 
-from ai_editor.ai_client import chat_json, chat_text, get_active_model_name
+from ai_editor.llm_client import chat_json, chat_text, get_active_model_name
 
 REQUIRED_FIELDS = [
     "video_topic",

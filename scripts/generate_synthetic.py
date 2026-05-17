@@ -49,9 +49,18 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .frame_sampler import SampledVideo, sample_video_frames
-from .model import MOTION_LABELS, OVERLAY_LABELS, TRANSITION_LABELS
-from .schemas import CropSpec, EditSlot, EditTemplate, GlobalStyle, MotionSpec, OverlaySpec, SlotMapping, SlotMappingItem
+from ai_editor.vision_template.frame_sampler import SampledVideo, sample_video_frames
+from ai_editor.vision_template.model import MOTION_LABELS, OVERLAY_LABELS, TRANSITION_LABELS
+from ai_editor.vision_template.schemas import (
+    CropSpec,
+    EditSlot,
+    EditTemplate,
+    GlobalStyle,
+    MotionSpec,
+    OverlaySpec,
+    SlotMapping,
+    SlotMappingItem,
+)
 
 
 def _make_canvas(size: Tuple[int, int], base_color: Tuple[int, int, int]) -> np.ndarray:

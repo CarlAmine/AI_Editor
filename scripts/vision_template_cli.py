@@ -4,7 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
-from .metrics import (
+from scripts.benchmark_real import run_real_benchmark_suite
+from scripts.generate_synthetic import generate_synthetic_edit_sample
+from scripts.vision_template_metrics import (
     boundary_precision_recall_with_tolerance,
     boundary_time_mae,
     decode_confidence_summary,
@@ -14,11 +16,9 @@ from .metrics import (
     timeline_validity_score,
     total_duration_error,
 )
-from .real_benchmark import run_real_benchmark_suite
-from .renderer_adapter import build_render_spec_from_vision_template
-from .schemas import EditTemplate, SlotMapping
-from .synthetic_dataset import generate_synthetic_edit_sample
-from .train_reference import train_reference_adapter
+from ai_editor.vision_template.renderer_adapter import build_render_spec_from_vision_template
+from ai_editor.vision_template.schemas import EditTemplate, SlotMapping
+from ai_editor.vision_template.train_reference import train_reference_adapter
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -294,7 +294,7 @@ def _cmd_init_real_benchmark_case(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m ai_editor.vision_template.cli")
+    parser = argparse.ArgumentParser(prog="python -m scripts.vision_template_cli")
     sub = parser.add_subparsers(dest="command", required=True)
 
     gen = sub.add_parser("generate-synthetic")

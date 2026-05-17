@@ -1,4 +1,4 @@
-from ai_editor.pipeline_feedback import build_pipeline_assistant_feedback
+from pipeline.feedback import build_pipeline_assistant_feedback
 
 
 def test_reference_mimic_too_few_sources_routes_to_chat():

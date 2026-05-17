@@ -8,10 +8,10 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .edit_event_classifier import classify_semantic_edit_events
-from .layer_stack import build_layer_stack
-from .scene_graph import build_semantic_video_graph
-from .schemas import ObjectFrameState, SemanticEditEvent, SemanticVideoGraph, TrackedObject, VideoLayer
+from ai_editor.semantic_edit.edit_event_classifier import classify_semantic_edit_events
+from ai_editor.semantic_edit.layer_stack import build_layer_stack
+from ai_editor.semantic_edit.scene_graph import build_semantic_video_graph
+from ai_editor.semantic_edit.schemas import ObjectFrameState, SemanticEditEvent, SemanticVideoGraph, TrackedObject, VideoLayer
 
 
 def _write_video(path: str, frames: List[np.ndarray], fps: int) -> None:

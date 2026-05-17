@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .frame_sampler import sample_video_frames
-from .metrics import (
+from ai_editor.vision_template.frame_sampler import sample_video_frames
+from ai_editor.vision_template.renderer_adapter import build_render_spec_from_vision_template
+from ai_editor.vision_template.schemas import EditTemplate, SlotMapping, validate_monotonic_slots, validate_slot_mapping
+from ai_editor.vision_template.train_reference import train_reference_adapter
+from scripts.vision_template_metrics import (
     boundary_precision_recall_with_tolerance,
     boundary_time_mae,
     decode_confidence_summary,
@@ -17,9 +20,6 @@ from .metrics import (
     timeline_validity_score,
     total_duration_error,
 )
-from .renderer_adapter import build_render_spec_from_vision_template
-from .schemas import EditTemplate, SlotMapping, validate_monotonic_slots, validate_slot_mapping
-from .train_reference import train_reference_adapter
 
 
 @dataclass

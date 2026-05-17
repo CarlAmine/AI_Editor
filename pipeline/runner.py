@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from ai_editor.pipeline_feedback import build_pipeline_assistant_feedback
+from pipeline.feedback import build_pipeline_assistant_feedback
 
 from .artifacts import ArtifactRegistry
 from .decision_engine import DecisionOutcome, PipelineDecision, PipelineDecisionEngine

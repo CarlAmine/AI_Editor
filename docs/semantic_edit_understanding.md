@@ -75,19 +75,19 @@ If semantic analysis is disabled, the pipeline skips it silently. If analysis is
 Synthetic semantic demo:
 
 ```bash
-python -m ai_editor.semantic_edit.cli synthetic-demo --out tmp/semantic_demo --scenario chair_disappears
+python -m scripts.semantic_edit_cli synthetic-demo --out tmp/semantic_demo --scenario chair_disappears
 ```
 
 Analyze a video with the fallback backend:
 
 ```bash
-python -m ai_editor.semantic_edit.cli analyze --video path/to/video.mp4 --out tmp/semantic_analysis --backend synthetic_color
+python -m scripts.semantic_edit_cli analyze --video path/to/video.mp4 --out tmp/semantic_analysis --backend synthetic_color
 ```
 
 Verify whether a target object changed:
 
 ```bash
-python -m ai_editor.semantic_edit.cli verify --before tmp/before_graph.json --after tmp/after_graph.json --instruction "change the chair" --out tmp/verification.json
+python -m scripts.semantic_edit_cli verify --before tmp/before_graph.json --after tmp/after_graph.json --instruction "change the chair" --out tmp/verification.json
 ```
 
 ## Artifacts

@@ -25,13 +25,14 @@ except Exception:  # pragma: no cover - dependency availability varies by enviro
 
 from ai_editor.analysis import (
     AnalysisResult,
+    AnalysisStatus,
     OCRAnalyzer,
     MotionEffectAnalyzer,
     SceneAnalyzer,
     SegmentBuilder,
     SegmentScorer,
     StyleProfiler,
-    TranscriptAnalyzer,
+    TranscriptResult,
     VideoMetadata,
     VisualSignatureAnalyzer,
 )
@@ -44,6 +45,54 @@ class AnalysisContext:
     metadata: VideoMetadata
     result: AnalysisResult
     keyframes: list[dict]
+
+
+class TranscriptAnalyzer:
+    """
+    Incremental abstraction for transcript backends.
+
+    When no backend such as Whisper or faster-whisper is installed, the
+    analyzer returns an empty transcript payload instead of failing the
+    pipeline.
+    """
+
+    def __init__(self, preferred_backend: Optional[str] = None) -> None:
+        self.preferred_backend = preferred_backend or "auto"
+
+    def analyze(self, video_path: str) -> TranscriptResult:
+        del video_path
+        try:
+            import faster_whisper  # type: ignore  # pragma: no cover
+
+            _ = faster_whisper
+            return TranscriptResult(
+                status=AnalysisStatus.EMPTY.value,
+                backend="faster-whisper",
+                reason="Transcript backend detected but transcription is not wired in yet.",
+                spans=[],
+            )
+        except Exception:
+            pass
+
+        try:
+            import whisper  # type: ignore  # pragma: no cover
+
+            _ = whisper
+            return TranscriptResult(
+                status=AnalysisStatus.EMPTY.value,
+                backend="whisper",
+                reason="Transcript backend detected but transcription is not wired in yet.",
+                spans=[],
+            )
+        except Exception:
+            pass
+
+        return TranscriptResult(
+            status=AnalysisStatus.UNAVAILABLE.value,
+            backend=None,
+            reason="No transcript backend installed. Install whisper or faster-whisper to enable transcripts.",
+            spans=[],
+        )
 
 
 class VideoEditAnalyzer:

@@ -59,43 +59,43 @@ It does not generate new video pixels. It does not OCR text content. It does not
 Generate a synthetic sample:
 
 ```bash
-python -m ai_editor.vision_template.cli generate-synthetic --out tmp/vision_synth --num-slots 5
+python -m scripts.vision_template_cli generate-synthetic --out tmp/vision_synth --num-slots 5
 ```
 
 Train on the synthetic reference:
 
 ```bash
-python -m ai_editor.vision_template.cli train-reference --reference tmp/vision_synth/reference.mp4 --out tmp/vision_run --epochs 5 --expected-slots 5
+python -m scripts.vision_template_cli train-reference --reference tmp/vision_synth/reference.mp4 --out tmp/vision_run --epochs 5 --expected-slots 5
 ```
 
 Transfer a learned template to replacement clips:
 
 ```bash
-python -m ai_editor.vision_template.cli transfer --template tmp/vision_run/edit_template.json --slot-mapping tmp/vision_synth/slot_mapping.json --out tmp/vision_run/canonical_timeline.json
+python -m scripts.vision_template_cli transfer --template tmp/vision_run/edit_template.json --slot-mapping tmp/vision_synth/slot_mapping.json --out tmp/vision_run/canonical_timeline.json
 ```
 
 Run the end-to-end smoke demo:
 
 ```bash
-python -m ai_editor.vision_template.cli smoke-demo --out tmp/vision_demo --num-slots 5 --epochs 3
+python -m scripts.vision_template_cli smoke-demo --out tmp/vision_demo --num-slots 5 --epochs 3
 ```
 
 Run a slower quality-oriented demo with synthetic pretraining:
 
 ```bash
-python -m ai_editor.vision_template.cli quality-demo --out tmp/vision_quality_demo --num-slots 5 --pretrain-samples 32 --pretrain-epochs 2 --adapt-epochs 8
+python -m scripts.vision_template_cli quality-demo --out tmp/vision_quality_demo --num-slots 5 --pretrain-samples 32 --pretrain-epochs 2 --adapt-epochs 8
 ```
 
 Initialize a real benchmark case scaffold:
 
 ```bash
-python -m ai_editor.vision_template.cli init-real-benchmark-case --out benchmarks/vision_template_real/example_001
+python -m scripts.vision_template_cli init-real-benchmark-case --out benchmarks/vision_template_real/example_001
 ```
 
 Evaluate a directory of real benchmark cases:
 
 ```bash
-python -m ai_editor.vision_template.cli eval-real --benchmark-dir benchmarks/vision_template_real --out tmp/vision_real_eval --epochs 8 --synthetic-pretrain true --synthetic-pretrain-samples 32 --synthetic-pretrain-epochs 2
+python -m scripts.vision_template_cli eval-real --benchmark-dir benchmarks/vision_template_real --out tmp/vision_real_eval --epochs 8 --synthetic-pretrain true --synthetic-pretrain-samples 32 --synthetic-pretrain-epochs 2
 ```
 
 ## Model Quality Modes

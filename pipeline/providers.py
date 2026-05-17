@@ -4,7 +4,7 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict
 
-from ai_editor.ai_client import get_provider_readiness
+from ai_editor.llm_client import get_provider_readiness
 from ai_editor.google_auth import (
     GoogleCredentialError,
     resolve_drive_oauth_client_secret_path,

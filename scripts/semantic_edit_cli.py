@@ -6,15 +6,15 @@ from pathlib import Path
 
 from ai_editor.vision_template.frame_sampler import sample_video_frames
 
-from .edit_event_classifier import classify_semantic_edit_events
-from .layer_stack import build_layer_stack
-from .object_detector import detect_objects
-from .object_segmenter import segment_objects
-from .object_tracker import track_objects
-from .scene_graph import build_semantic_video_graph
-from .schemas import SemanticEditVerification, SemanticVideoGraph
-from .synthetic_objects import generate_synthetic_object_video
-from .verifier import verify_object_edit
+from ai_editor.semantic_edit.edit_event_classifier import classify_semantic_edit_events
+from ai_editor.semantic_edit.layer_stack import build_layer_stack
+from ai_editor.semantic_edit.object_detector import detect_objects
+from ai_editor.semantic_edit.object_segmenter import segment_objects
+from ai_editor.semantic_edit.object_tracker import track_objects
+from ai_editor.semantic_edit.scene_graph import build_semantic_video_graph
+from ai_editor.semantic_edit.schemas import SemanticEditVerification, SemanticVideoGraph
+from ai_editor.semantic_edit.verifier import verify_object_edit
+from tests.helpers.semantic_fixtures import generate_synthetic_object_video
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -60,7 +60,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m ai_editor.semantic_edit.cli")
+    parser = argparse.ArgumentParser(prog="python -m scripts.semantic_edit_cli")
     sub = parser.add_subparsers(dest="command", required=True)
 
     synth = sub.add_parser("synthetic-demo")

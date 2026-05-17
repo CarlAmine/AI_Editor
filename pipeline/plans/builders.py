@@ -419,7 +419,7 @@ def build_overlay_plan(
         ]
     if not overlays:
         try:
-            from ai_editor.overlay_planner import generate_overlay_plan as _generate_overlay_plan
+            from ai_editor.planning.overlay_planner import generate_overlay_plan as _generate_overlay_plan
 
             overlays = _generate_overlay_plan(
                 analysis_results=analysis,
