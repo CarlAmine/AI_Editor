@@ -71,6 +71,15 @@ class _SequenceDecisionEngine:
         )
 
 
+class _ForbiddenDecisionEngine:
+    def __init__(self):
+        self.decide_calls = 0
+
+    def decide(self, state):
+        self.decide_calls += 1
+        raise AssertionError("deterministic style-transfer route should not call decide()")
+
+
 class _FakeExecutor:
     def __init__(self, *, validation_scores=None, apply_pending_feedback_on_revise=False):
         self.actions = []
@@ -588,5 +597,31 @@ def test_runner_resumes_existing_waiting_job_with_same_job_id():
         assert state.latest_user_feedback == "Continue. Prioritize rendering the current plan."
         assert state.requirements["edit_requests"][-1] == "Continue. Prioritize rendering the current plan."
         assert state.status == JobStatus.RUNNING
+    finally:
+        _cleanup(job_id)
+
+
+def test_runner_uses_deterministic_style_transfer_route_without_llm_decide():
+    job_id = _job_id("runner-style-transfer")
+    try:
+        request = _job_request()
+        request["requirements_state"] = {"generation_mode": "reference_style_transfer"}
+        executor = _FakeExecutor(validation_scores=[0.94])
+        engine = _ForbiddenDecisionEngine()
+
+        result = run_job(job_id, request, decision_engine=engine, executor=executor)
+        state = load_state(str(Path("tmp") / "jobs" / job_id))
+
+        assert result["success"] is True
+        assert executor.actions == [
+            "run_analysis",
+            "generate_plan",
+            "validate_plan",
+            "render_final",
+            "finish",
+        ]
+        assert engine.decide_calls == 0
+        assert state is not None
+        assert [entry.source for entry in state.decision_trace] == ["deterministic"] * 5
     finally:
         _cleanup(job_id)

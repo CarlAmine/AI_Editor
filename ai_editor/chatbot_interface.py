@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ai_editor.editing.intent_parser import IntentParser
+from ai_editor.generation_modes import (
+    FREE_GENERATION_MODE,
+    REFERENCE_STYLE_TRANSFER_MODE,
+    VISION_TEMPLATE_LEARNING_MODE,
+    normalize_generation_mode,
+)
 from ai_editor.llm_client import chat_json, chat_text, get_active_model_name
 
 log = logging.getLogger(__name__)
-
-# ── Constants ─────────────────────────────────────────────────────────────────
 
 REQUIRED_FIELDS = [
     "video_topic", "target_audience", "platform", "duration_seconds",
@@ -19,31 +23,30 @@ REQUIRED_FIELDS = [
 ]
 
 DEFAULT_STATE: Dict[str, Any] = {
-    "video_topic":      "General promotional/edit video",
-    "target_audience":  "General audience",
-    "platform":         "YouTube",
+    "video_topic": "General promotional/edit video",
+    "target_audience": "General audience",
+    "platform": "YouTube",
     "duration_seconds": 60,
-    "aspect_ratio":     "16:9",
-    "orientation":      "horizontal",
-    "tone":             "engaging",
-    "pacing":           "medium",
-    "style_reference":  "",
-    "call_to_action":   "",
-    "branding":         "",
-    "subtitles":        "yes",
-    "deadline":         "",
-    "budget":           "",
-    "intent_mode":      "video",
-    "refit_mode":       "crop",
-    "generation_mode":  "reference_mimic_mode",
-    "edit_mode":        "scene",
-    "edit_requests":    [],   # list of EditOperation dicts
-    "user_requests":    [],   # raw string history
+    "aspect_ratio": "16:9",
+    "orientation": "horizontal",
+    "tone": "engaging",
+    "pacing": "medium",
+    "style_reference": "",
+    "call_to_action": "",
+    "branding": "",
+    "subtitles": "yes",
+    "deadline": "",
+    "budget": "",
+    "intent_mode": "video",
+    "refit_mode": "crop",
+    "generation_mode": REFERENCE_STYLE_TRANSFER_MODE,
+    "edit_mode": "scene",
+    "edit_requests": [],
+    "user_requests": [],
 }
 
 _INTENT_PARSER = IntentParser()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _normalize_state(current_state: Dict) -> Dict:
     state = dict(DEFAULT_STATE)
@@ -78,19 +81,34 @@ def _is_editing_instruction(text: str) -> bool:
 def _extract_generation_mode(text: str) -> str:
     text_low = text.lower()
     if any(k in text_low for k in [
-        "reference mimic", "mimic mode", "match reference", "copy reference timing"
+        "train template", "learn template", "template learning", "train model",
+        "learn model", "vision template learning",
     ]):
-        return "reference_mimic_mode"
+        return VISION_TEMPLATE_LEARNING_MODE
     if any(k in text_low for k in [
-        "free generation", "free mode", "non mimic", "not mimic"
+        "free generation", "free mode", "non mimic", "not mimic",
     ]):
-        return "free_generation_mode"
+        return FREE_GENERATION_MODE
     if any(k in text_low for k in [
-        "vision mode", "replicate edit", "replicate the edit",
-        "same edit", "reference vision"
+        "vision mode", "reference vision", "reference mimic", "reference mimic mode",
+        "replicate edit", "replicate the edit", "replicate this edit",
+        "copy style", "copy the style", "copy editing style", "copy the editing style",
+        "match reference", "match the reference", "same edit", "same edit style",
+        "same style", "use reference style",
     ]):
-        return "reference_vision_mode"
+        return REFERENCE_STYLE_TRANSFER_MODE
     return ""
+
+
+def _normalize_generation_mode_for_state(value: str, state: Dict[str, Any]) -> str:
+    has_reference = bool(
+        str(state.get("style_reference", "")).strip()
+        or str(state.get("reference_url", "")).strip()
+        or str(state.get("primary_url", "")).strip()
+        or state.get("motion_effects_path")
+    )
+    default = REFERENCE_STYLE_TRANSFER_MODE if has_reference else FREE_GENERATION_MODE
+    return normalize_generation_mode(value, default=default)
 
 
 def _extract_edit_mode(text: str) -> str:
@@ -112,8 +130,8 @@ def _summarize_pipeline_feedback(state: Dict) -> str:
     if not isinstance(feedback, dict):
         return ""
     reason = str(feedback.get("reason", "")).strip()
-    error  = str(feedback.get("error",  "")).strip()
-    stage  = str(feedback.get("stage",  "")).strip()
+    error = str(feedback.get("error", "")).strip()
+    stage = str(feedback.get("stage", "")).strip()
     if not reason and not error:
         return ""
     summary = f"stage={stage or 'UNKNOWN'}"
@@ -139,8 +157,8 @@ def _extract_preferences(
         "Return a JSON object with keys:\n"
         f"{REQUIRED_FIELDS}\n"
         "Allowed intent_mode: video|shorts. Allowed refit_mode: crop|pad.\n"
-        "Allowed generation_mode: reference_mimic_mode|free_generation_mode"
-        "|reference_vision_mode.\n"
+        "Allowed generation_mode: free_generation_mode|reference_style_transfer"
+        "|vision_template_learning.\n"
         "Allowed edit_mode: scene|ocr.\n"
         "If a value is unknown, return null.\n\n"
         f"Current state: {json.dumps(state, ensure_ascii=False, default=str)}\n"
@@ -172,11 +190,10 @@ def _build_reply(
     Generates the assistant's conversational reply.
     Tells the user what was understood in plain language.
     """
-    # Summarise the parsed operations for the reply prompt
     if parsed_ops:
         op_summary = "; ".join(
             f"{op.get('operation')} on {op.get('target') or op.get('scope', 'video')}"
-            for op in parsed_ops[:3]  # show at most 3 in the reply
+            for op in parsed_ops[:3]
         )
         if len(parsed_ops) > 3:
             op_summary += f" (and {len(parsed_ops) - 3} more)"
@@ -202,7 +219,7 @@ def _build_reply(
                 "content": (
                     "You are a helpful video editing assistant. "
                     "Respond naturally in 1-2 short sentences. "
-                    "Confirm what the user asked for using plain language — "
+                    "Confirm what the user asked for using plain language - "
                     "do not mention JSON, operations, or technical terms. "
                     "Be concise and friendly."
                 ),
@@ -222,7 +239,7 @@ def _build_reply(
         if parsed_ops:
             op = parsed_ops[0]
             reply = (
-                f"Got it — I'll {op.get('operation', 'apply that change')} "
+                f"Got it - I'll {op.get('operation', 'apply that change')} "
                 f"on the {op.get('scope', 'video')}."
             )
         else:
@@ -230,8 +247,6 @@ def _build_reply(
 
     return reply
 
-
-# ── Public API ────────────────────────────────────────────────────────────────
 
 def process_ui_turn(
     user_input: str,
@@ -243,26 +258,24 @@ def process_ui_turn(
     Processes one turn of the chat UI.
 
     Returns a dict with keys:
-        updated_state   — the new state dict (includes edit_requests and
+        updated_state   - the new state dict (includes edit_requests and
                           parsed_operations for the executor)
-        next_message    — assistant reply string
-        is_complete     — always False (completion is handled by the pipeline)
-        final_report    — always None
-        model_used      — active LLM model name
+        next_message    - assistant reply string
+        is_complete     - always False (completion is handled by the pipeline)
+        final_report    - always None
+        model_used      - active LLM model name
     """
+    del api_key
     state = _normalize_state(current_state)
 
-    # Always record the raw user message
     state["user_requests"].append(user_input.strip())
 
-    # ── 1. Extract session-level preferences (platform, tone, pacing, etc.) ──
     extracted = _extract_preferences(user_input, state, analyzer_output)
     for key in REQUIRED_FIELDS:
         val = extracted.get(key)
         if val is not None and val != "":
             state[key] = val
 
-    # ── 2. Override generation/edit mode from explicit keywords ───────────────
     explicit_gen_mode = _extract_generation_mode(user_input)
     if explicit_gen_mode:
         state["generation_mode"] = explicit_gen_mode
@@ -271,26 +284,23 @@ def process_ui_turn(
     if explicit_edit_mode:
         state["edit_mode"] = explicit_edit_mode
 
-    # Normalise constrained values
     if str(state.get("intent_mode", "")).lower() not in {"video", "shorts"}:
         state["intent_mode"] = "video"
     if str(state.get("refit_mode", "")).lower() not in {"crop", "pad"}:
         state["refit_mode"] = "crop"
-    if str(state.get("generation_mode", "")).lower() not in {
-        "reference_mimic_mode", "free_generation_mode", "reference_vision_mode"
-    }:
-        state["generation_mode"] = "reference_mimic_mode"
+    state["generation_mode"] = _normalize_generation_mode_for_state(
+        str(state.get("generation_mode", "") or ""),
+        state,
+    )
     if str(state.get("edit_mode", "")).lower() not in {"scene", "ocr"}:
         state["edit_mode"] = "scene"
 
-    # ── 3. Parse editing intent via LLM (replaces regex) ─────────────────────
     parsed_ops: List[Dict] = []
     if _is_editing_instruction(user_input):
         try:
             operations = _INTENT_PARSER.parse(user_input, current_state=state)
             parsed_ops = [op.to_dict() for op in operations]
 
-            # Store in state — deduplicate by (operation, target, scope)
             existing_keys = {
                 (r.get("operation"), r.get("target"), r.get("scope"))
                 for r in state["edit_requests"]
@@ -303,7 +313,6 @@ def process_ui_turn(
                     existing_keys.add(key)
         except Exception as exc:
             log.exception("IntentParser failed for input %r: %s", user_input[:80], exc)
-            # Safe fallback: store raw string as a custom operation
             state["edit_requests"].append({
                 "operation": "custom",
                 "value": user_input.strip(),
@@ -311,17 +320,14 @@ def process_ui_turn(
                 "metadata": {"unresolved": True, "parse_error": str(exc)},
             })
 
-    # Expose the freshly parsed operations for the executor to read
-    # without iterating the full edit_requests history
     state["parsed_operations"] = parsed_ops
 
-    # ── 4. Generate conversational reply ──────────────────────────────────────
     next_message = _build_reply(user_input, state, parsed_ops)
 
     return {
-        "updated_state":    state,
-        "next_message":     next_message,
-        "is_complete":      False,
-        "final_report":     None,
-        "model_used":       get_active_model_name(),
+        "updated_state": state,
+        "next_message": next_message,
+        "is_complete": False,
+        "final_report": None,
+        "model_used": get_active_model_name(),
     }

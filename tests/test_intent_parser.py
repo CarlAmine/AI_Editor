@@ -1,9 +1,8 @@
 """Tests for LLM-powered IntentParser."""
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from ai_editor.editing.intent_parser import IntentParser
-from ai_editor.editing.edit_operations import EditOperation
 
 
 class TestIntentParser:
@@ -77,7 +76,7 @@ class TestIntentParser:
     def test_vision_mode_instruction_detected(self):
         parser = IntentParser()
         with self._mock_llm([{
-            "operation": "reference_vision_mode",
+            "operation": "reference_style_transfer",
             "scope": "global",
             "value": "full_replication",
             "metadata": {"apply_motion_effects": True},
@@ -86,7 +85,7 @@ class TestIntentParser:
                 "replicate the same edit style as the reference onto my clips",
                 {"motion_effects_path": "/tmp/motion_effects.json"}
             )
-        assert ops[0].operation == "reference_vision_mode"
+        assert ops[0].operation == "reference_style_transfer"
 
     def test_plan_context_includes_shot_list(self):
         """Verifies that shot identifiers from the plan are included in context."""

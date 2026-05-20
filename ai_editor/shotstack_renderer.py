@@ -5,9 +5,10 @@ import requests
 import textwrap
 import copy
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Union, Any
 from dataclasses import dataclass, asdict
+from ai_editor.generation_modes import is_reference_style_transfer_mode, normalize_generation_mode
 try:
     import shotstack_sdk as shotstack
     from shotstack_sdk.api import edit_api
@@ -84,6 +85,105 @@ def _format_shotstack_error(exc: Exception, host: str) -> str:
                 "environment and that the account has available credits/plan access."
             )
     return base
+
+
+def _strip_none_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            k: _strip_none_values(v)
+            for k, v in value.items()
+            if v is not None
+        }
+    if isinstance(value, list):
+        return [_strip_none_values(v) for v in value]
+    return value
+
+
+def _extract_shotstack_offending_field(exception: Any) -> Optional[str]:
+    message = str(exception)
+    for pattern in [r"variable '([^']+)'", r"at \['([^']+)'\]", r"\[['\"]([^'\"]+)['\"]\]"]:
+        match = re.search(pattern, message)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _sanitize_shotstack_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_lower = str(key).lower()
+            if any(token in key_lower for token in ("key", "token", "secret", "authorization")):
+                sanitized[str(key)] = "[redacted]"
+            else:
+                sanitized[str(key)] = _sanitize_shotstack_payload(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_shotstack_payload(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(os.getenv("SHOTSTACK_KEY", ""), "[redacted]") if os.getenv("SHOTSTACK_KEY") else value
+    return value
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_shotstack_text(value: Any, *secret_tokens: str) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    tokens = [os.getenv("SHOTSTACK_KEY", ""), *secret_tokens]
+    for token in tokens:
+        if token:
+            text = text.replace(token, "[redacted]")
+    return text
+
+
+def _write_shotstack_debug_file(path: Optional[str], payload: Dict[str, Any]) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(
+            _sanitize_shotstack_payload(_strip_none_values(payload)),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def _build_shotstack_debug_record(
+    *,
+    stage: str,
+    request_url: str,
+    payload_path: Optional[str],
+    status_code: Optional[int] = None,
+    response_text: Any = None,
+    response_json: Any = None,
+    error: str = "",
+    exception: Any = None,
+    render_id: Optional[str] = None,
+    offending_field: Optional[str] = None,
+    hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    record = {
+        "stage": stage,
+        "status_code": status_code,
+        "response_text": _sanitize_shotstack_text(response_text),
+        "response_json": _sanitize_shotstack_payload(response_json) if response_json is not None else None,
+        "error": str(error or ""),
+        "exception": _sanitize_shotstack_text(exception),
+        "render_id": render_id,
+        "request_url": request_url,
+        "payload_path": payload_path,
+        "timestamp": _utc_now_iso(),
+    }
+    if offending_field is not None:
+        record["offending_field"] = offending_field
+    if hint is not None:
+        record["hint"] = hint
+    return record
 
 
 def _is_video_clip(clip: Dict[str, Any]) -> bool:
@@ -425,6 +525,7 @@ def create_and_render_video(
     debug_render_spec_path: Optional[str] = None,
     debug_overlay_timing_path: Optional[str] = None,
     debug_shotstack_payload_path: Optional[str] = None,
+    debug_shotstack_error_path: Optional[str] = None,
 ) -> Dict:
     """
     Pipeline function to assemble clips, add text/music, and render a video using Shotstack.
@@ -444,6 +545,47 @@ def create_and_render_video(
 
     # --- 1. Configuration & Constants ---
     HOST = _resolve_shotstack_host()
+    create_request_url = f"{HOST}/render"
+
+    def _return_failure(
+        *,
+        stage: str,
+        error: str,
+        status_code: Optional[int] = None,
+        response_text: Any = None,
+        response_json: Any = None,
+        exception: Any = None,
+        render_id: Optional[str] = None,
+        request_url: Optional[str] = None,
+        status: str = "failed",
+    ) -> Dict[str, Any]:
+        offending_field = _extract_shotstack_offending_field(exception) if exception is not None else None
+        hint = (
+            "Optional Shotstack fields must be omitted when None."
+            if stage == "shotstack_create" and exception is not None
+            else None
+        )
+        debug_record = _build_shotstack_debug_record(
+            stage=stage,
+            request_url=request_url or create_request_url,
+            payload_path=debug_shotstack_payload_path,
+            status_code=status_code,
+            response_text=_sanitize_shotstack_text(response_text, api_key),
+            response_json=response_json,
+            error=error,
+            exception=_sanitize_shotstack_text(repr(exception), api_key) if exception is not None else None,
+            render_id=render_id,
+            offending_field=offending_field,
+            hint=hint,
+        )
+        _write_shotstack_debug_file(debug_shotstack_error_path, debug_record)
+        return {
+            "success": False,
+            "status": status,
+            "error": error,
+            "debug": debug_record,
+            "error_detail": debug_record,
+        }
 
     def get_video_duration(api_key: str, url: str) -> float:
         """Fetches the duration of a remote video file using OpenCV.
@@ -579,13 +721,14 @@ def create_and_render_video(
     # --- 3. Logic: Prepare Project Data ---
     print(f"Initializing Project: {project_title}")
 
-    use_reference_mimic = str(generation_mode).lower() == "reference_mimic_mode"
+    normalized_generation_mode = normalize_generation_mode(generation_mode, default="free_generation_mode")
+    use_reference_mimic = is_reference_style_transfer_mode(normalized_generation_mode)
     use_canonical_timeline = bool(canonical_timeline)
     if use_reference_mimic and not use_canonical_timeline:
-        return {
-            "success": False,
-            "error": "reference_mimic_mode requires canonical_timeline; refusing heuristic timing fallback.",
-        }
+        return _return_failure(
+            stage="payload_build",
+            error="reference_style_transfer requires canonical_timeline; refusing heuristic timing fallback.",
+        )
 
     # NEW: Dynamically fetch durations unless strict timeline is provided.
     clips = []
@@ -919,46 +1062,54 @@ def create_and_render_video(
         tol = 1e-6
         expected = sorted(canonical_timeline, key=lambda r: float(r.get("start", 0.0)))
         if len(video_clip_specs) != len(expected):
-            return {
-                "success": False,
-                "error": (
+            result = _return_failure(
+                stage="payload_build",
+                error=(
                     f"Canonical timeline validation failed: rendered clip count={len(video_clip_specs)} "
                     f"does not match canonical rows={len(expected)}"
                 ),
-                "warnings": warnings,
-            }
+                response_json={"warnings": warnings},
+            )
+            result["warnings"] = warnings
+            return result
         for i, (clip_spec, row) in enumerate(zip(video_clip_specs, expected), start=1):
             cs = float(clip_spec.get("start", 0.0))
             cl = float(clip_spec.get("length", 0.0))
             rs = float(row.get("start", 0.0))
             rl = float(row.get("duration", row.get("length", 0.0)))
             if abs(cs - rs) > tol:
-                return {
-                    "success": False,
-                    "error": (
+                result = _return_failure(
+                    stage="payload_build",
+                    error=(
                         f"Canonical timeline validation failed at clip {i}: start={cs:.9f} "
                         f"expected={rs:.9f}"
                     ),
-                    "warnings": warnings,
-                }
+                    response_json={"warnings": warnings},
+                )
+                result["warnings"] = warnings
+                return result
             if abs(cl - rl) > tol:
-                return {
-                    "success": False,
-                    "error": (
+                result = _return_failure(
+                    stage="payload_build",
+                    error=(
                         f"Canonical timeline validation failed at clip {i}: length={cl:.9f} "
                         f"expected={rl:.9f}"
                     ),
-                    "warnings": warnings,
-                }
+                    response_json={"warnings": warnings},
+                )
+                result["warnings"] = warnings
+                return result
 
     if use_canonical_timeline:
         mimic_errors = validate_reference_mimic_alignment(edit_spec)
         if mimic_errors:
-            return {
-                "success": False,
-                "error": "Canonical timing validation failed: " + "; ".join(mimic_errors),
-                "warnings": warnings,
-            }
+            result = _return_failure(
+                stage="payload_build",
+                error="Canonical timing validation failed: " + "; ".join(mimic_errors),
+                response_json={"warnings": warnings, "alignment_errors": mimic_errors},
+            )
+            result["warnings"] = warnings
+            return result
 
     # Refit-mode specific overlay safety pass.
     safe_for_9x16 = mobile_safe_text_mode or force_mobile_safe_text
@@ -1032,6 +1183,19 @@ def create_and_render_video(
         except Exception as e:
             print(f"Could not write debug overlay timing: {e}")
 
+    if debug_shotstack_payload_path:
+        try:
+            os.makedirs(os.path.dirname(debug_shotstack_payload_path), exist_ok=True)
+            with open(debug_shotstack_payload_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    _sanitize_shotstack_payload(_strip_none_values({"edit_spec": edit_spec})),
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as e:
+            print(f"Could not write preliminary Shotstack payload JSON: {e}")
+
     # Convert normalized spec to Shotstack SDK objects.
     tracks = []
     for t in edit_spec.get("tracks", []):
@@ -1041,24 +1205,30 @@ def create_and_render_video(
             if asset.get("type") == "video":
                 sdk_asset = VideoAsset(src=asset.get("src"), trim=float(asset.get("trim", 0.0)))
             elif asset.get("type") == "html":
-                sdk_asset = HtmlAsset(
-                    html=asset.get("html", ""),
-                    css=asset.get("css"),
-                    width=asset.get("width"),
-                    height=asset.get("height"),
-                    background=asset.get("background"),
-                    position=asset.get("position"),
-                )
+                asset_kwargs = {"html": asset.get("html", "")}
+                if asset.get("css") is not None:
+                    asset_kwargs["css"] = asset.get("css")
+                if asset.get("width") is not None:
+                    asset_kwargs["width"] = asset.get("width")
+                if asset.get("height") is not None:
+                    asset_kwargs["height"] = asset.get("height")
+                if asset.get("background") is not None:
+                    asset_kwargs["background"] = asset.get("background")
+                if asset.get("position") is not None:
+                    asset_kwargs["position"] = asset.get("position")
+                sdk_asset = HtmlAsset(**asset_kwargs)
             elif asset.get("type") in {"title", "text"}:
                 text_html = _build_overlay_html(str(asset.get("text", "")))
-                sdk_asset = HtmlAsset(
-                    html=text_html,
-                    css="div{font-size:54px;letter-spacing:0.5px;font-family:'Space Grotesk',sans-serif;line-height:1.2;}",
-                    width=_overlay_width(),
-                    height=220,
-                    background="#00000052",
-                    position=asset.get("position", "center"),
-                )
+                asset_kwargs = {
+                    "html": text_html,
+                    "css": "div{font-size:54px;letter-spacing:0.5px;font-family:'Space Grotesk',sans-serif;line-height:1.2;}",
+                    "width": _overlay_width(),
+                    "height": 220,
+                    "background": "#00000052",
+                }
+                if asset.get("position") is not None:
+                    asset_kwargs["position"] = asset.get("position")
+                sdk_asset = HtmlAsset(**asset_kwargs)
             else:
                 continue
 
@@ -1066,8 +1236,14 @@ def create_and_render_video(
             sdk_transition = None
             if isinstance(trans, Transition):
                 sdk_transition = trans
-            elif isinstance(trans, dict) and (trans.get("in") or trans.get("out")):
-                sdk_transition = Transition(_in=trans.get("in"), out=trans.get("out"))
+            elif isinstance(trans, dict) and (trans.get("in") is not None or trans.get("out") is not None):
+                transition_kwargs = {}
+                if trans.get("in") is not None:
+                    transition_kwargs["_in"] = trans.get("in")
+                if trans.get("out") is not None:
+                    transition_kwargs["out"] = trans.get("out")
+                if transition_kwargs:
+                    sdk_transition = Transition(**transition_kwargs)
 
             off = c.get("offset")
             sdk_offset = None
@@ -1165,18 +1341,49 @@ def create_and_render_video(
             if debug_shotstack_payload_path:
                 try:
                     payload = api_client.sanitize_for_serialization(edit_object)
+                    payload = _strip_none_values(payload)
                     with open(debug_shotstack_payload_path, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                        json.dump(_sanitize_shotstack_payload(payload), f, ensure_ascii=False, indent=2)
                 except Exception as e:
                     print(f"Could not write Shotstack payload debug JSON: {e}")
 
             api_instance = edit_api.EditApi(api_client)
             
             print(f"Submitting render job to Shotstack ({HOST})...")
-            api_response = api_instance.post_render(edit_object)
-            
-            render_id = api_response['response']['id']
-            message = api_response['response']['message']
+            try:
+                api_response = api_instance.post_render(edit_object)
+            except Exception as e:
+                friendly_error = _format_shotstack_error(e, HOST)
+                return _return_failure(
+                    stage="shotstack_create",
+                    error=friendly_error,
+                    status_code=getattr(e, "status", None),
+                    response_text=getattr(e, "body", None),
+                    exception=e,
+                )
+
+            if not isinstance(api_response, dict):
+                return _return_failure(
+                    stage="shotstack_create",
+                    error="Shotstack create response was not a JSON object.",
+                    response_text=repr(api_response),
+                )
+            response_block = api_response.get("response")
+            if not isinstance(response_block, dict):
+                return _return_failure(
+                    stage="shotstack_create",
+                    error="Shotstack create response did not contain a valid response object.",
+                    response_json=api_response,
+                )
+
+            render_id = response_block.get('id')
+            message = response_block.get('message')
+            if not render_id:
+                return _return_failure(
+                    stage="shotstack_create",
+                    error="Shotstack create response did not include a render ID.",
+                    response_json=api_response,
+                )
             print(f"Submitted! Render ID: {render_id}")
 
             result_data = {
@@ -1203,20 +1410,56 @@ def create_and_render_video(
                 # Note: We use requests directly here for simple status checking to avoid regenerating API client
                 status_url = f"{HOST}/render/{render_id}"
                 headers = {"x-api-key": api_key}
-                status_resp = requests.get(status_url, headers=headers)
+                try:
+                    status_resp = requests.get(status_url, headers=headers)
+                except Exception as e:
+                    return _return_failure(
+                        stage="shotstack_poll",
+                        error="Shotstack status polling request failed.",
+                        exception=e,
+                        render_id=render_id,
+                        request_url=status_url,
+                    )
                 
                 if status_resp.status_code == 200:
-                    data = status_resp.json()['response']
+                    try:
+                        poll_json = status_resp.json()
+                    except Exception as e:
+                        return _return_failure(
+                            stage="shotstack_poll",
+                            error="Shotstack polling response could not be parsed as JSON.",
+                            status_code=status_resp.status_code,
+                            response_text=status_resp.text,
+                            exception=e,
+                            render_id=render_id,
+                            request_url=status_url,
+                        )
+                    data = poll_json.get('response')
+                    if not isinstance(data, dict):
+                        return _return_failure(
+                            stage="shotstack_poll",
+                            error="Shotstack polling response did not contain a valid response object.",
+                            status_code=status_resp.status_code,
+                            response_text=status_resp.text,
+                            response_json=poll_json,
+                            render_id=render_id,
+                            request_url=status_url,
+                        )
                     status = data['status']
                     
                     if status == 'done':
                         url = data.get('url')
                         if not url:
                             print("Render completed without output URL.")
-                            result_data['success'] = False
-                            result_data['status'] = 'failed'
-                            result_data['error'] = "Shotstack returned status=done but no output URL."
-                            return result_data
+                            return _return_failure(
+                                stage="shotstack_poll",
+                                error="Shotstack returned status=done but no output URL.",
+                                status_code=status_resp.status_code,
+                                response_text=status_resp.text,
+                                response_json=data,
+                                render_id=render_id,
+                                request_url=status_url,
+                            )
                         print("Render Complete!")
                         result_data['success'] = True
                         result_data['status'] = 'done'
@@ -1224,27 +1467,52 @@ def create_and_render_video(
                         return result_data
                     elif status == 'failed':
                         print(" Render Failed.")
-                        result_data['success'] = False
-                        result_data['status'] = 'failed'
-                        result_data['error'] = data.get('error')
-                        return result_data
+                        return _return_failure(
+                            stage="shotstack_poll",
+                            error=str(data.get("error") or "Shotstack reported a failed render."),
+                            status_code=status_resp.status_code,
+                            response_text=status_resp.text,
+                            response_json=data,
+                            render_id=render_id,
+                            request_url=status_url,
+                        )
                     else:
                         print(f"   Status: {status}...")
+                else:
+                    try:
+                        poll_body = status_resp.json()
+                    except Exception:
+                        poll_body = status_resp.text
+                    return _return_failure(
+                        stage="shotstack_poll",
+                        error=f"Shotstack status polling failed with HTTP {status_resp.status_code}.",
+                        status_code=status_resp.status_code,
+                        response_text=status_resp.text,
+                        response_json=poll_body if isinstance(poll_body, dict) else None,
+                        render_id=render_id,
+                        request_url=status_url,
+                    )
                 
                 attempts += 1
             
-            result_data['success'] = False
-            result_data['status'] = 'timeout'
-            result_data['error'] = "Render polling timed out before completion."
-            return result_data
+            return _return_failure(
+                stage="shotstack_poll",
+                error="Render polling timed out before completion.",
+                render_id=render_id,
+                request_url=f"{HOST}/render/{render_id}",
+                status="timeout",
+            )
 
     except Exception as e:
         friendly_error = _format_shotstack_error(e, HOST)
         print(f"Error during rendering: {friendly_error}")
-        return {
-            "success": False,
-            "error": friendly_error
-        }
+        return _return_failure(
+            stage="shotstack_create",
+            error=friendly_error,
+            status_code=getattr(e, "status", None),
+            response_text=getattr(e, "body", None),
+            exception=e,
+        )
 
 
 

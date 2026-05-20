@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ai_editor.editing.edit_operations import EditOperation, TimeWindowTarget
+from ai_editor.generation_modes import REFERENCE_STYLE_TRANSFER_MODE
 from ai_editor.llm_client import chat_json
 
 log = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ Each operation is a JSON object with these fields:
                     change_caption_style, promote_hook,
                     prioritize_source, deprioritize_source,
                     set_transition, set_motion_effect,
-                    reference_vision_mode, custom
+                    reference_style_transfer, custom
 
   target          (string, optional)  — what the operation applies to.
                     Can be a shot index ("shot_3"), a section name
@@ -91,8 +92,8 @@ Each operation is a JSON object with these fields:
    clip" (map to shot_3 or the actual clip identifier from the plan).
 6. Do not invent clip identifiers that aren't in the plan. Use "unknown" for
    the target if you cannot resolve it.
-7. For vision mode instructions ("replicate this edit", "use the reference
-   style", "apply the same shake"), set operation to "reference_vision_mode"
+7. For style-transfer instructions ("replicate this edit", "use the reference
+   style", "apply the same shake"), set operation to "reference_style_transfer"
    and include relevant metadata.
 """
 
@@ -176,11 +177,11 @@ _FEW_SHOT_EXAMPLES = [
         "plan_context": "reference video analyzed, motion_effects.json available",
         "output": [
             {
-                "operation": "reference_vision_mode",
+                "operation": "reference_style_transfer",
                 "scope": "global",
                 "value": "full_replication",
                 "metadata": {"apply_motion_effects": True, "apply_transitions": True,
-                             "apply_rhythm": True}
+                             "apply_rhythm": True, "apply_overlay_timing": True}
             }
         ]
     }
@@ -267,8 +268,14 @@ def _parse_operation(raw: Dict[str, Any]) -> EditOperation:
     elif isinstance(raw.get("scope"), str) and raw.get("scope") != "global":
         time_window = TimeWindowTarget(label=str(raw.get("scope", "global")))
 
+    operation = str(raw.get("operation") or "custom").strip()
+    if operation == "reference_vision_mode":
+        operation = REFERENCE_STYLE_TRANSFER_MODE
+    elif operation == "reference_mimic_mode":
+        operation = REFERENCE_STYLE_TRANSFER_MODE
+
     return EditOperation(
-        operation=str(raw.get("operation") or "custom"),
+        operation=operation,
         target=raw.get("target"),
         value=raw.get("value"),
         intensity=float(raw.get("intensity") or 1.0),

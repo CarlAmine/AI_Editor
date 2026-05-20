@@ -60,3 +60,10 @@ frontend/.env
 *.swo
 .DS_Store
 Thumbs.db
+
+# Debug and temp files
+dev.bat
+temp_debug.py
+tmp_payload.json
+verify_chat.py
+.pytest-tmp/

@@ -2,9 +2,11 @@ from pathlib import Path
 import shutil
 from uuid import uuid4
 
+from ai_editor.analysis.analysis_schema import EffectType, MotionCurve, MotionEffect, MotionEffectManifest
 from pipeline.artifacts import ArtifactRegistry
 from pipeline.decision_engine import PipelineDecision
 from pipeline.executor import ExecutionContext, PipelineExecutor
+from pipeline.provider_errors import ProviderFailure
 from pipeline.state import apply_plan_validation, new_state
 
 
@@ -158,5 +160,224 @@ def test_revise_plan_can_run_twice_without_duplicating_edit_directives():
         assert second_revised.get("plan_patch", {}).get("applied_requests") == [
             "edit: make it less cluttered in the middle"
         ]
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_get_edit_operations_from_state_reads_requirements_dict_entries():
+    ctx = _ctx()
+    try:
+        executor = PipelineExecutor()
+        ctx.requirements["parsed_operations"] = [
+            {
+                "operation": "remove_segment",
+                "target": "shot_2",
+                "scope": "global",
+                "segment_target": "shot_2",
+            }
+        ]
+
+        operations = executor._get_edit_operations_from_state(ctx)
+
+        assert len(operations) == 1
+        assert operations[0].operation == "remove_segment"
+        assert operations[0].target == "shot_2"
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_stage_render_plan_uses_reference_timeline_for_style_transfer(monkeypatch):
+    ctx = _ctx()
+    try:
+        executor = PipelineExecutor()
+        ctx.requirements["generation_mode"] = "reference_style_transfer"
+        ctx.state.requirements["generation_mode"] = "reference_style_transfer"
+        ctx.state.current_plan = {
+            "planning_strategy": "test_plan",
+            "selected_segments": [],
+            "support_segments": [],
+        }
+        ctx.state.overlay_plan = {"overlays": [], "text_segments": [], "warnings": []}
+        ctx.state.audio_plan = {"music_mode": "original"}
+
+        called = {"reference": 0}
+
+        def fake_reference_timeline(_ctx, _analysis, _overlay_plan, _audio_plan, _source_keys):
+            called["reference"] += 1
+            return (
+                [{"scene_id": 1, "start": 0.0, "end": 2.0, "duration": 2.0, "video_src": "clip.mp4"}],
+                [{"index": 1, "start": 0.0, "end": 2.0, "text": ""}],
+                {"preserved_total_duration": 2.0},
+                [],
+            )
+
+        monkeypatch.setattr(executor, "_build_reference_render_timeline", fake_reference_timeline)
+        monkeypatch.setattr(executor, "_source_keys_for_generation", lambda _ctx: ["sources.fetch.1"])
+        monkeypatch.setattr(executor, "_source_durations_for_plan", lambda _ctx, _analysis: [])
+        monkeypatch.setattr(executor, "_apply_motion_effects_to_render_spec", lambda _ctx, spec: spec)
+        monkeypatch.setattr(executor, "_write_plan_bundle", lambda *args, **kwargs: None)
+        monkeypatch.setattr(executor, "_record_overlay_warnings", lambda *args, **kwargs: None)
+
+        executor._stage_render_plan(ctx)
+
+        assert called["reference"] == 1
+        assert ctx.state.render_spec["canonical_timeline"][0]["scene_id"] == 1
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_apply_motion_effects_to_render_spec_updates_timeline_for_style_transfer(monkeypatch):
+    ctx = _ctx()
+    try:
+        executor = PipelineExecutor()
+        ctx.requirements["generation_mode"] = "reference_style_transfer"
+        ctx.state.requirements["generation_mode"] = "reference_style_transfer"
+
+        clip_path = Path(ctx.dirs["media"]) / "clip.mp4"
+        clip_path.write_bytes(b"fake")
+        manifest_path = Path(ctx.dirs["job"]) / "motion_effects.json"
+        manifest = MotionEffectManifest(
+            video_path="ref.mp4",
+            fps=25.0,
+            total_frames=10,
+            effects=[
+                MotionEffect(
+                    shot_index=0,
+                    effect_type=EffectType.SHAKE,
+                    onset_frac=0.0,
+                    offset_frac=1.0,
+                    intensity=0.8,
+                    curve=MotionCurve(dx_norm=[0.02], dy_norm=[0.01]),
+                )
+            ],
+        )
+        manifest_path.write_text("{}", encoding="utf-8")
+        ctx.state.motion_effects_path = str(manifest_path)
+
+        monkeypatch.setattr(executor, "_load_json_if_exists", lambda _path: manifest.to_dict())
+        monkeypatch.setattr(
+            "pipeline.executor.MotionEffectApplier.apply_to_clip",
+            lambda self, clip_path, shot_index, manifest, output_path: output_path,
+        )
+
+        render_spec = {
+            "canonical_timeline": [
+                {"scene_id": 1, "video_src": str(clip_path), "videoSrc": str(clip_path)}
+            ]
+        }
+
+        updated = executor._apply_motion_effects_to_render_spec(ctx, render_spec)
+
+        assert updated["canonical_timeline"][0]["video_src"].endswith("_stylized.mp4")
+        assert updated["edit_summary"]["motion_effect_clips_stylized"] == 1
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_stage_shotstack_render_writes_debug_error_details(monkeypatch):
+    ctx = _ctx()
+    try:
+        executor = PipelineExecutor()
+        ctx.requirements["generation_mode"] = "reference_style_transfer"
+        ctx.state.requirements["generation_mode"] = "reference_style_transfer"
+
+        clip_path = Path(ctx.dirs["media"]) / "clip.mp4"
+        clip_path.write_bytes(b"clip")
+        ctx.state.render_spec = {
+            "generation_mode": "reference_style_transfer",
+            "edit_mode": "scene",
+            "canonical_timeline": [
+                {"scene_id": 1, "video_src": str(clip_path), "duration": 2.0, "start": 0.0, "end": 2.0}
+            ],
+            "overlay_plan": [],
+            "resolution": "1080x1920",
+            "music_mode": "original",
+        }
+        ctx.state.analysis = {"scenes": [{"scene_id": 1, "duration": 2.0, "start_time": 0.0, "end_time": 2.0}]}
+        ctx.state.analysis_available = True
+
+        monkeypatch.setenv("SHOTSTACK_KEY", "test-key")
+        monkeypatch.setattr(
+            "pipeline.executor._upload_assets_for_shotstack",
+            lambda job_id, local_paths: [
+                {"local_path": local_paths[0], "public_url": "https://example.com/clip.mp4"}
+            ],
+        )
+        captured = {}
+
+        def fake_render(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": False,
+                "error": "invalid payload",
+                "status": "failed",
+                "debug": {"status_code": 400, "response_json": {"message": "bad payload"}},
+            }
+
+        monkeypatch.setattr("ai_editor.shotstack_renderer.create_and_render_video", fake_render)
+
+        try:
+            executor._stage_shotstack_render(ctx)
+            assert False, "expected ProviderFailure"
+        except ProviderFailure as exc:
+            assert exc.code == "RENDER_PROVIDER_FAILED"
+            assert exc.detail["status_code"] == 400
+            assert exc.detail["shotstack_debug_path"].endswith("shotstack_error.json")
+            assert exc.detail["operation"] == "shotstack_render.create_and_render_video"
+
+        assert captured["debug_shotstack_error_path"].endswith("shotstack_error.json")
+        assert captured["debug_shotstack_payload_path"].endswith("shotstack_request_payload.json")
+
+        debug_path = Path(ctx.dirs["debug"]) / "shotstack_error.json"
+        assert debug_path.exists()
+        assert "bad payload" in debug_path.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_stage_shotstack_render_backfills_debug_file_when_renderer_raises(monkeypatch):
+    ctx = _ctx()
+    try:
+        executor = PipelineExecutor()
+        ctx.requirements["generation_mode"] = "reference_style_transfer"
+        ctx.state.requirements["generation_mode"] = "reference_style_transfer"
+
+        clip_path = Path(ctx.dirs["media"]) / "clip.mp4"
+        clip_path.write_bytes(b"clip")
+        ctx.state.render_spec = {
+            "generation_mode": "reference_style_transfer",
+            "edit_mode": "scene",
+            "canonical_timeline": [
+                {"scene_id": 1, "video_src": str(clip_path), "duration": 2.0, "start": 0.0, "end": 2.0}
+            ],
+            "overlay_plan": [],
+            "resolution": "1080x1920",
+            "music_mode": "original",
+        }
+        ctx.state.analysis = {"scenes": [{"scene_id": 1, "duration": 2.0, "start_time": 0.0, "end_time": 2.0}]}
+        ctx.state.analysis_available = True
+
+        monkeypatch.setenv("SHOTSTACK_KEY", "test-key")
+        monkeypatch.setattr(
+            "pipeline.executor._upload_assets_for_shotstack",
+            lambda job_id, local_paths: [
+                {"local_path": local_paths[0], "public_url": "https://example.com/clip.mp4"}
+            ],
+        )
+        monkeypatch.setattr(
+            "ai_editor.shotstack_renderer.create_and_render_video",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("kaboom")),
+        )
+
+        try:
+            executor._stage_shotstack_render(ctx)
+            assert False, "expected ProviderFailure"
+        except ProviderFailure as exc:
+            assert exc.detail["shotstack_debug_path"].endswith("shotstack_error.json")
+            assert exc.detail["short_error_message"]
+
+        debug_path = Path(ctx.dirs["debug"]) / "shotstack_error.json"
+        assert debug_path.exists()
+        assert "kaboom" in debug_path.read_text(encoding="utf-8")
     finally:
         shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)

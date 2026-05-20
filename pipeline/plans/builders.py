@@ -3,6 +3,12 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from ai_editor.generation_modes import (
+    FREE_GENERATION_MODE,
+    REFERENCE_STYLE_TRANSFER_MODE,
+    VISION_TEMPLATE_LEARNING_MODE,
+    normalize_generation_mode,
+)
 from ai_editor.planning import PlanRewriter, PlanValidator, StyleAwarePlanner
 from ai_editor.rendering import StyleDirectiveAdapter
 
@@ -572,9 +578,10 @@ def build_render_spec(
             resolution = "1080x1920"
 
     overlay_full_clip = bool(requirements.get("overlay_full_clip", False))
-    generation_mode = str(requirements.get("generation_mode", "free_generation_mode")).lower()
-    if generation_mode not in {"free_generation_mode", "reference_mimic_mode", "vision_template_learning"}:
-        generation_mode = "free_generation_mode"
+    generation_mode = normalize_generation_mode(
+        requirements.get("generation_mode"),
+        default=FREE_GENERATION_MODE,
+    )
     style_directive_result = _STYLE_DIRECTIVE_ADAPTER.adapt(
         timeline_plan=timeline_plan,
         overlay_plan=overlay_plan,
@@ -617,7 +624,10 @@ def build_render_spec(
         "refit_mode": "native_9x16" if output_mode == "native_9x16" else "crop_center",
         "overlay_full_clip": overlay_full_clip,
         "generation_mode": generation_mode,
-        "disable_auto_transitions": generation_mode in {"reference_mimic_mode", "vision_template_learning"},
+        "disable_auto_transitions": generation_mode in {
+            REFERENCE_STYLE_TRANSFER_MODE,
+            VISION_TEMPLATE_LEARNING_MODE,
+        },
     }
 
 

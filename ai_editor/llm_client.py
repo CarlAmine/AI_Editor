@@ -41,6 +41,25 @@ _PROVIDER_CONFIGS = [
 ]
 
 
+def _ai_client_verbose() -> bool:
+    raw = str(os.getenv("AI_CLIENT_VERBOSE", "false") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _log_attempt(label: str) -> None:
+    if _ai_client_verbose():
+        print(f"AI client: trying {label}")
+
+
+def _log_success(label: str) -> None:
+    if _ai_client_verbose():
+        print(f"AI client: {label} succeeded")
+
+
+def _log_failure(label: str, exc: Exception) -> None:
+    print(f"AI client: {label} failed: {exc}")
+
+
 def _build_providers() -> List[_Provider]:
     providers: List[_Provider] = []
     for cfg in _PROVIDER_CONFIGS:
@@ -144,7 +163,7 @@ def chat_json(
     last_failure: Optional[ProviderFailure] = None
     for provider in providers:
         label = f"{provider.name}/{provider.model}"
-        print(f"AI client: trying {label}")
+        _log_attempt(label)
         try:
             completion = provider.client.chat.completions.create(
                 messages=messages,
@@ -156,10 +175,10 @@ def chat_json(
             raw = completion.choices[0].message.content or ""
             raw = _strip_markdown_fences(raw)
             data = json.loads(raw)
-            print(f"AI client: {label} succeeded")
+            _log_success(label)
             return data
         except Exception as e:
-            print(f"AI client: {label} failed: {e}")
+            _log_failure(label, e)
             failure = normalize_provider_exception(
                 "model_provider",
                 e,
@@ -210,7 +229,7 @@ def chat_text(
     last_failure: Optional[ProviderFailure] = None
     for provider in providers:
         label = f"{provider.name}/{provider.model}"
-        print(f"AI client: trying {label}")
+        _log_attempt(label)
         try:
             completion = provider.client.chat.completions.create(
                 messages=messages,
@@ -221,10 +240,10 @@ def chat_text(
             content = completion.choices[0].message.content
             if content is None:
                 raise ValueError("Empty response content")
-            print(f"AI client: {label} succeeded")
+            _log_success(label)
             return content
         except Exception as e:
-            print(f"AI client: {label} failed: {e}")
+            _log_failure(label, e)
             failure = normalize_provider_exception(
                 "model_provider",
                 e,

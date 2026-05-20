@@ -36,6 +36,12 @@ from ai_editor.downloader import (
     extract_audio_segment,
 )
 from ai_editor.editing import EditSession, InstructionParser
+from ai_editor.generation_modes import (
+    FREE_GENERATION_MODE,
+    REFERENCE_STYLE_TRANSFER_MODE,
+    VISION_TEMPLATE_LEARNING_MODE,
+    normalize_generation_mode,
+)
 from ai_editor.google_auth import GoogleCredentialError
 from ai_editor.planning import PlanRewriter, PlanValidator
 
@@ -85,6 +91,12 @@ class ExecutionContext:
     state: JobState
     artifacts: ArtifactRegistry
     runtime: Dict[str, Any] = field(default_factory=dict)
+
+
+def _write_debug_json(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 class PipelineExecutor:
@@ -194,7 +206,10 @@ class PipelineExecutor:
             raise
 
     def _handle_run_analysis(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
-        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
         self._run_stage(ctx, StageName.INGEST, lambda: self._stage_ingest(ctx))
         self._run_stage(
             ctx,
@@ -202,7 +217,7 @@ class PipelineExecutor:
             lambda: self._stage_fetch_primary(ctx),
             done_check=lambda: _artifact_path_exists(ctx.artifacts, "primary.video"),
         )
-        if generation_mode == "vision_template_learning":
+        if generation_mode == VISION_TEMPLATE_LEARNING_MODE:
             update_stage(
                 ctx.state,
                 StageName.ANALYZE_PRIMARY,
@@ -223,7 +238,7 @@ class PipelineExecutor:
             lambda: self._stage_fetch_sources(ctx),
             done_check=lambda: ctx.artifacts.exists("sources.raw.1") or ctx.artifacts.exists("sources.fetch.1"),
         )
-        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
+        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
             update_stage(
                 ctx.state,
                 StageName.ALIGN_SOURCES,
@@ -241,7 +256,7 @@ class PipelineExecutor:
         self._refresh_source_status(ctx)
 
     def _handle_generate_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
-        if ctx.requirements.get("generation_mode") == "vision_template_learning":
+        if normalize_generation_mode(ctx.requirements.get("generation_mode")) == VISION_TEMPLATE_LEARNING_MODE:
             self._run_stage(
                 ctx,
                 StageName.AUDIO_PLAN,
@@ -370,7 +385,7 @@ class PipelineExecutor:
         touch(ctx.state)
         self._save(ctx)
         self._run_stage(ctx, StageName.RENDER_PLAN, lambda: self._stage_render_plan(ctx))
-        self._run_stage(ctx, StageName.SHOTSTACK_RENDER, lambda: self._stage_shotstack_render(ctx))
+        self._run_stage(ctx, StageName.SHOTSTACK_RENDER, lambda: self._stage_render_provider(ctx))
         self._run_stage(ctx, StageName.POSTPROCESS, lambda: self._stage_postprocess(ctx))
         self._run_stage(ctx, StageName.PUBLISH, lambda: self._stage_publish(ctx))
         response_status = "preview_ready" if render_mode == "preview" else "rendered"
@@ -459,7 +474,10 @@ class PipelineExecutor:
     def _stage_fetch_sources(self, ctx: ExecutionContext) -> None:
         folder_id = ctx.request_payload.get("gdrive_folder_id")
         sources = ctx.request_payload.get("sources") or []
-        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
 
         if folder_id:
             from .storage import DriveStorageAdapter
@@ -481,7 +499,7 @@ class PipelineExecutor:
             if not assets:
                 raise RuntimeError("No video files found in provided Google Drive folder.")
             try:
-                if generation_mode == "reference_mimic_mode":
+                if generation_mode == REFERENCE_STYLE_TRANSFER_MODE:
                     for index, asset in enumerate(assets, start=1):
                         fetch_url = adapter.get_fetchable_url(asset)
                         ctx.artifacts.register_url(
@@ -521,10 +539,10 @@ class PipelineExecutor:
             ctx.runtime["drive_folder_id"] = folder_id
             return
 
-        if generation_mode == "reference_mimic_mode":
+        if generation_mode == REFERENCE_STYLE_TRANSFER_MODE:
             if not sources:
                 raise RuntimeError(
-                    "Reference mimic mode requires explicit source URLs when Drive folder is not provided."
+                    "Reference style transfer requires explicit source URLs when Drive folder is not provided."
                 )
             for index, source in enumerate(sources, start=1):
                 url = str(source.get("url", "")).strip()
@@ -670,10 +688,10 @@ class PipelineExecutor:
                 soundtrack_file = extract_audio(custom_video, ctx.dirs["media"], "custom_music.mp3")
             ctx.artifacts.register_file("audio.soundtrack", soundtrack_file, {"mode": "custom"}, "audio/mpeg")
             soundtrack_url = soundtrack_file
-        elif music_mode == "original" and ctx.requirements.get("generation_mode") in {
-            "reference_mimic_mode",
-            "vision_template_learning",
-        }:
+        elif music_mode == "original" and normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        ) in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
             primary = ctx.artifacts.get("primary.video")
             if primary is None:
                 raise RuntimeError("Primary video is required to extract reference audio.")
@@ -1027,7 +1045,7 @@ class PipelineExecutor:
         if not ctx.state.current_plan:
             raise RuntimeError("No plan is available to render.")
 
-        if ctx.requirements.get("generation_mode") == "vision_template_learning":
+        if normalize_generation_mode(ctx.requirements.get("generation_mode")) == VISION_TEMPLATE_LEARNING_MODE:
             render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
             if not render_spec.get("canonical_timeline"):
                 raise RuntimeError("vision_template_learning requires a canonical_timeline before rendering.")
@@ -1058,7 +1076,10 @@ class PipelineExecutor:
 
         render_spec = build_render_spec(ctx.state.current_plan, overlay_plan, audio_plan, ctx.requirements)
         postprocess_plan = build_postprocess_plan(ctx.requirements)
-        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
         edit_mode = str(ctx.requirements.get("edit_mode", "scene")).lower().strip()
         if edit_mode not in {"scene", "ocr"}:
             edit_mode = "scene"
@@ -1084,7 +1105,7 @@ class PipelineExecutor:
             if edit_summary:
                 render_spec["edit_summary"] = edit_summary
                 render_spec["edit_ops"] = edit_ops
-        elif generation_mode == "reference_mimic_mode":
+        elif generation_mode == REFERENCE_STYLE_TRANSFER_MODE:
             canonical_timeline, overlay_timing, edit_summary, edit_ops = self._build_reference_render_timeline(
                 ctx,
                 analysis,
@@ -1133,7 +1154,7 @@ class PipelineExecutor:
                 continue
             meta = art.meta or {}
             trim_start = float(meta.get("trim_start", 0.0) or 0.0)
-            if generation_mode == "reference_mimic_mode":
+            if generation_mode == REFERENCE_STYLE_TRANSFER_MODE:
                 trim_start = 0.0
             probe_src = art.path_or_url
             raw_art = ctx.artifacts.get(f"sources.raw.{index}")
@@ -1147,7 +1168,7 @@ class PipelineExecutor:
         canonical_timeline = _build_ocr_timeline(
             text_segments=ocr_segments,
             sources=source_rows,
-            strict_index_alignment=(generation_mode == "reference_mimic_mode"),
+            strict_index_alignment=(generation_mode == REFERENCE_STYLE_TRANSFER_MODE),
         )
         edit_ops = _parse_edit_ops(ctx.requirements)
         edit_summary = None
@@ -1251,8 +1272,90 @@ class PipelineExecutor:
                 reference_audio_duration=reference_audio_duration,
             )
             if errors:
-                raise RuntimeError("Reference mimic validation failed:\n" + "\n".join(errors))
+                raise RuntimeError("Reference style transfer validation failed:\n" + "\n".join(errors))
         return canonical_timeline, overlay_timing, edit_summary, edit_ops
+
+    def _stage_render_provider(self, ctx: ExecutionContext) -> None:
+        """Render video using configured provider (FFmpeg or Shotstack)."""
+        render_provider = str(os.getenv("RENDER_PROVIDER", "ffmpeg")).strip().lower()
+        
+        if render_provider == "ffmpeg":
+            return self._stage_ffmpeg_render(ctx)
+        elif render_provider == "shotstack":
+            return self._stage_shotstack_render(ctx)
+        else:
+            raise ProviderFailure(
+                provider="render_provider",
+                code="INVALID_RENDER_PROVIDER",
+                user_message=f"Invalid RENDER_PROVIDER: {render_provider}. Supported: ffmpeg, shotstack",
+                detail={"env_value": render_provider},
+                retryable=False,
+            )
+
+    def _stage_ffmpeg_render(self, ctx: ExecutionContext) -> None:
+        """Render video locally using FFmpeg."""
+        from ai_editor.renderers import FFmpegRenderer
+
+        spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
+        if not spec or not spec.get("canonical_timeline"):
+            raise ProviderFailure(
+                provider="render_provider",
+                code="RENDER_SPEC_MISSING",
+                user_message="Rendering requires canonical_timeline in render_spec.",
+                detail={"has_render_spec": bool(spec), "has_canonical_timeline": bool(spec and spec.get("canonical_timeline"))},
+                retryable=False,
+            )
+
+        try:
+            renderer = FFmpegRenderer()
+            result = renderer.render(
+                render_spec=spec,
+                job_id=ctx.job_id,
+                job_dir=ctx.dirs["job"],
+            )
+        except Exception as exc:
+            raise normalize_provider_exception(
+                "render_provider",
+                exc,
+                operation="ffmpeg_render.render",
+                config_message="The FFmpeg renderer is not configured correctly.",
+                timeout_message="The FFmpeg render operation timed out.",
+                auth_message="The FFmpeg render operation failed (not applicable).",
+                network_message="The FFmpeg render operation failed.",
+                default_message="The FFmpeg render operation failed.",
+            ) from exc
+
+        if not result.get("success"):
+            raise ProviderFailure(
+                provider="render_provider",
+                code="FFMPEG_RENDER_FAILED",
+                user_message=result.get("error", "FFmpeg render failed."),
+                detail={
+                    "error": result.get("error"),
+                    "debug_info": result.get("debug_info"),
+                },
+                retryable=False,
+            )
+
+        # Register output artifacts
+        output_path = result.get("output_path")
+        if output_path and os.path.exists(output_path):
+            ctx.artifacts.register_file(
+                "render.master_16x9",
+                output_path,
+                {"render_id": result.get("render_id"), "provider": "ffmpeg"},
+                "video/mp4",
+            )
+
+        # Register preview URL
+        ctx.artifacts.register_url(
+            "render.ffmpeg_url",
+            result.get("url", ""),
+            {"render_id": result.get("render_id"), "provider": "ffmpeg"},
+            "video/mp4",
+        )
+
+        ctx.runtime["render_result"] = result
 
     def _stage_shotstack_render(self, ctx: ExecutionContext) -> None:
         from ai_editor.shotstack_renderer import create_and_render_video
@@ -1270,13 +1373,16 @@ class PipelineExecutor:
         spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
         canonical_timeline = spec.get("canonical_timeline") or []
         edit_summary = spec.get("edit_summary") or {}
-        generation_mode = str(spec.get("generation_mode", ctx.requirements.get("generation_mode", "free_generation_mode"))).lower()
+        generation_mode = normalize_generation_mode(
+            spec.get("generation_mode", ctx.requirements.get("generation_mode", FREE_GENERATION_MODE)),
+            default=FREE_GENERATION_MODE,
+        )
         edit_mode = str(spec.get("edit_mode", ctx.requirements.get("edit_mode", "scene"))).lower().strip()
         if edit_mode not in {"scene", "ocr"}:
             edit_mode = "scene"
-        if generation_mode == "reference_mimic_mode" and edit_mode == "scene" and not canonical_timeline:
+        if generation_mode == REFERENCE_STYLE_TRANSFER_MODE and edit_mode == "scene" and not canonical_timeline:
             raise RuntimeError(
-                "reference_mimic_mode requires canonical_timeline in render_spec; refusing non-canonical render."
+                "reference_style_transfer requires canonical_timeline in render_spec; refusing non-canonical render."
             )
         if edit_mode == "ocr" and not canonical_timeline:
             raise RuntimeError("OCR mode requires canonical_timeline in render_spec; refusing scene-timed fallback.")
@@ -1344,13 +1450,13 @@ class PipelineExecutor:
             analysis = self._load_analysis(ctx)
             analyzed_scenes = analysis.get("scenes") or []
             if (
-                generation_mode == "reference_mimic_mode"
+                generation_mode == REFERENCE_STYLE_TRANSFER_MODE
                 and edit_mode == "scene"
                 and len(canonical_timeline) != len(analyzed_scenes)
                 and not (edit_summary.get("count_changed") or edit_summary.get("timing_changed"))
             ):
                 raise RuntimeError(
-                    f"reference_mimic_mode clip-count mismatch: canonical={len(canonical_timeline)} analyzed={len(analyzed_scenes)}"
+                    f"reference_style_transfer clip-count mismatch: canonical={len(canonical_timeline)} analyzed={len(analyzed_scenes)}"
                 )
 
         probe_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
@@ -1373,6 +1479,9 @@ class PipelineExecutor:
             spec["soundtrack_url"] = soundtrack_url
             ctx.state.render_spec = spec
 
+        shotstack_payload_path = os.path.join(ctx.dirs["plans"], "shotstack_request_payload.json")
+        shotstack_debug_path = os.path.join(ctx.dirs["debug"], "shotstack_error.json")
+
         try:
             render_result = create_and_render_video(
                 api_key=shotstack_key,
@@ -1388,7 +1497,10 @@ class PipelineExecutor:
                 overlay_timing=spec.get("overlay_timing") or None,
                 overlay_script=spec.get("overlay_script") or None,
                 timing_mode=str(spec.get("timing_mode", "ocr_keyframe")),
-                generation_mode=str(spec.get("generation_mode", ctx.requirements.get("generation_mode", "free_generation_mode"))),
+                generation_mode=normalize_generation_mode(
+                    spec.get("generation_mode", ctx.requirements.get("generation_mode", FREE_GENERATION_MODE)),
+                    default=FREE_GENERATION_MODE,
+                ),
                 canonical_timeline=canonical_timeline or None,
                 force_mobile_safe_text=bool(spec.get("force_mobile_safe_text")),
                 mobile_safe_text_mode=bool(spec.get("mobile_safe_text_mode", False)),
@@ -1405,10 +1517,27 @@ class PipelineExecutor:
                 debug_text_visibility=bool(ctx.requirements.get("debug_text_visibility", False)),
                 debug_render_spec_path=os.path.join(ctx.dirs["plans"], "render_spec.json"),
                 debug_overlay_timing_path=os.path.join(ctx.dirs["plans"], "overlay_timing.json"),
-                debug_shotstack_payload_path=os.path.join(ctx.dirs["plans"], "shotstack_request_payload.json"),
+                debug_shotstack_payload_path=shotstack_payload_path,
+                debug_shotstack_error_path=shotstack_debug_path,
             )
         except Exception as exc:
-            raise normalize_provider_exception(
+            if not os.path.exists(shotstack_debug_path):
+                _write_debug_json(
+                    shotstack_debug_path,
+                    {
+                        "stage": "shotstack_create",
+                        "status_code": None,
+                        "response_text": None,
+                        "response_json": None,
+                        "error": "The render provider failed while creating the video render.",
+                        "exception": repr(exc),
+                        "render_id": None,
+                        "request_url": f"{os.getenv('SHOTSTACK_HOST', 'https://api.shotstack.io/stage').strip() or 'https://api.shotstack.io/stage'}/render",
+                        "payload_path": shotstack_payload_path,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                )
+            failure = normalize_provider_exception(
                 "render_provider",
                 exc,
                 operation="shotstack_render.create_and_render_video",
@@ -1417,7 +1546,59 @@ class PipelineExecutor:
                 auth_message="The render provider rejected authentication. Check SHOTSTACK_KEY.",
                 network_message="The render provider is temporarily unavailable.",
                 default_message="The render provider failed while creating the video render.",
+            )
+            detail = dict(failure.detail or {})
+            detail.update(
+                {
+                    "failure_code": failure.code,
+                    "provider": failure.provider,
+                    "retryable": failure.retryable,
+                    "operation": "shotstack_render.create_and_render_video",
+                    "shotstack_debug_path": shotstack_debug_path,
+                    "short_error_message": failure.user_message,
+                }
+            )
+            raise ProviderFailure(
+                provider=failure.provider,
+                code=failure.code,
+                user_message=failure.user_message,
+                detail=detail,
+                retryable=failure.retryable,
             ) from exc
+        if not render_result.get("success"):
+            error_detail = dict(render_result.get("debug") or render_result.get("error_detail") or {})
+            if render_result.get("status"):
+                error_detail.setdefault("status", render_result.get("status"))
+            if render_result.get("render_id"):
+                error_detail.setdefault("render_id", render_result.get("render_id"))
+            if render_result.get("error"):
+                error_detail.setdefault("message", render_result.get("error"))
+            _write_debug_json(shotstack_debug_path, error_detail or {"message": "Unknown Shotstack render failure."})
+            ctx.artifacts.register_file(
+                "debug.shotstack_error",
+                shotstack_debug_path,
+                {"render_id": render_result.get("render_id")},
+                "application/json",
+            )
+            error_detail.update(
+                {
+                    "failure_code": "RENDER_PROVIDER_FAILED",
+                    "provider": "render_provider",
+                    "retryable": bool(render_result.get("status") == "timeout"),
+                    "operation": "shotstack_render.create_and_render_video",
+                    "shotstack_debug_path": shotstack_debug_path,
+                    "short_error_message": str(
+                        render_result.get("error") or "The render provider failed while creating the video render."
+                    ),
+                }
+            )
+            raise ProviderFailure(
+                provider="render_provider",
+                code="RENDER_PROVIDER_FAILED",
+                user_message=str(render_result.get("error") or "The render provider failed while creating the video render."),
+                detail=error_detail or {"shotstack_debug_path": shotstack_debug_path},
+                retryable=bool(render_result.get("status") == "timeout"),
+            )
         if not render_result.get("success") or not render_result.get("url"):
             raise RuntimeError(f"Render failed: {render_result.get('error') or 'No output URL returned.'}")
 
@@ -1498,8 +1679,11 @@ class PipelineExecutor:
         return {}
 
     def _source_keys_for_generation(self, ctx: ExecutionContext) -> List[str]:
-        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
-        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
+        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
             return _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
         source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
         if not source_keys:
@@ -1507,8 +1691,11 @@ class PipelineExecutor:
         return source_keys
 
     def _source_durations_for_plan(self, ctx: ExecutionContext, analysis: Dict[str, Any]) -> List[float]:
-        generation_mode = ctx.requirements.get("generation_mode", "free_generation_mode")
-        if generation_mode in {"reference_mimic_mode", "vision_template_learning"}:
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
+        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
             return []
         source_keys = self._source_keys_for_generation(ctx)
         source_paths = [ctx.artifacts.get(key).path_or_url for key in source_keys if ctx.artifacts.get(key)]
@@ -1519,7 +1706,10 @@ class PipelineExecutor:
         fetch_count = len(_sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch."))
         aligned_count = len(_sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned."))
         status = {
-            "generation_mode": ctx.requirements.get("generation_mode", "free_generation_mode"),
+            "generation_mode": normalize_generation_mode(
+                ctx.requirements.get("generation_mode"),
+                default=FREE_GENERATION_MODE,
+            ),
             "primary_ready": _artifact_path_exists(ctx.artifacts, "primary.video"),
             "raw_source_count": raw_count,
             "fetch_source_count": fetch_count,
@@ -1706,7 +1896,13 @@ class PipelineExecutor:
         operations: List[EditOperation] = []
 
         # 1. Freshly parsed operations from this turn (already EditOperation dicts)
-        parsed = ctx.state.get("parsed_operations") or []
+        requirements = {}
+        if isinstance(ctx.requirements, dict):
+            requirements = ctx.requirements
+        elif isinstance(getattr(ctx.state, "requirements", None), dict):
+            requirements = ctx.state.requirements
+
+        parsed = requirements.get("parsed_operations") or []
         for item in parsed:
             if isinstance(item, dict) and item.get("operation"):
                 try:
@@ -1740,7 +1936,7 @@ class PipelineExecutor:
         # 2. Fall back to accumulated edit_requests history
         # Handles both new-style dicts and legacy strings
         _parser = InstructionParser()
-        for request in (ctx.state.get("edit_requests") or []):
+        for request in (requirements.get("edit_requests") or []):
             if isinstance(request, dict) and request.get("operation"):
                 # New-style dict — reconstruct directly (same as above)
                 try:
@@ -1782,7 +1978,10 @@ class PipelineExecutor:
         requests: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         requests = list(requests or [])
-        if not requests or not timeline_plan:
+        if not timeline_plan:
+            return timeline_plan
+        requirements = ctx.requirements if isinstance(ctx.requirements, dict) else {}
+        if not requests and not (requirements.get("parsed_operations") or []):
             return timeline_plan
 
         session = EditSession.from_payloads(
@@ -2447,14 +2646,16 @@ def _apply_edit_ops_to_timeline(
 def _build_reference_timeline(analysis: Dict[str, Any], sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     scenes = analysis.get("scenes") or []
     if not scenes:
-        raise RuntimeError("Reference mimic mode requires analyzed scenes.")
+        raise RuntimeError("Reference style transfer requires analyzed scenes.")
     durations = [float(scene.get("duration", 0.0)) for scene in scenes]
     if any(duration <= 0 for duration in durations):
-        raise RuntimeError("Reference mimic mode requires positive analyzed scene durations.")
+        raise RuntimeError("Reference style transfer requires positive analyzed scene durations.")
     if not sources:
-        raise RuntimeError("No valid source clips available for reference mimic mode.")
+        raise RuntimeError("No valid source clips available for reference style transfer.")
     if len(sources) < len(scenes):
-        raise RuntimeError(f"Reference mimic requires at least {len(scenes)} sources; received {len(sources)}.")
+        raise RuntimeError(
+            f"Reference style transfer requires at least {len(scenes)} sources; received {len(sources)}."
+        )
 
     timeline = []
     for index, scene in enumerate(scenes, start=1):
@@ -2467,10 +2668,12 @@ def _build_reference_timeline(analysis: Dict[str, Any], sources: List[Dict[str, 
         if probe_src and not _is_http_url(probe_src):
             source_duration = _probe_duration_any(probe_src)
             if source_duration <= 0.0:
-                raise RuntimeError(f"Reference mimic source {index} duration could not be determined: {probe_src}")
+                raise RuntimeError(
+                    f"Reference style transfer source {index} duration could not be determined: {probe_src}"
+                )
             if source_duration + 0.02 < trim_start + target_duration:
                 raise RuntimeError(
-                    f"Reference mimic assignment failed for scene {index}: source too short "
+                    f"Reference style transfer assignment failed for scene {index}: source too short "
                     f"(source={source_duration:.2f}s, trim={trim_start:.2f}s, required={target_duration:.2f}s)."
                 )
         start = float(scene.get("start_time", sum(durations[: index - 1])))
@@ -2573,7 +2776,7 @@ def _build_ocr_timeline(
     ordered_segments = sorted(text_segments, key=lambda segment: float(segment.get("start", 0.0)))
     if strict_index_alignment and len(sources) < len(ordered_segments):
         raise RuntimeError(
-            f"OCR mode in reference mimic requires at least {len(ordered_segments)} sources; received {len(sources)}."
+            f"OCR mode in reference style transfer requires at least {len(ordered_segments)} sources; received {len(sources)}."
         )
     timeline: List[Dict[str, Any]] = []
     duration_cache: Dict[str, float] = {}

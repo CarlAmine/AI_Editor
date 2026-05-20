@@ -5,6 +5,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+from ai_editor.generation_modes import (
+    FREE_GENERATION_MODE,
+    REFERENCE_STYLE_TRANSFER_MODE,
+    normalize_generation_mode,
+)
 from pipeline.feedback import build_pipeline_assistant_feedback
 
 from .artifacts import ArtifactRegistry
@@ -88,13 +93,10 @@ def _normalize_requirements(request_payload: Dict[str, Any]) -> Dict[str, Any]:
     requirements["custom_music_end"] = request_payload.get("custom_music_end")
     requirements["custom_music_segment"] = request_payload.get("custom_music_segment")
     requirements["custom_music_segments"] = request_payload.get("custom_music_segments")
-    requirements["generation_mode"] = str(requirements.get("generation_mode", "free_generation_mode")).lower()
-    if requirements["generation_mode"] not in {
-        "free_generation_mode",
-        "reference_mimic_mode",
-        "vision_template_learning",
-    }:
-        requirements["generation_mode"] = "free_generation_mode"
+    requirements["generation_mode"] = normalize_generation_mode(
+        requirements.get("generation_mode"),
+        default=FREE_GENERATION_MODE,
+    )
     if "slot_mapping" not in requirements and request_payload.get("slot_mapping") is not None:
         requirements["slot_mapping"] = request_payload.get("slot_mapping")
     if "expected_slots" not in requirements and request_payload.get("expected_slots") is not None:
@@ -454,7 +456,7 @@ def _provider_requirements(
     decision_engine: Optional[PipelineDecisionEngine],
     executor: Optional[PipelineExecutor],
 ) -> Dict[str, bool]:
-    requirements = {"llm": decision_engine is None, "render": executor is None, "drive": executor is None}
+    requirements = {"llm": False, "render": executor is None, "drive": executor is None}
     if executor is not None and hasattr(executor, "provider_requirements"):
         reported = getattr(executor, "provider_requirements")()
         requirements["render"] = bool(reported.get("render", requirements["render"]))
@@ -463,6 +465,40 @@ def _provider_requirements(
         reported = getattr(decision_engine, "provider_requirements")()
         requirements["llm"] = bool(reported.get("llm", requirements["llm"]))
     return requirements
+
+
+def _should_use_deterministic_style_route(requirements: Dict[str, Any]) -> bool:
+    return (
+        normalize_generation_mode(requirements.get("generation_mode"), default=FREE_GENERATION_MODE)
+        == REFERENCE_STYLE_TRANSFER_MODE
+    )
+
+
+def _run_deterministic_style_transfer_route(
+    ctx: ExecutionContext,
+    executor: PipelineExecutor,
+) -> None:
+    for action in ("run_analysis", "generate_plan", "validate_plan", "render_final", "finish"):
+        if is_terminal(ctx.state):
+            break
+        decision = PipelineDecision(
+            next_action=action,
+            confidence=1.0,
+            rationale="Deterministic reference style-transfer route.",
+            parameters={"deterministic_route": True},
+        )
+        record_decision(
+            ctx.state,
+            next_action=decision.next_action,
+            confidence=decision.confidence,
+            rationale=decision.rationale,
+            parameters=decision.parameters,
+            source="deterministic",
+            overridden=False,
+        )
+        _save(ctx)
+        executor.execute(ctx, decision)
+        _save(ctx)
 
 
 def _validate_provider_readiness(
@@ -683,10 +719,12 @@ def run_job(
     )
 
     guardrails = guardrails or RunnerGuardrails()
-    decision_engine = decision_engine or PipelineDecisionEngine(
-        minimum_validation_score=guardrails.minimum_validation_score,
-        max_revision_attempts=guardrails.max_revision_attempts,
-    )
+    use_deterministic_style_route = _should_use_deterministic_style_route(requirements)
+    if not use_deterministic_style_route:
+        decision_engine = decision_engine or PipelineDecisionEngine(
+            minimum_validation_score=guardrails.minimum_validation_score,
+            max_revision_attempts=guardrails.max_revision_attempts,
+        )
     executor = executor or PipelineExecutor(
         save_hook=_save,
         minimum_validation_score=guardrails.minimum_validation_score,
@@ -700,6 +738,25 @@ def run_job(
     _save(ctx)
     if readiness_failure is not None:
         return readiness_failure
+
+    if use_deterministic_style_route:
+        try:
+            _run_deterministic_style_transfer_route(ctx, executor)
+        except ProviderFailure as exc:
+            if not is_terminal(ctx.state):
+                mark_terminal(
+                    ctx.state,
+                    JobStatus.FAILED,
+                    reason=exc.user_message,
+                    code=exc.code,
+                    detail=exc.to_error_detail(),
+                )
+                _save(ctx)
+        except Exception as exc:
+            if not is_terminal(ctx.state):
+                mark_terminal(ctx.state, JobStatus.FAILED, reason=str(exc), code="PIPELINE_EXECUTION_FAILED")
+                _save(ctx)
+        return _build_response(ctx)
 
     iterations = 0
     while not is_terminal(ctx.state):

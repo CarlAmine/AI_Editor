@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from ai_editor.generation_modes import is_vision_mode as _is_generation_vision_mode
+
 
 class StageName(str, Enum):
     PROVIDER_READINESS = "PROVIDER_READINESS"
@@ -155,7 +157,7 @@ class JobState:
 
     def is_vision_mode(self) -> bool:
         generation_mode = str(self.requirements.get("generation_mode", "") or "").strip().lower()
-        return generation_mode in {"reference_mimic_mode", "vision_template_learning"}
+        return _is_generation_vision_mode(generation_mode)
 
 
 def default_stages() -> Dict[str, StageEntry]:

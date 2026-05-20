@@ -1,6 +1,8 @@
 import re
 from typing import Any, Dict, Optional
 
+from ai_editor.generation_modes import normalize_generation_mode
+
 
 def build_pipeline_assistant_feedback(
     error: str,
@@ -11,7 +13,7 @@ def build_pipeline_assistant_feedback(
     requirements = requirements or {}
     message = str(error or "").strip() or "Pipeline failed."
     low = message.lower()
-    generation_mode = str(requirements.get("generation_mode", "free_generation_mode")).strip().lower()
+    generation_mode = normalize_generation_mode(requirements.get("generation_mode"))
     edit_mode = str(requirements.get("edit_mode", "scene")).strip().lower()
 
     feedback: Dict[str, Any] = {
@@ -55,7 +57,7 @@ def build_pipeline_assistant_feedback(
         return feedback
 
     ref_mimic_match = re.search(
-        r"Reference mimic requires at least (\d+) sources; received (\d+)\.",
+        r"Reference (?:mimic|style transfer) requires at least (\d+) sources; received (\d+)\.",
         message,
         re.IGNORECASE,
     )
@@ -68,7 +70,7 @@ def build_pipeline_assistant_feedback(
             category="input",
             reason="reference_mimic_too_few_sources",
             assistant_message=(
-                f"I couldn't continue because reference mimic mode needs {required} source videos, "
+                f"I couldn't continue because reference style transfer needs {required} source videos, "
                 f"and only {received} {'was' if received == 1 else 'were'} available. "
                 f"Add {missing} more source clip{'s' if missing != 1 else ''} in Source Footage or Bulk Source, "
                 "or tell me in chat to switch this job to free generation mode."
@@ -82,7 +84,7 @@ def build_pipeline_assistant_feedback(
         )
 
     ocr_match = re.search(
-        r"OCR mode in reference mimic requires at least (\d+) sources; received (\d+)\.",
+        r"OCR mode in reference (?:mimic|style transfer) requires at least (\d+) sources; received (\d+)\.",
         message,
         re.IGNORECASE,
     )
@@ -95,8 +97,8 @@ def build_pipeline_assistant_feedback(
             category="input",
             reason="ocr_reference_mimic_too_few_sources",
             assistant_message=(
-                f"OCR reference mimic needs {required} source videos, but only {received} {'was' if received == 1 else 'were'} provided. "
-                f"Add {missing} more source clip{'s' if missing != 1 else ''}, or ask me in chat to switch away from OCR/reference mimic mode."
+                f"OCR reference style transfer needs {required} source videos, but only {received} {'was' if received == 1 else 'were'} provided. "
+                f"Add {missing} more source clip{'s' if missing != 1 else ''}, or ask me in chat to switch away from OCR/reference style transfer mode."
             ),
             extra={
                 "required_sources": required,
