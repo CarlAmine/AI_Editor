@@ -306,16 +306,15 @@ Test coverage:
 
 ## Performance & Benchmarks
 
-> 🚧 Benchmarking data to be added. Run the pipeline on representative inputs and open a PR to fill in the table.
+Measured on real pipeline runs with basic text/clip editing workloads.
 
 | Metric | Value | Notes |
 |---|---|---|
-| Average job duration | — | End-to-end, reference → rendered artifact |
-| Shotstack render turnaround | — | Dependent on clip count and resolution |
-| OCR extraction latency | — | Per frame, GPU vs CPU |
-| Scene detection latency | — | Per minute of video |
-| Shorts conversion time | — | Post-render |
-| Pipeline success rate | — | Under normal load |
+| Average job duration | ~10 min | End-to-end, reference → rendered artifact; basic text/clip edit |
+| Shotstack render turnaround | 1–2 min | Dependent on clip count and resolution |
+| OCR + scene detection latency | Up to 4–5 min | Scales with video length |
+| Shorts conversion time | ~10 sec | ffmpeg 16:9 → 9:16 reframe |
+| Pipeline success rate | 100% on tested runs | Elementary editing workload; complex edits not yet benchmarked |
 
 ---
 
