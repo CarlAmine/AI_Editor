@@ -39,7 +39,15 @@ class _FailingSmokeExecutor(SmokePipelineExecutor):
             detail={"provider": "smoke-render"},
             retryable=True,
         )
-
+        
+    def _stage_ffmpeg_render(self, ctx):
+        raise ProviderFailure(
+            provider="render_provider",
+            code="RENDER_PROVIDER_TIMEOUT",
+            user_message="The render provider timed out during the smoke render.",
+            detail={"provider": "smoke-render"},
+            retryable=True,
+        )
 
 def test_run_job_fails_fast_when_required_providers_are_not_configured(monkeypatch):
     job_id = _job_id("provider-config")
@@ -49,6 +57,7 @@ def test_run_job_fails_fast_when_required_providers_are_not_configured(monkeypat
         monkeypatch.setenv("DRIVE_AUTH_MODE", "oauth_user")
         monkeypatch.setenv("DRIVE_CLIENT_SECRET_FILE", str(Path("tmp") / "missing-drive-client-secret.json"))
         monkeypatch.setenv("DRIVE_TOKEN_FILE", str(Path("tmp") / "missing-drive-token.json"))
+        monkeypatch.setenv("RENDER_PROVIDER", "shotstack")
 
         result = run_job(job_id, _request())
 

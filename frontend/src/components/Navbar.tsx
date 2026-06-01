@@ -15,7 +15,6 @@ const navLinks = [
   { href: "/architecture", label: "Architecture" },
   { href: "/stack", label: "Tech Stack" },
   { href: "/docs", label: "Docs" },
-  { href: "/pipeline", label: "Pipeline" },
 ];
 
 export default function Navbar() {
@@ -113,6 +112,19 @@ export default function Navbar() {
 
           {/* Right actions */}
           <div className="flex items-center gap-3">
+            <Link href="/workspace">
+              <span
+                className="hidden md:inline-flex items-center px-4 py-2 text-sm font-semibold rounded-sm transition-all duration-200"
+                style={{
+                  fontFamily: "'DM Sans', sans-serif",
+                  background: "oklch(0.75 0.18 70)",
+                  color: "oklch(0.09 0.015 265)",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Try AI Editor
+              </span>
+            </Link>
             <a
               href="https://github.com/CarlAmine/AI_Editor"
               target="_blank"
@@ -192,6 +204,18 @@ export default function Navbar() {
                 );
               })}
               <div className="mt-2 pt-3" style={{ borderTop: "1px solid oklch(1 0 0 / 8%)" }}>
+                <Link href="/workspace">
+                  <div
+                    className="px-4 py-3 text-sm font-semibold tracking-wide rounded-sm"
+                    style={{
+                      fontFamily: "'DM Sans', sans-serif",
+                      color: "oklch(0.09 0.015 265)",
+                      background: "oklch(0.75 0.18 70)",
+                    }}
+                  >
+                    Try AI Editor
+                  </div>
+                </Link>
                 <a
                   href="https://github.com/CarlAmine/AI_Editor"
                   target="_blank"

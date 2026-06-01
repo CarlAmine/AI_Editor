@@ -18,6 +18,7 @@ import Architecture from "./pages/Architecture";
 import Stack from "./pages/Stack";
 import Docs from "./pages/Docs";
 import Pipeline from "./pages/Pipeline";
+import Workspace from "./pages/Workspace";
 import Navbar from "./components/Navbar";
 import PageLoader from "./components/PageLoader";
 import { useState, useEffect } from "react";
@@ -44,6 +45,17 @@ function AnimatedRoute({ component: Component }: { component: React.ComponentTyp
 
 function Router() {
   const [location] = useLocation();
+  const isWorkspace = location === "/workspace" || location === "/ai-editor";
+
+  if (isWorkspace) {
+    return (
+      <Switch>
+        <Route path="/workspace" component={Workspace} />
+        <Route path="/ai-editor" component={Workspace} />
+      </Switch>
+    );
+  }
+
   return (
     <AnimatePresence mode="wait">
       <Switch key={location} location={location}>
@@ -57,6 +69,22 @@ function Router() {
         <Route component={NotFound} />
       </Switch>
     </AnimatePresence>
+  );
+}
+
+function AppShell() {
+  const [location] = useLocation();
+  const isWorkspace = location === "/workspace" || location === "/ai-editor";
+
+  if (isWorkspace) {
+    return <Router />;
+  }
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <Router />
+    </div>
   );
 }
 
@@ -76,10 +104,7 @@ function App() {
           {loading ? (
             <PageLoader onComplete={() => setLoading(false)} />
           ) : (
-            <div className="min-h-screen bg-background">
-              <Navbar />
-              <Router />
-            </div>
+            <AppShell />
           )}
         </TooltipProvider>
       </ThemeProvider>

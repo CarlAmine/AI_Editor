@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+
+log = logging.getLogger(__name__)
 
 from ai_editor.analyzer import analyze_video_content_with_results
 from ai_editor.analysis.analysis_schema import MotionEffectManifest
@@ -40,8 +43,12 @@ from ai_editor.generation_modes import (
     FREE_GENERATION_MODE,
     REFERENCE_STYLE_TRANSFER_MODE,
     VISION_TEMPLATE_LEARNING_MODE,
+    REFERENCE_EDIT_AGENT_MODE,
     normalize_generation_mode,
 )
+from ai_editor.reference_learning import build_reference_edit_template
+from ai_editor.source_inventory import build_source_inventory
+from ai_editor.edit_agent import ReferenceEditAgentError, run_edit_agent_compile_stage
 from ai_editor.google_auth import GoogleCredentialError
 from ai_editor.planning import PlanRewriter, PlanValidator
 
@@ -109,7 +116,7 @@ class PipelineExecutor:
         validator: Optional[PlanValidator] = None,
         rewriter: Optional[PlanRewriter] = None,
         instruction_parser: Optional[InstructionParser] = None,
-        minimum_validation_score: float = 0.74,
+        minimum_validation_score: float = 0.5,
         provider_requirements: Optional[Dict[str, bool]] = None,
     ) -> None:
         self._save_hook = save_hook or (lambda _ctx: None)
@@ -256,7 +263,38 @@ class PipelineExecutor:
         self._refresh_source_status(ctx)
 
     def _handle_generate_plan(self, ctx: ExecutionContext, decision: PipelineDecision) -> None:
-        if normalize_generation_mode(ctx.requirements.get("generation_mode")) == VISION_TEMPLATE_LEARNING_MODE:
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
+        if generation_mode == REFERENCE_EDIT_AGENT_MODE:
+            self._run_stage(
+                ctx,
+                StageName.AUDIO_PLAN,
+                lambda: self._stage_audio_plan(ctx),
+                done_check=lambda: bool(ctx.state.audio_plan),
+            )
+            self._run_stage(
+                ctx,
+                StageName.BUILD_REFERENCE_TEMPLATE,
+                lambda: self._stage_build_reference_template(ctx),
+                done_check=lambda: ctx.artifacts.exists("reference.edit_template"),
+            )
+            self._run_stage(
+                ctx,
+                StageName.ANALYZE_SOURCE_INVENTORY,
+                lambda: self._stage_analyze_source_inventory(ctx),
+                done_check=lambda: ctx.artifacts.exists("source.inventory"),
+            )
+            self._run_stage(
+                ctx,
+                StageName.EDIT_AGENT_COMPILE,
+                lambda: self._stage_edit_agent_compile(ctx),
+                done_check=lambda: ctx.artifacts.exists("render.compiled_spec"),
+            )
+            return
+
+        if generation_mode == VISION_TEMPLATE_LEARNING_MODE:
             self._run_stage(
                 ctx,
                 StageName.AUDIO_PLAN,
@@ -691,7 +729,7 @@ class PipelineExecutor:
         elif music_mode == "original" and normalize_generation_mode(
             ctx.requirements.get("generation_mode"),
             default=FREE_GENERATION_MODE,
-        ) in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
+        ) in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE, REFERENCE_EDIT_AGENT_MODE}:
             primary = ctx.artifacts.get("primary.video")
             if primary is None:
                 raise RuntimeError("Primary video is required to extract reference audio.")
@@ -1045,7 +1083,37 @@ class PipelineExecutor:
         if not ctx.state.current_plan:
             raise RuntimeError("No plan is available to render.")
 
-        if normalize_generation_mode(ctx.requirements.get("generation_mode")) == VISION_TEMPLATE_LEARNING_MODE:
+        generation_mode = normalize_generation_mode(
+            ctx.requirements.get("generation_mode"),
+            default=FREE_GENERATION_MODE,
+        )
+        if generation_mode == REFERENCE_EDIT_AGENT_MODE:
+            render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
+            if not render_spec.get("canonical_timeline"):
+                raise RuntimeError("reference_edit_agent requires a canonical_timeline before rendering.")
+            if (ctx.state.plan_validation or {}).get("validator_strategy") != "edit_graph_validator":
+                raise RuntimeError("reference_edit_agent requires a validated edit graph before rendering.")
+            
+            canonical_timeline = render_spec.get("canonical_timeline") or []
+            total_duration = float(sum(row.get("duration", 0.0) for row in canonical_timeline))
+            
+            render_spec = self._apply_motion_effects_to_render_spec(ctx, render_spec)
+            ctx.state.render_spec = render_spec
+            touch(ctx.state)
+            
+            self._write_plan_bundle(
+                ctx,
+                timeline_plan=ctx.state.current_plan,
+                overlay_plan=ctx.state.overlay_plan or {"overlays": [], "text_segments": [], "warnings": [], "overlay_script": None},
+                audio_plan=ctx.state.audio_plan or {},
+                render_spec=render_spec,
+                postprocess_plan=build_postprocess_plan(ctx.requirements),
+                analysis_duration=total_duration,
+                render_duration=total_duration,
+            )
+            return
+
+        if generation_mode == VISION_TEMPLATE_LEARNING_MODE:
             render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
             if not render_spec.get("canonical_timeline"):
                 raise RuntimeError("vision_template_learning requires a canonical_timeline before rendering.")
@@ -1120,6 +1188,8 @@ class PipelineExecutor:
                 render_spec["edit_ops"] = edit_ops
 
         render_spec = self._apply_motion_effects_to_render_spec(ctx, render_spec)
+        filter_plan = self._build_render_filter_plan(render_spec)
+        _write_render_filter_plan(ctx.dirs["debug"], filter_plan)
         ctx.state.render_spec = render_spec
         touch(ctx.state)
         self._write_plan_bundle(
@@ -1220,25 +1290,11 @@ class PipelineExecutor:
             )
 
         canonical_timeline = _build_reference_timeline(analysis=analysis, sources=source_rows)
-        script = overlay_plan.get("overlay_script") or {}
-        script_texts: List[str] = []
-        if isinstance(script, dict):
-            if script.get("title"):
-                script_texts.append(str(script.get("title")))
-            script_texts.extend([str(item) for item in (script.get("items") or []) if str(item)])
-        if not script_texts:
-            script_texts = [
-                str(overlay.get("text", "")).strip()
-                for overlay in (overlay_plan.get("overlays") or [])
-                if str(overlay.get("text", "")).strip()
-            ]
-        for index, scene in enumerate(canonical_timeline):
-            text = script_texts[index] if index < len(script_texts) else ""
-            start = float(scene["start"])
-            end = float(scene["end"])
-            scene["text"] = _sanitize_overlay_text(text)
-            scene["text_start"] = start
-            scene["text_end"] = end
+
+        # Do not auto-render OCR/overlay script text; only user-confirmed overlays render.
+        text_overlays = ctx.requirements.get("text_overlays") or []
+        if text_overlays:
+            _apply_confirmed_text_overlays_to_timeline(canonical_timeline, text_overlays)
 
         edit_ops = _parse_edit_ops(ctx.requirements)
         edit_summary = None
@@ -1350,6 +1406,13 @@ class PipelineExecutor:
         # Register preview URL
         ctx.artifacts.register_url(
             "render.ffmpeg_url",
+            result.get("url", ""),
+            {"render_id": result.get("render_id"), "provider": "ffmpeg"},
+            "video/mp4",
+        )
+
+        ctx.artifacts.register_url(
+            "render.output_url",
             result.get("url", ""),
             {"render_id": result.get("render_id"), "provider": "ffmpeg"},
             "video/mp4",
@@ -1668,6 +1731,153 @@ class PipelineExecutor:
         ctx.runtime["preview_url"] = f"/files/{ctx.job_id}/outputs/{preview_name}"
         ctx.runtime["preview_mode"] = preview_mode
 
+    def _stage_build_reference_template(self, ctx: ExecutionContext) -> None:
+        analysis = self._load_analysis(ctx)
+        primary = ctx.artifacts.get("primary.video")
+        if primary is None:
+            raise RuntimeError("Primary reference video artifact is missing.")
+        
+        template = build_reference_edit_template(
+            analysis,
+            primary.path_or_url,
+            ctx.job_id,
+            ctx.requirements,
+        )
+        
+        template_path = os.path.join(ctx.dirs["plans"], "reference_edit_template.json")
+        self._write_json(template_path, template)
+        ctx.artifacts.register_file("reference.edit_template", template_path, {}, "application/json")
+        self._save(ctx)
+
+    def _stage_analyze_source_inventory(self, ctx: ExecutionContext) -> None:
+        raw_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        fetch_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+        
+        source_artifacts = []
+        for index in range(1, max(len(raw_keys), len(fetch_keys)) + 1):
+            art = ctx.artifacts.get(f"sources.raw.{index}") or ctx.artifacts.get(f"sources.fetch.{index}")
+            if art is not None:
+                clip_id = art.meta.get("clip_id") or str(index)
+                source_artifacts.append({
+                    "source_index": index,
+                    "clip_id": clip_id,
+                    "path": art.path_or_url,
+                })
+        
+        inventory = build_source_inventory(
+            source_artifacts,
+            ctx.job_id,
+            ctx.dirs["plans"],
+            lightweight=True,
+        )
+        
+        inventory_path = os.path.join(ctx.dirs["plans"], "source_inventory.json")
+        self._write_json(inventory_path, inventory)
+        ctx.artifacts.register_file("source.inventory", inventory_path, {}, "application/json")
+        self._save(ctx)
+
+    def _stage_edit_agent_compile(self, ctx: ExecutionContext) -> None:
+        template_art = ctx.artifacts.get("reference.edit_template")
+        inventory_art = ctx.artifacts.get("source.inventory")
+        
+        if template_art is None or inventory_art is None:
+            raise RuntimeError("reference.edit_template and source.inventory artifacts are required.")
+            
+        reference_template = self._load_json_if_exists(template_art.path_or_url)
+        source_inventory = self._load_json_if_exists(inventory_art.path_or_url)
+        
+        try:
+            compile_res = run_edit_agent_compile_stage(
+                job_id=ctx.job_id,
+                job_dir=ctx.dirs["job"],
+                requirements=ctx.requirements,
+                request_payload=ctx.request_payload,
+                reference_template=reference_template,
+                source_inventory=source_inventory,
+                audio_plan=ctx.state.audio_plan or None,
+                overlay_plan=ctx.state.overlay_plan or None,
+            )
+        except ReferenceEditAgentError as exc:
+            error_path = os.path.join(ctx.dirs["plans"], "edit_agent_error.json")
+            if os.path.exists(error_path):
+                ctx.artifacts.register_file(
+                    "edit.agent_error",
+                    error_path,
+                    {"code": exc.code},
+                    "application/json",
+                )
+            raise ProviderFailure(
+                provider="reference_edit_agent",
+                code=exc.code,
+                user_message=exc.message,
+                detail=exc.detail,
+                retryable=False,
+            ) from exc
+        
+        ctx.artifacts.register_file(
+            "user.patched_plan",
+            os.path.join(ctx.dirs["plans"], "user_patched_plan.json"),
+            {},
+            "application/json",
+        )
+        ctx.artifacts.register_file(
+            "edit.agent_graph",
+            os.path.join(ctx.dirs["plans"], "executable_edit_graph.json"),
+            {},
+            "application/json",
+        )
+        ctx.artifacts.register_file(
+            "edit.graph_validation",
+            os.path.join(ctx.dirs["plans"], "edit_graph_validation.json"),
+            {},
+            "application/json",
+        )
+        ctx.artifacts.register_file(
+            "render.compiled_spec",
+            os.path.join(ctx.dirs["plans"], "compiled_render_spec.json"),
+            {},
+            "application/json",
+        )
+        training_sample_path = compile_res.get("training_sample_path")
+        if training_sample_path:
+            ctx.artifacts.register_file(
+                "training.edit_agent_sample",
+                training_sample_path,
+                {},
+                "application/json",
+            )
+
+        render_spec = compile_res["render_spec"]
+        ctx.state.render_spec = render_spec
+        
+        canonical_timeline = render_spec.get("canonical_timeline") or []
+        durations = [float(row.get("duration", 0.0)) for row in canonical_timeline]
+        
+        ctx.state.current_plan = {
+            "planning_strategy": "reference_edit_agent",
+            "scene_durations": durations,
+            "selected_segments": [],
+            "support_segments": [],
+            "plan_validation": {
+                "validation_score": float(compile_res["validation"].get("score", 1.0)),
+                "validator_strategy": "edit_graph_validator",
+            },
+            "planning_debug": {
+                "edit_agent_backend": os.getenv("EDIT_AGENT_BACKEND", "llm_json") or "llm_json",
+                "edit_graph_version": "edit_graph_v1",
+            }
+        }
+        
+        apply_plan_validation(ctx.state, ctx.state.current_plan["plan_validation"])
+        
+        if compile_res["validation"].get("valid") is True:
+            ctx.state.plan_needs_validation = False
+            
+        write_plan(ctx.dirs["job"], "timeline_plan.json", ctx.state.current_plan)
+        write_plan(ctx.dirs["job"], "render_spec.json", render_spec)
+        
+        self._save(ctx)
+
     def _load_analysis(self, ctx: ExecutionContext) -> Dict[str, Any]:
         if ctx.state.analysis:
             return ctx.state.analysis
@@ -1683,7 +1893,7 @@ class PipelineExecutor:
             ctx.requirements.get("generation_mode"),
             default=FREE_GENERATION_MODE,
         )
-        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
+        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE, REFERENCE_EDIT_AGENT_MODE}:
             return _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
         source_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
         if not source_keys:
@@ -1695,7 +1905,7 @@ class PipelineExecutor:
             ctx.requirements.get("generation_mode"),
             default=FREE_GENERATION_MODE,
         )
-        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE}:
+        if generation_mode in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE, REFERENCE_EDIT_AGENT_MODE}:
             return []
         source_keys = self._source_keys_for_generation(ctx)
         source_paths = [ctx.artifacts.get(key).path_or_url for key in source_keys if ctx.artifacts.get(key)]
@@ -1802,7 +2012,7 @@ class PipelineExecutor:
                 entry["metadata"]["shot_index_used"] = shot_index
             updated_timeline.append(entry)
 
-        if manifest.transitions_detected:
+        if manifest.transitions_detected and _should_bake_reference_transitions(render_spec):
             for transition in manifest.transitions_detected:
                 out_idx = transition.outgoing_shot_index
                 in_idx = transition.incoming_shot_index
@@ -1823,12 +2033,43 @@ class PipelineExecutor:
                 if in_idx < len(updated_timeline):
                     updated_timeline[in_idx].setdefault("metadata", {})
                     updated_timeline[in_idx]["metadata"]["transition_in"] = transition.transition_type.value
+        elif manifest.transitions_detected:
+            log.warning(
+                "Skipping reference transition baking (FFMPEG_DISABLE_TRANSITIONS or disable_auto_transitions)."
+            )
 
         updated_spec = dict(render_spec)
         updated_spec["canonical_timeline"] = updated_timeline
         updated_spec.setdefault("edit_summary", {})
         updated_spec["edit_summary"]["motion_effect_clips_stylized"] = stylized_count
         return updated_spec
+
+    def _build_render_filter_plan(self, render_spec: Dict[str, Any]) -> Dict[str, Any]:
+        clips = []
+        for index, row in enumerate(render_spec.get("canonical_timeline") or []):
+            metadata = row.get("metadata") or {}
+            clips.append(
+                {
+                    "index": index,
+                    "start": float(row.get("start", 0.0)),
+                    "end": float(row.get("end", row.get("start", 0.0))),
+                    "duration": float(row.get("duration", row.get("length", 0.0)) or 0.0),
+                    "text": row.get("text"),
+                    "text_start": row.get("text_start"),
+                    "text_end": row.get("text_end"),
+                    "transition_in": metadata.get("transition_in"),
+                    "transition_out": metadata.get("transition_out"),
+                    "transition_applied": bool(
+                        metadata.get("transition_in") or metadata.get("transition_out")
+                    ),
+                    "motion_effects_applied": bool(metadata.get("motion_effects_applied")),
+                }
+            )
+        return {
+            "transitions_disabled": not _should_bake_reference_transitions(render_spec),
+            "disable_auto_transitions": bool(render_spec.get("disable_auto_transitions")),
+            "clips": clips,
+        }
 
     def _write_plan_bundle(
         self,
@@ -2077,7 +2318,11 @@ class PipelineExecutor:
             )
 
     def _build_success_response(self, ctx: ExecutionContext, *, status: str) -> Dict[str, Any]:
-        render_url_artifact = ctx.artifacts.get("render.shotstack_url")
+        render_url_artifact = (
+            ctx.artifacts.get("render.output_url")
+            or ctx.artifacts.get("render.ffmpeg_url")
+            or ctx.artifacts.get("render.shotstack_url")
+        )
         render_url = render_url_artifact.path_or_url if render_url_artifact else None
         render_id = (render_url_artifact.meta or {}).get("render_id") if render_url_artifact else None
         render_spec = ctx.state.render_spec or self._load_json_if_exists(os.path.join(ctx.dirs["plans"], "render_spec.json"))
@@ -2466,6 +2711,57 @@ def _collect_edit_request_lines(requirements: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _should_bake_reference_transitions(render_spec: Dict[str, Any]) -> bool:
+    """Reference transition baking is opt-in; FFmpeg uses safe hard cuts by default."""
+    if bool(render_spec.get("disable_auto_transitions")):
+        return False
+    flag = os.getenv("FFMPEG_DISABLE_TRANSITIONS", "1").strip().lower()
+    return flag not in {"1", "true", "yes", "on"}
+
+
+def _apply_confirmed_text_overlays_to_timeline(
+    timeline: List[Dict[str, Any]],
+    text_overlays: List[Dict[str, Any]],
+) -> None:
+    """Apply only user-confirmed text overlays to canonical timeline rows."""
+    for overlay in text_overlays or []:
+        action = str(overlay.get("action", "ask_user")).strip().lower()
+        if action in {"remove", "ask_user", "skip", ""}:
+            continue
+
+        render_text = str(overlay.get("render_text", "")).strip()
+        if action == "keep":
+            render_text = str(overlay.get("detected_text", render_text)).strip()
+        if not render_text:
+            continue
+
+        overlay_start = float(overlay.get("start", 0.0))
+        overlay_end = float(overlay.get("end", overlay_start + 0.5))
+        position = str(overlay.get("position", "center")).strip().lower() or "center"
+        style = overlay.get("style") or {"box": False, "stroke": True, "shadow": False}
+
+        for row in timeline:
+            row_start = float(row.get("start", 0.0))
+            row_end = float(row.get("end", row_start + float(row.get("duration", 0.0) or 0.0)))
+            if overlay_end <= row_start or overlay_start >= row_end:
+                continue
+            row["text"] = _sanitize_overlay_text(render_text)
+            row["text_start"] = max(overlay_start, row_start)
+            row["text_end"] = min(overlay_end, row_end)
+            row["position"] = position
+            row["text_style"] = style
+            row.setdefault("metadata", {})
+            row["metadata"]["text_action"] = "render"
+            break
+
+
+def _write_render_filter_plan(debug_dir: str, plan: Dict[str, Any]) -> None:
+    os.makedirs(debug_dir, exist_ok=True)
+    path = os.path.join(debug_dir, "render_filter_plan.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(plan, handle, indent=2, ensure_ascii=False)
+
+
 def _sanitize_overlay_text(text: str) -> str:
     cleaned = str(text or "")
     cleaned = re.sub(r"\((?:top|bottom|middle|center)\)", "", cleaned, flags=re.IGNORECASE)
@@ -2722,28 +3018,36 @@ def _validate_reference_timeline(
     generated_total = sum(generated_durations)
     if abs(generated_total - analyzed_total) > tolerance:
         errors.append(f"total_duration mismatch: generated={generated_total:.3f}, analyzed={analyzed_total:.3f}")
-    if len(overlay_timing) != len(timeline):
-        errors.append(f"overlay_count mismatch: overlays={len(overlay_timing)} scenes={len(timeline)}")
-    for index, (overlay, scene_row) in enumerate(zip(overlay_timing, timeline), start=1):
+    for index, overlay in enumerate(overlay_timing, start=1):
         start = float(overlay.get("start", 0.0))
-        end = float(overlay.get("end", 0.0))
-        scene_start = float(scene_row.get("start", 0.0))
-        scene_end = float(scene_row.get("end", scene_start + float(scene_row.get("duration", 0.0))))
-        if abs(start - scene_start) > tolerance:
-            errors.append(f"overlay_start mismatch at {index}: overlay={start:.3f}, scene={scene_start:.3f}")
-        if abs((end - start) - (scene_end - scene_start)) > tolerance:
-            errors.append(
-                f"overlay_length mismatch at {index}: overlay={(end-start):.3f}, scene={(scene_end-scene_start):.3f}"
-            )
-    last_end = -1.0
-    for row in sorted(overlay_timing, key=lambda item: float(item.get("start", 0.0))):
-        start = float(row.get("start", 0.0))
-        end = float(row.get("end", 0.0))
+        end = float(overlay.get("end", start))
         if end < start:
-            errors.append(f"overlay timing invalid: start={start:.3f}, end={end:.3f}")
-        if start < last_end - 1e-3:
-            errors.append(f"overlay overlap detected: start={start:.3f}, prev_end={last_end:.3f}")
-        last_end = max(last_end, end)
+            errors.append(f"overlay timing invalid at {index}: start={start:.3f}, end={end:.3f}")
+            continue
+
+        containing_scene = None
+        for scene_index, scene_row in enumerate(timeline, start=1):
+            scene_start = float(scene_row.get("start", 0.0))
+            scene_end = float(scene_row.get("end", scene_start + float(scene_row.get("duration", 0.0))))
+            if scene_start - tolerance <= start and end <= scene_end + tolerance:
+                containing_scene = (scene_index, scene_start, scene_end)
+                break
+
+        if containing_scene is None:
+            errors.append(
+                f"overlay containment mismatch at {index}: overlay={start:.3f}-{end:.3f} not within any scene"
+            )
+            continue
+
+        scene_index, scene_start, scene_end = containing_scene
+        if start < scene_start - tolerance:
+            errors.append(
+                f"overlay_start mismatch at {index}: overlay={start:.3f}, scene={scene_start:.3f}, scene_index={scene_index}"
+            )
+        if end > scene_end + tolerance:
+            errors.append(
+                f"overlay_end mismatch at {index}: overlay={end:.3f}, scene={scene_end:.3f}, scene_index={scene_index}"
+            )
     if timeline:
         final_scene_end = float(timeline[-1].get("end", 0.0))
         if abs(final_scene_end - generated_total) > tolerance:

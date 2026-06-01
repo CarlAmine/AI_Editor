@@ -79,24 +79,6 @@ export const HeroHeader: React.FC = () => {
           </motion.p>
 
           <motion.div className="amber-divider mt-6 w-24" variants={itemVariants} />
-
-          <motion.div className="flex flex-wrap gap-3 mt-8" variants={itemVariants}>
-            {[
-              { icon: "🎬", label: "Multi-Source" },
-              { icon: "🤖", label: "AI Brief" },
-              { icon: "⚡", label: "Live Status" },
-              { icon: "📤", label: "YouTube Ready" },
-            ].map((feature) => (
-              <motion.div
-                key={feature.label}
-                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-xs font-medium text-blue-300"
-                whileHover={{ scale: 1.04, backgroundColor: "rgba(59, 130, 246, 0.18)" }}
-              >
-                <span>{feature.icon}</span>
-                <span>{feature.label}</span>
-              </motion.div>
-            ))}
-          </motion.div>
         </motion.div>
       </div>
 

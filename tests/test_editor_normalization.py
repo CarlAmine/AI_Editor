@@ -15,7 +15,7 @@ def test_track_ordering_overlay_first():
     }
     warnings = normalize_tracks(edit)
     assert edit["tracks"][0]["clips"][0]["asset"]["type"] == "title"
-    assert any(w["code"] == "TRACK_ORDER_FIXED" for w in warnings)
+    assert not any(w["code"] == "TRACK_ORDER_FIXED" for w in warnings)
 
 
 def test_track_ordering_html_overlay_moves_above_video():

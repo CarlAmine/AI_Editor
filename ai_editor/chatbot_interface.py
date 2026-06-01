@@ -248,6 +248,27 @@ def _build_reply(
     return reply
 
 
+def _is_intake_mode(state: Dict) -> bool:
+    if not isinstance(state, dict):
+        return True
+    
+    # If phase is explicitly set to one of the intake phases, it's guided intake
+    if state.get("phase") in {
+        "awaiting_reference", "analyzing_reference", "reference_url_received",
+        "reference_summary_ready", "awaiting_sources", "awaiting_slot_mapping",
+        "awaiting_audio", "awaiting_custom_music", "awaiting_output",
+        "awaiting_final_confirmation", "pipeline_running"
+    }:
+        return True
+    
+    # If phase is not set but state is empty or has active intake modes
+    # If there is no existing video_topic or user_goal, and no edit requests, and it's reference mimic mode:
+    if not state.get("video_topic") and not state.get("edit_requests"):
+        return True
+        
+    return False
+
+
 def process_ui_turn(
     user_input: str,
     current_state: Dict,
@@ -266,6 +287,11 @@ def process_ui_turn(
         model_used      - active LLM model name
     """
     del api_key
+    
+    if _is_intake_mode(current_state):
+        from ai_editor.chat_intake.state_machine import process_guided_turn
+        return process_guided_turn(user_input, current_state, analyzer_output)
+
     state = _normalize_state(current_state)
 
     state["user_requests"].append(user_input.strip())

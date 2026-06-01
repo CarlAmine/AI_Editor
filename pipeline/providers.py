@@ -80,23 +80,69 @@ def _build_llm_status(*, required: bool, preferred_provider: str | None) -> Prov
 
 
 def _build_render_status(*, required: bool) -> ProviderStatus:
-    shotstack_key = str(os.getenv("SHOTSTACK_KEY", "") or "").strip()
-    if shotstack_key:
+    import shutil
+    
+    render_provider = str(os.getenv("RENDER_PROVIDER", "") or "").strip().lower()
+    
+    if render_provider in ("", "ffmpeg"):
+        ffmpeg_bin = str(os.getenv("FFMPEG_BINARY", "ffmpeg") or "ffmpeg").strip()
+        ffprobe_bin = str(os.getenv("FFPROBE_BINARY", "ffprobe") or "ffprobe").strip()
+        
+        ffmpeg_found = shutil.which(ffmpeg_bin) is not None
+        ffprobe_found = shutil.which(ffprobe_bin) is not None
+        
+        if ffmpeg_found and ffprobe_found:
+            return ProviderStatus(
+                name="render_provider",
+                required=required,
+                configured=True,
+                ready=True,
+                message="Local FFmpeg and FFprobe are configured and ready.",
+            )
+        
+        missing = []
+        if not ffmpeg_found:
+            missing.append(ffmpeg_bin)
+        if not ffprobe_found:
+            missing.append(ffprobe_bin)
+            
         return ProviderStatus(
             name="render_provider",
             required=required,
-            configured=True,
-            ready=True,
-            message="Render provider is configured.",
+            configured=False,
+            ready=False,
+            code="FFMPEG_NOT_INSTALLED",
+            message=f"Local render binaries not found: missing {', '.join(missing)}.",
         )
-    return ProviderStatus(
-        name="render_provider",
-        required=required,
-        configured=False,
-        ready=False,
-        code="RENDER_PROVIDER_NOT_CONFIGURED",
-        message="Set SHOTSTACK_KEY to enable final renders.",
-    )
+        
+    elif render_provider == "shotstack":
+        shotstack_key = str(os.getenv("SHOTSTACK_KEY", "") or "").strip()
+        if shotstack_key:
+            return ProviderStatus(
+                name="render_provider",
+                required=required,
+                configured=True,
+                ready=True,
+                message="Render provider is configured.",
+            )
+        return ProviderStatus(
+            name="render_provider",
+            required=required,
+            configured=False,
+            ready=False,
+            code="RENDER_PROVIDER_NOT_CONFIGURED",
+            message="Set SHOTSTACK_KEY to enable final renders.",
+        )
+        
+    else:
+        return ProviderStatus(
+            name="render_provider",
+            required=required,
+            configured=False,
+            ready=False,
+            code="INVALID_RENDER_PROVIDER",
+            message=f"Unsupported RENDER_PROVIDER '{render_provider}'.",
+        )
 
 
 def _build_drive_status(*, required: bool) -> ProviderStatus:

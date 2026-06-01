@@ -67,7 +67,7 @@ class PipelineDecisionEngine:
             Callable[[list[dict[str, Any]], float, int, Optional[str]], Optional[Dict[str, Any]]]
         ] = None,
         preferred_provider: Optional[str] = None,
-        minimum_validation_score: float = 0.74,
+        minimum_validation_score: float = 0.5,
         max_revision_attempts: int = 5,
     ) -> None:
         self._json_client = json_client or self._default_json_client

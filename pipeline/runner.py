@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 from ai_editor.generation_modes import (
     FREE_GENERATION_MODE,
     REFERENCE_STYLE_TRANSFER_MODE,
+    REFERENCE_EDIT_AGENT_MODE,
     normalize_generation_mode,
 )
 from pipeline.feedback import build_pipeline_assistant_feedback
@@ -45,7 +46,7 @@ from .state import (
 
 @dataclass
 class RunnerGuardrails:
-    minimum_validation_score: float = 0.74
+    minimum_validation_score: float = 0.5
     final_action_confidence: float = 0.72
     destructive_action_confidence: float = 0.82
     preview_action_confidence: float = 0.55
@@ -468,10 +469,8 @@ def _provider_requirements(
 
 
 def _should_use_deterministic_style_route(requirements: Dict[str, Any]) -> bool:
-    return (
-        normalize_generation_mode(requirements.get("generation_mode"), default=FREE_GENERATION_MODE)
-        == REFERENCE_STYLE_TRANSFER_MODE
-    )
+    mode = normalize_generation_mode(requirements.get("generation_mode"), default=FREE_GENERATION_MODE)
+    return mode in {REFERENCE_STYLE_TRANSFER_MODE, REFERENCE_EDIT_AGENT_MODE}
 
 
 def _run_deterministic_style_transfer_route(

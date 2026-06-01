@@ -172,7 +172,7 @@ export default function Home() {
             transition={{ duration: 0.6, delay: 0.65 }}
             className="flex flex-wrap items-center justify-center gap-4"
           >
-            <Link href="/features">
+            <Link href="/workspace">
               <button
                 className="flex items-center gap-2 px-7 py-3.5 text-sm font-semibold rounded-sm transition-all duration-300"
                 style={{
@@ -191,8 +191,30 @@ export default function Home() {
                   e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
-                Explore Features
+                Try AI Editor
                 <ArrowRight size={16} />
+              </button>
+            </Link>
+            <Link href="/features">
+              <button
+                className="flex items-center gap-2 px-7 py-3.5 text-sm font-semibold rounded-sm transition-all duration-300"
+                style={{
+                  border: "1px solid oklch(1 0 0 / 20%)",
+                  color: "oklch(0.85 0.01 80)",
+                  fontFamily: "'DM Sans', sans-serif",
+                  letterSpacing: "0.05em",
+                  background: "oklch(1 0 0 / 0.03)",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "oklch(1 0 0 / 0.08)";
+                  e.currentTarget.style.borderColor = "oklch(1 0 0 / 0.35)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "oklch(1 0 0 / 0.03)";
+                  e.currentTarget.style.borderColor = "oklch(1 0 0 / 20%)";
+                }}
+              >
+                Explore Features
               </button>
             </Link>
             <a

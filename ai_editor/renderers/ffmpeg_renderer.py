@@ -1,27 +1,90 @@
 """FFmpeg-based local video renderer."""
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ai_editor.renderers.base import BaseRenderer
+log = logging.getLogger(__name__)
 
 
-class FFmpegRenderer(BaseRenderer):
+def _resolve_font_file() -> str | None:
+    """Return the first usable font file path for FFmpeg drawtext."""
+    candidates = [
+        os.getenv("FFMPEG_FONT_FILE"),
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\calibri.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _escape_drawtext_path(path: str) -> str:
+    """Escape a font file path for FFmpeg drawtext."""
+    value = path.replace("\\", "/")
+    value = value.replace(":", r"\:")
+    value = value.replace("'", r"\'")
+    return value
+
+
+def _escape_drawtext_text(text: str) -> str:
+    """Escape overlay text for FFmpeg drawtext."""
+    value = str(text or "")
+    value = value.replace("\\", r"\\")
+    value = value.replace(":", r"\:")
+    value = value.replace("'", r"\'")
+    value = value.replace("%", r"\%")
+    value = value.replace("\n", " ")
+    return value
+
+
+DEFAULT_TEXT_STYLE = {"box": False, "stroke": True, "shadow": False, "font_size": 42}
+
+
+def _drawtext_style_parts(style: Dict[str, Any]) -> str:
+    """Build optional drawtext style fragments (no black box by default)."""
+    box = bool(style.get("box", False))
+    stroke = bool(style.get("stroke", True))
+    shadow = bool(style.get("shadow", False))
+    parts: List[str] = []
+    if box:
+        parts.extend(["box=1", "boxcolor=black@0.45", "boxborderw=12"])
+    if stroke:
+        parts.extend(["borderw=2", "bordercolor=black@0.45"])
+    if shadow:
+        parts.extend(["shadowcolor=black@0.45", "shadowx=2", "shadowy=2"])
+    return ":".join(parts)
+
+
+def _concat_demuxer_path(path: Path) -> str:
+    """Normalize a clip path for FFmpeg concat demuxer entries."""
+    value = path.resolve().as_posix()
+    value = value.replace("'", r"'\''")
+    return value
+
+
+class FFmpegRenderer:
     """Local FFmpeg-based video renderer."""
 
-    def __init__(self, ffmpeg_binary: str = "ffmpeg", ffprobe_binary: str = "ffprobe"):
+    def __init__(self, ffmpeg_binary: Optional[str] = None, ffprobe_binary: Optional[str] = None):
         """Initialize FFmpeg renderer.
 
         Args:
-            ffmpeg_binary: Path to ffmpeg executable.
-            ffprobe_binary: Path to ffprobe executable.
+            ffmpeg_binary: Optional path to ffmpeg executable.
+            ffprobe_binary: Optional path to ffprobe executable.
         """
-        self.ffmpeg = ffmpeg_binary
-        self.ffprobe = ffprobe_binary
+        self.ffmpeg = ffmpeg_binary or os.getenv("FFMPEG_BINARY") or "ffmpeg"
+        self.ffprobe = ffprobe_binary or os.getenv("FFPROBE_BINARY") or "ffprobe"
         self._commands: List[Dict[str, Any]] = []
 
     def render(
@@ -41,33 +104,66 @@ class FFmpegRenderer(BaseRenderer):
             Dict with success, url, render_id, error, debug_info.
         """
         self._commands = []
+        warnings = []
 
         try:
             # Create working directories
             ffmpeg_dir = os.path.join(job_dir, "ffmpeg")
             outputs_dir = os.path.join(job_dir, "outputs")
+            debug_dir = os.path.join(job_dir, "debug")
             os.makedirs(ffmpeg_dir, exist_ok=True)
             os.makedirs(outputs_dir, exist_ok=True)
+            os.makedirs(debug_dir, exist_ok=True)
 
             # Validate and extract timeline
             canonical_timeline = render_spec.get("canonical_timeline") or []
             if not canonical_timeline:
                 return self._failure(
                     "No canonical_timeline found in render_spec",
-                    debug_dir=os.path.join(job_dir, "debug"),
+                    debug_dir=debug_dir,
                     job_id=job_id,
                 )
 
+            # Check for transition metadata and log warning
+            has_transitions = False
+            for row in canonical_timeline:
+                meta = row.get("metadata") or {}
+                if "transition_in" in meta or "transition_out" in meta:
+                    has_transitions = True
+                    break
+            if has_transitions:
+                msg = "Transitions are currently rendered as hard cuts under FFmpeg."
+                warnings.append(msg)
+
+            # Get refit and output modes
+            refit_mode = str(render_spec.get("refit_mode", "crop_center")).strip().lower()
+            output_mode = str(render_spec.get("output_mode", "crop_to_9x16")).strip().lower()
+            
             # Get resolution and other parameters
             resolution = render_spec.get("resolution", "1080x1920")
             width, height = self._parse_resolution(resolution)
             fps = 30
-            codec_settings = {
-                "vcodec": "libx264",
-                "pix_fmt": "yuv420p",
-                "fps": fps,
-                "crf": 23,  # Quality (0-51, lower is better)
-            }
+            
+            mute_source_audio = bool(render_spec.get("mute_source_audio", False))
+            preserve_audio = not mute_source_audio
+
+            filter_plan_clips = []
+            for index, row in enumerate(canonical_timeline):
+                meta = row.get("metadata") or {}
+                filter_plan_clips.append(
+                    {
+                        "index": index,
+                        "start": float(row.get("start", 0.0)),
+                        "end": float(row.get("end", row.get("start", 0.0))),
+                        "duration": float(row.get("duration", row.get("length", 0.0)) or 0.0),
+                        "text": row.get("text"),
+                        "text_start": row.get("text_start"),
+                        "text_end": row.get("text_end"),
+                        "transition_in": meta.get("transition_in"),
+                        "transition_out": meta.get("transition_out"),
+                        "transition_skipped": True,
+                    }
+                )
 
             # Build temporary clips
             clip_paths = []
@@ -79,27 +175,70 @@ class FFmpegRenderer(BaseRenderer):
                     width=width,
                     height=height,
                     fps=fps,
+                    refit_mode=refit_mode,
+                    mute_source_audio=mute_source_audio,
                 )
                 if clip_path:
                     clip_paths.append(clip_path)
+                else:
+                    return self._failure(
+                        f"Failed to build normalized clip at index {index}",
+                        debug_dir=debug_dir,
+                        job_id=job_id,
+                        warnings=warnings,
+                    )
 
             if not clip_paths:
                 return self._failure(
                     "Failed to build any normalized clips from canonical_timeline",
-                    debug_dir=os.path.join(job_dir, "debug"),
+                    debug_dir=debug_dir,
                     job_id=job_id,
+                    warnings=warnings,
                 )
+
+            build_commands = [
+                command for command in self._commands if command.get("type") == "build_clip"
+            ]
+            for plan_clip, command in zip(filter_plan_clips, build_commands):
+                plan_clip["filter_graph"] = command.get("filter_graph")
+                plan_clip["command"] = command.get("command")
+                plan_clip["retry_without_text"] = command.get("retry_without_text", False)
+
+            self._write_render_filter_plan(
+                debug_dir,
+                {
+                    "provider": "ffmpeg",
+                    "transitions_rendered": False,
+                    "clips": filter_plan_clips,
+                    "concat_commands": [
+                        entry for entry in self._commands if entry.get("type") == "concat"
+                    ],
+                },
+            )
 
             # Concatenate clips
             concat_path = os.path.join(ffmpeg_dir, "concat.txt")
             self._write_concat_file(concat_path, clip_paths)
 
             concat_output = os.path.join(ffmpeg_dir, "concatenated.mp4")
-            if not self._concat_clips(concat_path, concat_output, codec_settings):
+            codec_settings = {
+                "vcodec": "libx264",
+                "pix_fmt": "yuv420p",
+                "fps": fps,
+                "crf": 23,
+            }
+            if not self._concat_clips(
+                concat_path,
+                concat_output,
+                codec_settings,
+                clip_paths=clip_paths,
+                preserve_audio=preserve_audio,
+            ):
                 return self._failure(
                     "Failed to concatenate clips",
-                    debug_dir=os.path.join(job_dir, "debug"),
+                    debug_dir=debug_dir,
                     job_id=job_id,
+                    warnings=warnings,
                 )
 
             # Add audio if needed
@@ -107,36 +246,39 @@ class FFmpegRenderer(BaseRenderer):
             soundtrack_url = render_spec.get("soundtrack_url")
             if soundtrack_url:
                 output_file = os.path.join(ffmpeg_dir, "with_audio.mp4")
-                if not self._add_audio(concat_output, soundtrack_url, output_file):
+                if not self._add_audio(concat_output, soundtrack_url, output_file, preserve_source_audio=preserve_audio):
                     return self._failure(
-                        "Failed to add audio to video",
-                        debug_dir=os.path.join(job_dir, "debug"),
+                        "Failed to add/mix audio to video",
+                        debug_dir=debug_dir,
                         job_id=job_id,
+                        warnings=warnings,
                     )
 
             # Final output
-            master_path = os.path.join(outputs_dir, "master.mp4")
+            master_path = os.path.join(outputs_dir, "master_16x9.mp4")
             shutil.copy(output_file, master_path)
 
             # Write debug files
-            debug_dir = os.path.join(job_dir, "debug")
-            os.makedirs(debug_dir, exist_ok=True)
             self._write_debug_commands(os.path.join(debug_dir, "ffmpeg_commands.json"))
             self._write_debug_summary(
                 os.path.join(debug_dir, "ffmpeg_render_summary.json"),
                 {
+                    "provider": "ffmpeg",
                     "job_id": job_id,
                     "resolution": resolution,
+                    "refit_mode": refit_mode,
+                    "output_mode": output_mode,
                     "fps": fps,
                     "clip_count": len(clip_paths),
                     "output": master_path,
+                    "warnings": warnings,
                     "success": True,
                 },
             )
 
             return {
                 "success": True,
-                "url": f"/files/{job_id}/outputs/master.mp4",
+                "url": f"/files/{job_id}/outputs/master_16x9.mp4",
                 "render_id": f"ffmpeg-{job_id}",
                 "output_path": master_path,
                 "debug_info": {
@@ -151,7 +293,205 @@ class FFmpegRenderer(BaseRenderer):
                 debug_dir=os.path.join(job_dir, "debug"),
                 job_id=job_id,
                 exception=exc,
+                warnings=warnings,
             )
+
+    def _build_video_filters(
+        self,
+        row: Dict[str, Any],
+        width: int,
+        height: int,
+        fps: int,
+        trim_start: float,
+        duration: float,
+        refit_mode: str,
+        include_text: bool = True,
+    ) -> tuple[List[str], bool]:
+        """Build the video filter chain for a normalized clip."""
+        v_filters = [
+            f"trim=start={trim_start}:duration={duration},setpts=PTS-STARTPTS,fps={fps}",
+        ]
+
+        if refit_mode == "pad":
+            scale_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            )
+        else:
+            scale_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}"
+            )
+        v_filters.append(scale_filter)
+
+        had_text_overlay = False
+        if include_text:
+            had_text_overlay = self._append_drawtext_filter(v_filters, row, duration)
+
+        v_filters.append("format=yuv420p")
+        return v_filters, had_text_overlay
+
+    def _append_drawtext_filter(
+        self,
+        v_filters: List[str],
+        row: Dict[str, Any],
+        duration: float,
+    ) -> bool:
+        """Append a drawtext filter when text and a font file are available."""
+        metadata = row.get("metadata") or {}
+        if str(metadata.get("text_action", "")).lower() in {"remove", "skip"}:
+            return False
+
+        text_overlay = str(row.get("text", "")).strip() if row.get("text") else None
+        if not text_overlay:
+            return False
+
+        font_file = _resolve_font_file()
+        if not font_file:
+            log.warning(
+                "No usable font file found for FFmpeg drawtext; skipping text overlay."
+            )
+            return False
+
+        row_start = float(row.get("start", 0.0))
+        text_start = float(row.get("text_start", row_start))
+        text_end = float(row.get("text_end", row_start + duration))
+
+        rel_start = max(0.0, text_start - row_start)
+        rel_end = min(duration, text_end - row_start)
+
+        escaped_text = _escape_drawtext_text(text_overlay)
+        fontfile = _escape_drawtext_path(font_file)
+
+        position = str(row.get("position", "")).strip().lower()
+        if "top" in position:
+            y_expr = "h/6"
+        elif "bottom" in position:
+            y_expr = "h*5/6"
+        else:
+            y_expr = "(h-text_h)/2"
+
+        style = row.get("text_style") or metadata.get("text_style") or DEFAULT_TEXT_STYLE
+        if not isinstance(style, dict):
+            style = DEFAULT_TEXT_STYLE
+        font_size = int(style.get("font_size", 42) or 42)
+        style_parts = _drawtext_style_parts(style)
+        style_suffix = f":{style_parts}" if style_parts else ""
+
+        enable_expr = f":enable='between(t,{rel_start:.3f},{rel_end:.3f})'"
+        drawtext = (
+            f"drawtext=fontfile='{fontfile}':"
+            f"text='{escaped_text}':"
+            "fontcolor=white:"
+            f"fontsize={font_size}:"
+            "x=(w-text_w)/2:"
+            f"y={y_expr}"
+            f"{style_suffix}"
+            f"{enable_expr}"
+        )
+        v_filters.append(drawtext)
+        return True
+
+    def _write_render_filter_plan(self, debug_dir: str, plan: Dict[str, Any]) -> None:
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, "render_filter_plan.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(plan, handle, indent=2, ensure_ascii=False)
+
+    def _run_normalized_clip_ffmpeg(
+        self,
+        index: int,
+        video_src: str,
+        output_clip: str,
+        trim_start: float,
+        duration: float,
+        text_overlay: Optional[str],
+        v_filters: List[str],
+        mute_source_audio: bool,
+        retry_without_text: bool = False,
+    ) -> bool:
+        """Execute FFmpeg to build a normalized clip."""
+        video_filter_complex = ",".join(v_filters)
+        preserve_audio = not mute_source_audio
+        filter_complex = f"[0:v]{video_filter_complex}[out_v]"
+        maps = ["-map", "[out_v]"]
+        inputs = ["-i", video_src]
+
+        if preserve_audio:
+            if self._has_audio(video_src):
+                audio_filter = (
+                    f"[0:a]atrim=start={trim_start}:duration={duration},"
+                    "asetpts=PTS-STARTPTS,"
+                    "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo[out_a]"
+                )
+                filter_complex += f";{audio_filter}"
+                maps.extend(["-map", "[out_a]", "-c:a", "aac"])
+            else:
+                silent_filter = (
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=duration={duration},asetpts=PTS-STARTPTS[out_a]"
+                )
+                filter_complex += f";{silent_filter}"
+                maps.extend(["-map", "[out_a]", "-c:a", "aac"])
+
+        cmd = [
+            self.ffmpeg,
+            *inputs,
+            "-filter_complex",
+            filter_complex,
+            *maps,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-y",
+            output_clip,
+        ]
+
+        self._commands.append(
+            {
+                "index": index,
+                "type": "build_clip",
+                "input": video_src,
+                "output": output_clip,
+                "trim_start": trim_start,
+                "duration": duration,
+                "text_overlay": text_overlay,
+                "retry_without_text": retry_without_text,
+                "filter_graph": filter_complex,
+                "command": " ".join(cmd),
+            }
+        )
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                log.error(
+                    "FFmpeg clip build failed (index %s): input=%s output=%s command=%s "
+                    "filter_graph=%s stderr=%s",
+                    index,
+                    video_src,
+                    output_clip,
+                    " ".join(cmd),
+                    filter_complex,
+                    result.stderr,
+                )
+                return False
+            return True
+        except Exception as exc:
+            log.error(
+                "FFmpeg clip build exception (index %s): input=%s output=%s command=%s "
+                "filter_graph=%s error=%s",
+                index,
+                video_src,
+                output_clip,
+                " ".join(cmd),
+                filter_complex,
+                exc,
+            )
+            return False
 
     def _build_normalized_clip(
         self,
@@ -161,17 +501,10 @@ class FFmpegRenderer(BaseRenderer):
         width: int,
         height: int,
         fps: int,
+        refit_mode: str = "crop_center",
+        mute_source_audio: bool = False,
     ) -> Optional[str]:
-        """Build a normalized clip from a timeline row.
-
-        Handles:
-        - Trimming (row["trim"] or 0)
-        - Duration (row["duration"] or row["length"])
-        - Scaling/cropping to resolution
-        - FPS enforcement
-        - Text overlay (row["text"])
-        - Codec settings (yuv420p, x264)
-        """
+        """Build a normalized clip from a timeline row."""
         video_src = str(row.get("video_src", "")).strip()
         if not video_src:
             return None
@@ -183,7 +516,6 @@ class FFmpegRenderer(BaseRenderer):
         if duration <= 0:
             return None
 
-        # Download if needed
         if video_src.startswith(("http://", "https://")):
             local_src = os.path.join(output_dir, f"source_{index}.mp4")
             if not self._download_file(video_src, local_src):
@@ -192,106 +524,148 @@ class FFmpegRenderer(BaseRenderer):
 
         output_clip = os.path.join(output_dir, f"clip_{index}.mp4")
 
-        # Build filter chain
-        filters = []
+        v_filters, had_text_overlay = self._build_video_filters(
+            row=row,
+            width=width,
+            height=height,
+            fps=fps,
+            trim_start=trim_start,
+            duration=duration,
+            refit_mode=refit_mode,
+            include_text=True,
+        )
 
-        # Trim
-        if trim_start > 0:
-            filters.append(f"[0:v]trim=start={trim_start}:duration={duration}[trimmed]")
-            filters.append("[trimmed]fps={fps}[fps_normalized]")
-        else:
-            filters.append(f"[0:v]fps={fps}[fps_normalized]")
-
-        # Scale and pad
-        scale_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-        filters.append(f"[fps_normalized]{scale_filter}[scaled]")
-
-        # Text overlay
-        if text_overlay:
-            # Escape text for drawtext filter
-            escaped_text = self._escape_drawtext(text_overlay)
-            drawtext = (
-                f"[scaled]drawtext=text='{escaped_text}':fontsize=54:fontcolor=white:"
-                "x=(w-text_w)/2:y=(h-text_h)/2:borderw=2:bordercolor=black"
-                "[with_text]"
-            )
-            filters.append(drawtext)
-            final_filter = "[with_text]format=yuv420p[out]"
-        else:
-            final_filter = "[scaled]format=yuv420p[out]"
-        filters.append(final_filter)
-
-        filter_complex = ";".join(filters)
-
-        # Build command
-        cmd = [
-            self.ffmpeg,
-            "-i", video_src,
-            "-filter_complex", filter_complex,
-            "-map", "[out]",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-y",
-            output_clip,
-        ]
-
-        self._commands.append({
-            "index": index,
-            "type": "build_clip",
-            "input": video_src,
-            "output": output_clip,
-            "trim_start": trim_start,
-            "duration": duration,
-            "text_overlay": text_overlay,
-            "command": " ".join(cmd),
-        })
-
-        # Execute
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                print(f"FFmpeg clip build failed (index {index}): {result.stderr}")
-                return None
+        if self._run_normalized_clip_ffmpeg(
+            index=index,
+            video_src=video_src,
+            output_clip=output_clip,
+            trim_start=trim_start,
+            duration=duration,
+            text_overlay=text_overlay,
+            v_filters=v_filters,
+            mute_source_audio=mute_source_audio,
+        ):
             return output_clip
-        except Exception as exc:
-            print(f"FFmpeg clip build exception (index {index}): {exc}")
-            return None
 
-    def _concat_clips(self, concat_file: str, output_file: str, codec_settings: Dict[str, Any]) -> bool:
+        if had_text_overlay:
+            log.warning(
+                "Retrying clip %s without text overlay after drawtext failure.",
+                index,
+            )
+            v_filters_no_text, _ = self._build_video_filters(
+                row=row,
+                width=width,
+                height=height,
+                fps=fps,
+                trim_start=trim_start,
+                duration=duration,
+                refit_mode=refit_mode,
+                include_text=False,
+            )
+            if self._run_normalized_clip_ffmpeg(
+                index=index,
+                video_src=video_src,
+                output_clip=output_clip,
+                trim_start=trim_start,
+                duration=duration,
+                text_overlay=text_overlay,
+                v_filters=v_filters_no_text,
+                mute_source_audio=mute_source_audio,
+                retry_without_text=True,
+            ):
+                return output_clip
+
+        return None
+
+    def _concat_clips(
+        self,
+        concat_file: str,
+        output_file: str,
+        codec_settings: Dict[str, Any],
+        clip_paths: Optional[List[str]] = None,
+        preserve_audio: bool = False,
+    ) -> bool:
         """Concatenate clips using concat demuxer."""
+        concat_contents = ""
+        if os.path.isfile(concat_file):
+            concat_contents = Path(concat_file).read_text(encoding="utf-8")
+
         cmd = [
             self.ffmpeg,
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_file,
-            "-c:v", codec_settings.get("vcodec", "libx264"),
-            "-preset", "fast",
-            "-crf", str(codec_settings.get("crf", 23)),
-            "-pix_fmt", codec_settings.get("pix_fmt", "yuv420p"),
             "-y",
-            output_file,
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_file,
+            "-c:v",
+            codec_settings.get("vcodec", "libx264"),
+            "-preset",
+            "fast",
+            "-crf",
+            str(codec_settings.get("crf", 23)),
+            "-pix_fmt",
+            codec_settings.get("pix_fmt", "yuv420p"),
         ]
+        if preserve_audio:
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(["-an"])
 
-        self._commands.append({
-            "type": "concat",
-            "input": concat_file,
-            "output": output_file,
-            "command": " ".join(cmd),
-        })
+        cmd.append(output_file)
+
+        log.info(
+            "FFmpeg concat starting: concat_file=%s output=%s clip_paths=%s "
+            "concat_contents=%r command=%s",
+            concat_file,
+            output_file,
+            clip_paths or [],
+            concat_contents,
+            " ".join(cmd),
+        )
+
+        self._commands.append(
+            {
+                "type": "concat",
+                "input": concat_file,
+                "output": output_file,
+                "clip_paths": clip_paths or [],
+                "concat_contents": concat_contents,
+                "command": " ".join(cmd),
+            }
+        )
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if result.returncode != 0:
-                print(f"FFmpeg concat failed: {result.stderr}")
+                log.error(
+                    "FFmpeg concat failed: concat_file=%s output=%s clip_paths=%s "
+                    "concat_contents=%r command=%s stderr=%s",
+                    concat_file,
+                    output_file,
+                    clip_paths or [],
+                    concat_contents,
+                    " ".join(cmd),
+                    result.stderr,
+                )
                 return False
             return True
         except Exception as exc:
-            print(f"FFmpeg concat exception: {exc}")
+            log.error(
+                "FFmpeg concat exception: concat_file=%s output=%s clip_paths=%s "
+                "concat_contents=%r command=%s error=%s",
+                concat_file,
+                output_file,
+                clip_paths or [],
+                concat_contents,
+                " ".join(cmd),
+                exc,
+            )
             return False
 
-    def _add_audio(self, video_file: str, audio_url: str, output_file: str) -> bool:
-        """Add audio to video."""
+    def _add_audio(self, video_file: str, audio_url: str, output_file: str, preserve_source_audio: bool = False) -> bool:
+        """Add/mix audio to video."""
         audio_file = audio_url
         
         # Download if URL
@@ -300,16 +674,38 @@ class FFmpegRenderer(BaseRenderer):
             if not self._download_file(audio_url, audio_file):
                 return False
 
-        cmd = [
-            self.ffmpeg,
-            "-i", video_file,
-            "-i", audio_file,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            "-y",
-            output_file,
-        ]
+        if preserve_source_audio:
+            # Mix source audio and soundtrack using amix
+            filter_complex = "[0:a][1:a]amix=inputs=2:duration=first,aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo[a]"
+            cmd = [
+                self.ffmpeg,
+                "-i", video_file,
+                "-i", audio_file,
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-map", "[a]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                "-y",
+                output_file,
+            ]
+        else:
+            # Map soundtrack as the only audio
+            filter_complex = "[1:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo[a]"
+            cmd = [
+                self.ffmpeg,
+                "-i", video_file,
+                "-i", audio_file,
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-map", "[a]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                "-y",
+                output_file,
+            ]
 
         self._commands.append({
             "type": "add_audio",
@@ -330,10 +726,12 @@ class FFmpegRenderer(BaseRenderer):
             return False
 
     def _write_concat_file(self, concat_path: str, clip_paths: List[str]) -> None:
-        """Write FFmpeg concat demuxer file."""
-        lines = [f"file '{clip}'" for clip in clip_paths]
-        with open(concat_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        """Write FFmpeg concat demuxer file with absolute clip paths."""
+        concat_file = Path(concat_path)
+        concat_file.parent.mkdir(parents=True, exist_ok=True)
+        with concat_file.open("w", encoding="utf-8") as handle:
+            for clip_path in clip_paths:
+                handle.write(f"file '{_concat_demuxer_path(Path(clip_path))}'\n")
 
     def _download_file(self, url: str, output_path: str) -> bool:
         """Download file from URL."""
@@ -358,16 +756,23 @@ class FFmpegRenderer(BaseRenderer):
                 return (int(parts[0]), int(parts[1]))
             except ValueError:
                 pass
-        return (1080, 1920)  # Default mobile
+        return (1080, 1920)
 
-    def _escape_drawtext(self, text: str) -> str:
-        """Escape text for FFmpeg drawtext filter."""
-        # Escape special characters for drawtext
-        text = text.replace("'", "'\\''")
-        text = text.replace(":", "\\:")
-        text = text.replace("[", "\\[")
-        text = text.replace("]", "\\]")
-        return text
+    def _has_audio(self, path: str) -> bool:
+        """Check if video path has an audio stream using ffprobe."""
+        cmd = [
+            self.ffprobe,
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0",
+            path
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return "audio" in result.stdout.lower()
+        except Exception:
+            return False
 
     def _failure(
         self,
@@ -375,16 +780,21 @@ class FFmpegRenderer(BaseRenderer):
         debug_dir: str,
         job_id: str,
         exception: Optional[Exception] = None,
+        warnings: Optional[List[str]] = None,
+        stderr: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Write failure debug files and return error result."""
         os.makedirs(debug_dir, exist_ok=True)
         
         error_detail = {
+            "provider": "ffmpeg",
+            "job_id": job_id,
             "stage": "ffmpeg_render",
             "error": error_msg,
             "exception": repr(exception) if exception else None,
-            "job_id": job_id,
-            "timestamp": json.dumps(self._iso_now()),
+            "warnings": warnings or [],
+            "stderr_snippet": stderr[-500:] if stderr else None,
+            "timestamp": self._iso_now(),
         }
         
         self._write_debug_commands(os.path.join(debug_dir, "ffmpeg_commands.json"))

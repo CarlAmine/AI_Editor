@@ -5,7 +5,7 @@ from uuid import uuid4
 from ai_editor.analysis.analysis_schema import EffectType, MotionCurve, MotionEffect, MotionEffectManifest
 from pipeline.artifacts import ArtifactRegistry
 from pipeline.decision_engine import PipelineDecision
-from pipeline.executor import ExecutionContext, PipelineExecutor
+from pipeline.executor import ExecutionContext, PipelineExecutor, _validate_reference_timeline
 from pipeline.provider_errors import ProviderFailure
 from pipeline.state import apply_plan_validation, new_state
 
@@ -381,3 +381,31 @@ def test_stage_shotstack_render_backfills_debug_file_when_renderer_raises(monkey
         assert "kaboom" in debug_path.read_text(encoding="utf-8")
     finally:
         shutil.rmtree(Path(ctx.dirs["job"]).parent, ignore_errors=True)
+
+
+def test_reference_overlay_validation_allows_multiple_overlays_per_scene():
+    analysis = {
+        "scenes": [
+            {"scene_id": 1, "start_time": 0.0, "end_time": 2.0, "duration": 2.0},
+            {"scene_id": 2, "start_time": 2.0, "end_time": 4.0, "duration": 2.0},
+        ]
+    }
+    timeline = [
+        {"start": 0.0, "end": 2.0, "duration": 2.0},
+        {"start": 2.0, "end": 4.0, "duration": 2.0},
+    ]
+    overlay_timing = [
+        {"start": 0.1, "end": 0.6},
+        {"start": 0.8, "end": 1.4},
+        {"start": 2.1, "end": 2.7},
+    ]
+
+    errors = _validate_reference_timeline(
+        analysis=analysis,
+        timeline=timeline,
+        overlay_timing=overlay_timing,
+        use_reference_audio=False,
+        reference_audio_duration=None,
+    )
+
+    assert errors == []

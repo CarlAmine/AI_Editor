@@ -621,7 +621,11 @@ def build_render_spec(
         "text_placement_policy": render_settings.get("text_placement_policy", "default"),
         "text_readability_mode": render_settings.get("text_readability_mode", "balanced"),
         "output_mode": output_mode,
-        "refit_mode": "native_9x16" if output_mode == "native_9x16" else "crop_center",
+        "refit_mode": (
+            "native_9x16" if output_mode == "native_9x16"
+            else ("pad" if str(requirements.get("refit_mode", "crop_center")).lower().strip() == "pad"
+                  else "crop_center")
+        ),
         "overlay_full_clip": overlay_full_clip,
         "generation_mode": generation_mode,
         "disable_auto_transitions": generation_mode in {

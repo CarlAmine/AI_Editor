@@ -151,6 +151,13 @@ class SmokePipelineExecutor(PipelineExecutor):
         ctx.artifacts.register_url("render.shotstack_url", render_url, {"render_id": f"smoke-{ctx.job_id}"}, "video/mp4")
         ctx.runtime["render_result"] = {"success": True, "render_id": f"smoke-{ctx.job_id}", "url": render_url}
 
+    def _stage_ffmpeg_render(self, ctx: ExecutionContext) -> None:
+        master_path = os.path.join(ctx.dirs["outputs"], "master_16x9.mp4")
+        self._write_binary(master_path, b"smoke-render-output")
+        render_url = f"/files/{ctx.job_id}/outputs/master_16x9.mp4"
+        ctx.artifacts.register_file("render.master_16x9", master_path, {"provider": "smoke"}, "video/mp4")
+        ctx.artifacts.register_url("render.output_url", render_url, {"render_id": f"ffmpeg-{ctx.job_id}"}, "video/mp4")
+        ctx.runtime["render_result"] = {"success": True, "render_id": f"ffmpeg-{ctx.job_id}", "url": render_url}
     def _stage_postprocess(self, ctx: ExecutionContext) -> None:
         return None
 

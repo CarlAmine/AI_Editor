@@ -21,10 +21,10 @@ def test_smoke_job_runs_end_to_end_with_fake_providers():
         assert state is not None
         assert state.status.value == "succeeded"
         assert state.controller_status.value == "finished"
-        assert state.render_summary.get("url") == f"https://example.test/renders/{job_id}.mp4"
+        assert state.render_summary.get("url") == f"/files/{job_id}/outputs/master_16x9.mp4"
 
         artifacts = json.loads(Path(payload["artifacts_path"]).read_text(encoding="utf-8"))
         assert "decision.trace" in artifacts
-        assert "render.shotstack_url" in artifacts
+        assert "render.output_url" in artifacts
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)

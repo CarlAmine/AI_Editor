@@ -38,6 +38,12 @@ class StageName(str, Enum):
     POSTPROCESS = "POSTPROCESS"
     PUBLISH = "PUBLISH"
     CLEANUP = "CLEANUP"
+    BUILD_REFERENCE_TEMPLATE = "BUILD_REFERENCE_TEMPLATE"
+    ANALYZE_SOURCE_INVENTORY = "ANALYZE_SOURCE_INVENTORY"
+    BUILD_USER_PATCHED_PLAN = "BUILD_USER_PATCHED_PLAN"
+    EDIT_AGENT_COMPILE = "EDIT_AGENT_COMPILE"
+    VALIDATE_EDIT_GRAPH = "VALIDATE_EDIT_GRAPH"
+    COMPILE_RENDER_SPEC = "COMPILE_RENDER_SPEC"
 
 
 class StageStatus(str, Enum):
@@ -62,6 +68,7 @@ class ControllerStatus(str, Enum):
     PLANNING = "planning"
     VISION_TEMPLATE_TRAINING = "vision_template_training"
     VISION_TEMPLATE_TRANSFERRING = "vision_template_transferring"
+    EDIT_AGENT_COMPILING = "edit_agent_compiling"
     REVISING = "revising"
     VALIDATING = "validating"
     RENDERING = "rendering"

@@ -514,6 +514,122 @@ class ChatTurn(BaseModel):
 class ResumeJobRequest(BaseModel):
     message: str
 
+class ReferenceAnalyzeRequest(BaseModel):
+    reference_url: str
+    job_id: Optional[str] = None
+
+
+@app.post("/chat/analyze-reference")
+async def analyze_reference(request: ReferenceAnalyzeRequest):
+    try:
+        from ai_editor.downloader import download_video, _probe_media
+        from ai_editor.analyzer import analyze_video_content_with_results
+        from ai_editor.chat_intake.reference_summary import (
+            build_reference_summary,
+            build_reference_slots,
+            summarize_reference_for_chat,
+        )
+        from ai_editor.chat_intake.text_overlays import build_text_overlays_from_analysis
+        
+        job_id = request.job_id or f"chat_ref_{int(time.time() * 1000)}"
+        job_dir = TMP_JOBS_DIR / job_id
+        media_dir = job_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download
+        print(f"Downloading reference video from {request.reference_url} for job {job_id}...")
+        video_path = download_video(request.reference_url, str(media_dir), "reference.mp4")
+        if not video_path or not os.path.exists(video_path):
+            raise Exception("Failed to download reference video.")
+            
+        # Probe
+        print(f"Probing media: {video_path}...")
+        probe_meta = _probe_media(video_path)
+        
+        duration = 0.0
+        fps = 30.0
+        width = 1920
+        height = 1080
+        
+        fmt = probe_meta.get("format", {})
+        if "duration" in fmt:
+            try:
+                duration = float(fmt["duration"])
+            except ValueError:
+                pass
+                
+        video_stream = next((s for s in probe_meta.get("streams", []) if str(s.get("codec_type")).lower() == "video"), {})
+        if video_stream:
+            width = int(video_stream.get("width", width))
+            height = int(video_stream.get("height", height))
+            fr = video_stream.get("r_frame_rate", "30/1")
+            if "/" in fr:
+                try:
+                    num, den = fr.split("/")
+                    if float(den) > 0:
+                        fps = float(num) / float(den)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    fps = float(fr)
+                except ValueError:
+                    pass
+                    
+        probe_payload = {
+            "duration": duration,
+            "fps": fps,
+            "width": width,
+            "height": height
+        }
+        
+        # Analyze
+        print(f"Analyzing reference video style...")
+        summary_text, raw_analysis = analyze_video_content_with_results(video_path)
+        
+        # Build summary and slots
+        summary = build_reference_summary(raw_analysis, probe_payload)
+        slots = build_reference_slots(raw_analysis, summary["duration_seconds"])
+        text_overlays = build_text_overlays_from_analysis(raw_analysis, slots)
+        chat_message = summarize_reference_for_chat(summary, slots, text_overlays)
+        
+        # Save to job directory for persistence
+        with open(job_dir / "reference_analysis.json", "w", encoding="utf-8") as f:
+            json.dump(raw_analysis, f, ensure_ascii=False, indent=2)
+        with open(job_dir / "reference_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        with open(job_dir / "reference_slots.json", "w", encoding="utf-8") as f:
+            json.dump(slots, f, ensure_ascii=False, indent=2)
+        with open(job_dir / "text_overlays.json", "w", encoding="utf-8") as f:
+            json.dump(text_overlays, f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "summary": summary,
+            "slots": slots,
+            "text_overlays": text_overlays,
+            "analysis": {
+                "summary": summary,
+                "slots": slots,
+                "text_moments": text_overlays,
+                "duration_seconds": summary.get("duration_seconds"),
+                "aspect_ratio": summary.get("aspect_ratio"),
+                "style_summary": summary.get("style_summary"),
+            },
+            "chat_message": chat_message,
+        }
+        
+    except Exception as e:
+        print(f"ERROR in /chat/analyze-reference: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 @app.post("/chat")
 async def handle_chat(turn: ChatTurn):
     # This calls the logic we wrote previously

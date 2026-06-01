@@ -17,6 +17,8 @@ from ai_editor.analysis.analysis_schema import EffectType, MotionCurve, MotionEf
 
 log = logging.getLogger(__name__)
 
+MAX_TRANSITION_DURATION_SEC = 0.25
+
 
 class MotionEffectApplier:
     """
@@ -214,7 +216,7 @@ class MotionEffectApplier:
 
         del position
         transition_type = transition.transition_type
-        n_frames = max(1, transition.duration_frames)
+        n_frames = max(1, int(transition.duration_frames or 1))
 
         if transition_type in (
             TransitionType.HARD_CUT,
@@ -243,6 +245,20 @@ class MotionEffectApplier:
 
         if not frames:
             return clip_path
+
+        clip_duration_sec = len(frames) / max(fps, 1.0)
+        max_transition_frames = max(
+            1,
+            int(min(MAX_TRANSITION_DURATION_SEC * fps, len(frames) * 0.5)),
+        )
+        if n_frames > max_transition_frames:
+            log.warning(
+                "Clamping transition frames from %s to %s (clip %.2fs)",
+                n_frames,
+                max_transition_frames,
+                clip_duration_sec,
+            )
+            n_frames = max_transition_frames
 
         if transition_type in (TransitionType.FADE_TO_BLACK, TransitionType.FADE_TO_WHITE):
             target = 0 if transition_type == TransitionType.FADE_TO_BLACK else 255
