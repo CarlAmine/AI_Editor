@@ -48,6 +48,9 @@ class OCRSpan:
     confidence: Optional[float] = None
     position: Optional[str] = None
     bbox: Optional[List[List[float]]] = None
+    # span_end marks the last timestamp where this text was observed before it
+    # changed. Set by the change-detection post-processing step in OCRAnalyzer.
+    span_end: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
