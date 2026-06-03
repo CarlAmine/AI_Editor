@@ -182,7 +182,13 @@ class VideoEditAnalyzer:
         self._refresh_results()
 
     def detect_transitions(self):
-        self.analysis.transitions = self.scene_analyzer.detect_transitions(self.analysis.scenes)
+        try:
+            self.analysis.transitions = self.scene_analyzer.detect_transitions(
+                self.analysis.scenes,
+                self.video_path,
+            )
+        except TypeError:
+            self.analysis.transitions = self.scene_analyzer.detect_transitions(self.analysis.scenes)
         self._refresh_results()
 
     def extract_and_analyze_keyframes(self, num_frames: int = 12):

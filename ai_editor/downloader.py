@@ -109,6 +109,7 @@ def download_video_section(
             [
                 "yt-dlp",
                 "--no-playlist",
+                "--extractor-args", "youtube:player_client=ios,android,web",
                 "-f", "b[ext=mp4]/b",
                 "--download-sections", section,
                 "-o", output_path,
@@ -120,6 +121,7 @@ def download_video_section(
         [
             "yt-dlp",
             "--no-playlist",
+            "--extractor-args", "youtube:player_client=ios,android,web",
             "-f", "bv*+ba/b",
             "--merge-output-format", "mp4",
             "--download-sections", section,
@@ -220,9 +222,9 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None) ->
         cmd = [
             "yt-dlp",
             "--no-playlist",
-            "-f", "bv*+ba/b",  # Prefer best video+audio, fallback to best combined
-            "--merge-output-format",
-            "mp4",
+            "--extractor-args", "youtube:player_client=ios,android,web",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
             "-o", output_template,
             url,
         ]

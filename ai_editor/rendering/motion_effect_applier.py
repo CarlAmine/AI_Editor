@@ -120,7 +120,8 @@ class MotionEffectApplier:
             elif effect.effect_type == EffectType.PAN:
                 result = self._apply_pan(result, local_frac, effect, width, height)
             elif effect.effect_type in (EffectType.BLUR_SMEAR, EffectType.GLITCH):
-                result = self._apply_blur_smear(result, effect)
+                if effect.intensity <= 2.0:
+                    result = self._apply_blur_smear(result, effect)
 
         if not freeze_active:
             current_frozen = None
@@ -182,7 +183,8 @@ class MotionEffectApplier:
             return frame
         dx = float(np.mean(effect.curve.dx_norm)) if effect.curve.dx_norm else 0.0
         dy = float(np.mean(effect.curve.dy_norm)) if effect.curve.dy_norm else 0.0
-        size = max(int(effect.intensity * 15), 3) | 1
+        capped_intensity = min(effect.intensity, 1.0)
+        size = max(int(capped_intensity * 15), 3) | 1
         kernel = np.zeros((size, size), dtype=np.float32)
         if abs(dx) >= abs(dy):
             kernel[size // 2, :] = 1.0 / size

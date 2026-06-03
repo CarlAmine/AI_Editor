@@ -6,7 +6,6 @@ import { WorkspaceSidebar } from "../components/workspace/WorkspaceSidebar";
 import { WorkspaceHeader } from "../components/workspace/WorkspaceHeader";
 import { ConversationCanvas } from "../components/workspace/ConversationCanvas";
 import { ChatInputDock } from "../components/workspace/ChatInputDock";
-import { WorkspaceStatusPanel } from "../components/workspace/WorkspaceStatusPanel";
 import type { PipelineResult } from "../components/VideoPipelinePanel";
 import "./workspace.css";
 
@@ -62,7 +61,12 @@ export default function Workspace() {
 
         <div className="workspace-body">
           <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" }}>
-            <ConversationCanvas {...chat} chatState={chatState} />
+            <ConversationCanvas
+              {...chat}
+              chatState={chatState}
+              displayResult={displayResult}
+              apiBase={apiBase}
+            />
             <ChatInputDock
               value={chat.input}
               onChange={chat.setInput}
@@ -71,10 +75,6 @@ export default function Workspace() {
               disabled={chat.isLoading}
             />
           </div>
-
-          <aside className="workspace-rail">
-            <WorkspaceStatusPanel apiBase={apiBase} result={displayResult} isPolling={isPolling} />
-          </aside>
         </div>
       </div>
     </div>

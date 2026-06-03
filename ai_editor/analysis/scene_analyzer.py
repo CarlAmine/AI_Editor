@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+log = logging.getLogger(__name__)
 
 try:
     import cv2
@@ -39,7 +42,7 @@ class SceneAnalyzer:
         scenes = self.detect_scenes(video_path, threshold=threshold)
         pacing = self.analyze_pacing(scenes, metadata.duration_seconds)
         black_frames = self.detect_black_frames(video_path, metadata.fps)
-        transitions = self.detect_transitions(scenes)
+        transitions = self.detect_transitions(scenes, video_path)
         return SceneAnalysisOutput(
             scenes=scenes,
             pacing=pacing,
@@ -143,19 +146,130 @@ class SceneAnalyzer:
             cap.release()
         return black_frames
 
-    def detect_transitions(self, scenes: List[Scene]) -> List[Dict[str, Any]]:
+    def detect_transitions(self, scenes: List[Scene], video_path: str = "") -> List[Dict[str, Any]]:
         transitions: List[Dict[str, Any]] = []
-        for index in range(len(scenes) - 1):
-            gap = scenes[index + 1].start_time - scenes[index].end_time
+
+        def _gap_label(gap: float) -> str:
             if gap < 0.05:
-                t_type = "Hard Cut"
-            elif gap < 0.2:
-                t_type = "Quick Fade"
-            elif gap < 0.8:
-                t_type = "Standard Dissolve"
-            elif gap < 2.0:
-                t_type = "Long Fade"
-            else:
-                t_type = "Pause/Gap"
-            transitions.append({"type": t_type, "gap": gap})
+                return "Hard Cut"
+            if gap < 0.2:
+                return "Quick Fade"
+            if gap < 0.8:
+                return "Standard Dissolve"
+            if gap < 2.0:
+                return "Long Fade"
+            return "Pause/Gap"
+
+        def _histogram_for_frame(frame):
+            if frame is None:
+                return None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+            if hist is None:
+                return None
+            cv2.normalize(hist, hist)
+            return hist
+
+        def _compare_hist(hist_a, hist_b) -> Optional[float]:
+            if hist_a is None or hist_b is None:
+                return None
+            try:
+                return float(cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL))
+            except Exception:
+                return None
+
+        if cv2 is None or np is None or not scenes:
+            for index in range(len(scenes) - 1):
+                gap = scenes[index + 1].start_time - scenes[index].end_time
+                transitions.append({"type": _gap_label(gap), "gap": gap, "correlation": None})
+            return transitions
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            log.warning("Scene transition analysis fallback: unable to open video %s", video_path)
+            for index in range(len(scenes) - 1):
+                gap = scenes[index + 1].start_time - scenes[index].end_time
+                transitions.append({"type": _gap_label(gap), "gap": gap, "correlation": None})
+            return transitions
+
+        try:
+            for index in range(len(scenes) - 1):
+                current = scenes[index]
+                next_scene = scenes[index + 1]
+                gap = next_scene.start_time - current.end_time
+                correlation: Optional[float] = None
+                transition_type: str = "Fade" if gap > 1.0 else _gap_label(gap)
+
+                if gap <= 1.0:
+                    last_frame_index = int(round(current.end_frame))
+                    first_frame_index = int(round(next_scene.start_frame))
+
+                    def _clamp(index: int, minimum: int, maximum: int) -> int:
+                        return max(minimum, min(index, maximum))
+
+                    last_indices = [
+                        _clamp(last_frame_index - 2, current.start_frame, current.end_frame),
+                        _clamp(last_frame_index - 1, current.start_frame, current.end_frame),
+                        _clamp(last_frame_index, current.start_frame, current.end_frame),
+                    ]
+                    next_indices = [
+                        _clamp(first_frame_index, next_scene.start_frame, next_scene.end_frame),
+                        _clamp(first_frame_index + 1, next_scene.start_frame, next_scene.end_frame),
+                        _clamp(first_frame_index + 2, next_scene.start_frame, next_scene.end_frame),
+                    ]
+
+                    last_frames = []
+                    for frame_index in sorted(set(last_indices)):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            last_frames = []
+                            break
+                        last_frames.append(frame)
+
+                    next_frames = []
+                    for frame_index in sorted(set(next_indices)):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            next_frames = []
+                            break
+                        next_frames.append(frame)
+
+                    if last_frames and next_frames:
+                        last_hist = _histogram_for_frame(last_frames[-1])
+                        next_hist = _histogram_for_frame(next_frames[0])
+                        correlation = _compare_hist(last_hist, next_hist)
+                        if correlation is None:
+                            transition_type = _gap_label(gap)
+                        elif correlation < 0.6:
+                            transition_type = "Hard Cut"
+                        elif correlation > 0.85:
+                            transition_type = "Soft Cut"
+                        else:
+                            sequence: List[float] = []
+                            for prev_frame, next_frame in zip(last_frames, next_frames):
+                                prev_hist = _histogram_for_frame(prev_frame)
+                                next_hist = _histogram_for_frame(next_frame)
+                                corr_value = _compare_hist(prev_hist, next_hist)
+                                if corr_value is None:
+                                    sequence = []
+                                    break
+                                sequence.append(corr_value)
+                            if len(sequence) >= 2 and all(sequence[i] >= sequence[i - 1] for i in range(1, len(sequence))):
+                                transition_type = "Dissolve"
+                            else:
+                                transition_type = "Wipe or Match Cut"
+                    else:
+                        log.warning(
+                            "Scene transition frame sampling failed for scenes %d-%d: falling back to gap heuristic",
+                            current.scene_id,
+                            next_scene.scene_id,
+                        )
+                        transition_type = _gap_label(gap)
+                        correlation = None
+
+                transitions.append({"type": transition_type, "gap": gap, "correlation": correlation})
+        finally:
+            cap.release()
         return transitions

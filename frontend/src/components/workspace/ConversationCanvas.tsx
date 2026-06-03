@@ -6,13 +6,17 @@ import { StyleSummaryCard } from "./StyleSummaryCard";
 import { SlotReplacementForm } from "./SlotReplacementForm";
 import { TextReplacementForm } from "./TextReplacementForm";
 import { RenderStatusCard } from "./RenderStatusCard";
+import { ResultPreviewCard } from "../ResultPreviewCard";
 import type { useWorkspaceChat } from "../../hooks/useWorkspaceChat";
-import type { ReplacementSlot, SlotMappingEntry, TextReplacementEntry } from "../../types/pipeline";
+import type { SlotMappingEntry, TextReplacementEntry } from "../../types/pipeline";
+import type { PipelineResult } from "../VideoPipelinePanel";
 
 type ChatApi = ReturnType<typeof useWorkspaceChat>;
 
 type Props = ChatApi & {
   chatState: Record<string, unknown>;
+  displayResult?: PipelineResult | null;
+  apiBase?: string;
 };
 
 export function ConversationCanvas({
@@ -28,6 +32,8 @@ export function ConversationCanvas({
   finalReport,
   chatState,
   updateMessageCompletion,
+  displayResult,
+  apiBase = "",
 }: Props) {
   const summary = chatState.reference_analysis as
     | {
@@ -252,6 +258,13 @@ export function ConversationCanvas({
               <div className="workspace-card workspace-message-card" style={{ fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
                 {finalReport}
               </div>
+            </article>
+          )}
+
+          {displayResult?.success && (displayResult.preview_url || displayResult.url) && (
+            <article className="workspace-msg-assistant" style={{ maxWidth: "min(90%, 520px)" }}>
+              <div className="workspace-msg-meta">Rendered video</div>
+              <ResultPreviewCard result={displayResult} apiBase={apiBase} />
             </article>
           )}
         </div>

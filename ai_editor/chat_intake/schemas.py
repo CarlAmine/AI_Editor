@@ -51,6 +51,6 @@ DEFAULT_INTAKE_STATE = {
     "user_goal": "",
     "edit_requests": [],
     "user_requests": [],
-    "generation_mode": "reference_style_transfer",
+    "generation_mode": "neural_style_transfer",
     "edit_mode": "scene",
 }

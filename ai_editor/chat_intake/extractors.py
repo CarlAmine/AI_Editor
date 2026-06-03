@@ -1,30 +1,14 @@
 # ai_editor/chat_intake/extractors.py
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+from ai_editor.llm_client import chat_json
 
 URL_REGEX = re.compile(
     r'(https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*))'
 )
-
-# Keywords that signal the user wants neural style transfer mode.
-_NEURAL_STYLE_KEYWORDS = [
-    "neural style",
-    "style transfer",
-    "copy the style",
-    "copy style",
-    "apply the style",
-    "apply style",
-    "transfer style",
-    "transfer the style",
-    "replicate the style",
-    "replicate style",
-    "make it look like",
-    "make it feel like",
-    "same visual style",
-    "same look",
-    "same vibe",
-]
 
 def extract_urls(text: str) -> List[str]:
     return [url.strip(".,()[]{}<>\"'") for url in URL_REGEX.findall(text)]
@@ -55,7 +39,7 @@ def extract_time_range(text: str) -> Optional[Tuple[float, float]]:
             pass
         return None
 
-    m1 = re.search(r'(\d+(?::\d+){0,2})\s*[-\u2013\u2014to]+\s*(\d+(?::\d+){0,2})', text.lower())
+    m1 = re.search(r'(\d+(?::\d+){0,2})\s*[-–—to]+\s*(\d+(?::\d+){0,2})', text.lower())
     if m1:
         s = to_seconds(m1.group(1))
         e = to_seconds(m1.group(2))
@@ -66,8 +50,7 @@ def extract_time_range(text: str) -> Optional[Tuple[float, float]]:
 def extract_output_settings(text: str) -> Dict[str, Any]:
     text_low = text.lower()
     res = {}
-    
-    # Aspect Ratio and Intent Mode
+
     if any(k in text_low for k in ["vertical", "9:16", "shorts", "tiktok", "reels", "reel", "short"]):
         res["intent_mode"] = "shorts"
         res["aspect_ratio"] = "9:16"
@@ -79,7 +62,6 @@ def extract_output_settings(text: str) -> Dict[str, Any]:
         res["intent_mode"] = "video"
         res["aspect_ratio"] = "1:1"
 
-    # Refit Mode
     if any(k in text_low for k in ["pad", "no crop", "keep full frame", "black bars", "letterbox"]):
         res["refit_mode"] = "pad"
     elif any(k in text_low for k in ["crop", "reframe", "fill screen", "fill", "crop center", "crop_center"]):
@@ -109,32 +91,14 @@ def extract_audio_settings(text: str) -> Dict[str, Any]:
 
     return res
 
-def extract_generation_mode(text: str, current_state: Dict[str, Any]) -> Optional[str]:
-    """Detect if the user is requesting neural style transfer mode.
-
-    Returns "neural_style_transfer" if detected, None otherwise.
-    Preserves any mode already set in state so a single message doesn't
-    accidentally override a previously confirmed mode.
-    """
-    existing = current_state.get("generation_mode")
-    if existing == "neural_style_transfer":
-        return existing
-
-    text_low = text.lower()
-    if any(kw in text_low for kw in _NEURAL_STYLE_KEYWORDS):
-        return "neural_style_transfer"
-
-    return existing or None
-
 def extract_slot_mapping(text: str, available_slots: List[Dict]) -> List[Dict]:
     mapping = []
     text_low = text.lower()
-    
+
     urls = extract_urls(text)
     if not urls:
         return mapping
 
-    # Parse slot mentions
     slot_matches = re.finditer(r'slot\s*(\d+)', text_low)
     slots_found = [int(m.group(1)) for m in slot_matches]
 
@@ -196,7 +160,7 @@ def extract_text_overlay_preferences(
         return {"text_overlays": updated, "text_overlays_resolved": True}
 
     replace_match = re.search(
-        r"(?:slot\s*)?(\d+)\s*(?:text|caption)?\s*(?:with|=|:)\s*['\"]?([^'\"]+)['\"\s]?",
+        r"(?:slot\s*)?(\d+)\s*(?:text|caption)?\s*(?:with|=|:)\s*['\"]?([^'\"]+)['\"]?",
         text,
         flags=re.IGNORECASE,
     )
@@ -241,33 +205,204 @@ def extract_text_overlay_preferences(
     return {}
 
 
-def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
+def _llm_extract(
+    text: str,
+    current_state: Dict[str, Any],
+    classified_urls: List[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    phase = current_state.get("phase", "awaiting_reference")
+    existing_source_urls = {
+        src.get("url") if isinstance(src, dict) else src
+        for src in current_state.get("sources") or []
+    }
+    text_overlays = current_state.get("text_overlays") or []
+
+    context = {
+        "phase": phase,
+        "has_primary_url": bool(current_state.get("primary_url")),
+        "reference_slots": current_state.get("reference_slots") or [],
+        "sources_count": len(current_state.get("sources") or []),
+        "existing_slot_mapping_ids": [
+            item["slot_id"]
+            for item in (current_state.get("slot_mapping") or [])
+            if isinstance(item, dict)
+        ],
+        "music_mode": current_state.get("music_mode", ""),
+        "has_text_overlays": bool(text_overlays),
+        "text_overlays": text_overlays,
+    }
+
+    prompt = (
+        "You are parsing a user message in a video editing chatbot intake flow.\n\n"
+        f"Phase: {phase}\n"
+        f"Context: {json.dumps(context, ensure_ascii=False)}\n"
+        f"URLs detected in message: {json.dumps(classified_urls, ensure_ascii=False)}\n"
+        "Existing source URLs (already added, do not re-add): "
+        f"{json.dumps(list(existing_source_urls), ensure_ascii=False)}\n"
+        f"User message: {json.dumps(text, ensure_ascii=False)}\n\n"
+        "Extract ONLY what the user explicitly said. Return a JSON object. "
+        "Omit any field not clearly mentioned.\n\n"
+        "Fields you may return:\n"
+        '- "primary_url": string — reference video URL; only when phase="awaiting_reference" '
+        "and has_primary_url=false\n"
+        '- "sources": array of {"label": int, "url": string} — replacement clips '
+        "(not the reference video, not music, not a drive folder)\n"
+        '- "google_drive_link": string — Google Drive folder URL\n'
+        '- "music_mode": "original" | "custom"\n'
+        '- "custom_music_url": string — music URL\n'
+        '- "custom_music_segment": string — time range as "START-END" seconds, e.g. "30-90"\n'
+        '- "aspect_ratio": "16:9" | "9:16" | "1:1"\n'
+        '- "intent_mode": "video" | "shorts"\n'
+        '- "output_mode": "crop_to_9x16" | "native_9x16"\n'
+        '- "refit_mode": "crop_center" | "pad"\n'
+        '- "slot_mapping": array of {"slot_id": int, "clip_url": string} — explicit slot assignments only\n'
+        '- "text_overlays_action": "keep_all" | "remove_all" | "replace_one"\n'
+        '- "text_overlay_replace": {"slot_id": int, "text": string}\n\n'
+        "Signal rules:\n"
+        '- vertical / 9:16 / shorts / tiktok / reels → intent_mode="shorts", aspect_ratio="9:16"\n'
+        '- horizontal / 16:9 / youtube → intent_mode="video", aspect_ratio="16:9"\n'
+        '- pad / black bars / letterbox / keep full frame → refit_mode="pad"\n'
+        '- crop / fill screen → refit_mode="crop_center"\n'
+        '- "original audio" / "keep audio" / "reference audio" / "same audio" / "keep original" '
+        '→ music_mode="original"\n'
+        '- "custom music" / "new music" / "background music" / "bgm" / "my music" '
+        '→ music_mode="custom"\n'
+        '- "no text" / "remove text" / "no captions" → text_overlays_action="remove_all"\n'
+        '- "keep text" / "same text" / "keep captions" → text_overlays_action="keep_all"\n\n'
+        "Return {} if nothing applies."
+    )
+
+    result = chat_json(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a structured data extractor for a video editing intake chatbot. "
+                    "Output valid JSON only. Include only fields explicitly mentioned by the user."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+    )
+    return result if isinstance(result, dict) else None
+
+
+def _apply_llm_result(
+    result: Dict[str, Any],
+    current_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    extracted: Dict[str, Any] = {}
+    existing_source_urls = {
+        src.get("url") if isinstance(src, dict) else src
+        for src in current_state.get("sources") or []
+    }
+    primary_url = current_state.get("primary_url", "")
+
+    if result.get("primary_url") and not primary_url:
+        extracted["primary_url"] = result["primary_url"]
+
+    if result.get("sources"):
+        new_sources = [
+            s for s in result["sources"]
+            if isinstance(s, dict)
+            and s.get("url")
+            and s.get("url") not in existing_source_urls
+            and s.get("url") != primary_url
+        ]
+        if new_sources:
+            existing = list(current_state.get("sources") or [])
+            for i, src in enumerate(new_sources):
+                src["label"] = len(existing) + i + 1
+            extracted["sources"] = existing + new_sources
+
+    for field in ("google_drive_link", "custom_music_url"):
+        if result.get(field):
+            extracted[field] = result[field]
+
+    if result.get("music_mode") in {"original", "custom"}:
+        extracted["music_mode"] = result["music_mode"]
+
+    if result.get("custom_music_segment"):
+        extracted["custom_music_segment"] = str(result["custom_music_segment"])
+
+    for field in ("aspect_ratio", "output_mode"):
+        if result.get(field):
+            extracted[field] = result[field]
+
+    if result.get("intent_mode") in {"video", "shorts"}:
+        extracted["intent_mode"] = result["intent_mode"]
+
+    if result.get("refit_mode") in {"crop_center", "pad"}:
+        extracted["refit_mode"] = result["refit_mode"]
+
+    if result.get("slot_mapping"):
+        existing_mapping = {
+            item["slot_id"]: item
+            for item in (current_state.get("slot_mapping") or [])
+            if isinstance(item, dict) and "slot_id" in item
+        }
+        for item in result["slot_mapping"]:
+            if isinstance(item, dict) and "slot_id" in item:
+                existing_mapping[item["slot_id"]] = item
+        extracted["slot_mapping"] = list(existing_mapping.values())
+
+    text_overlays = current_state.get("text_overlays") or []
+    action = result.get("text_overlays_action")
+    if text_overlays and action:
+        updated = [dict(item) for item in text_overlays]
+        if action == "remove_all":
+            for overlay in updated:
+                overlay["action"] = "remove"
+                overlay["render_text"] = ""
+            extracted["text_overlays"] = updated
+            extracted["text_overlays_resolved"] = True
+        elif action == "keep_all":
+            for overlay in updated:
+                overlay["action"] = "render"
+                overlay["render_text"] = str(overlay.get("detected_text", "")).strip()
+            extracted["text_overlays"] = updated
+            extracted["text_overlays_resolved"] = True
+        elif action == "replace_one" and result.get("text_overlay_replace"):
+            replace_info = result["text_overlay_replace"]
+            slot_id = int(replace_info.get("slot_id", -1))
+            new_text = str(replace_info.get("text", "")).strip()
+            for overlay in updated:
+                if int(overlay.get("slot_id") or 0) == slot_id:
+                    overlay["action"] = "render"
+                    overlay["render_text"] = new_text
+            extracted["text_overlays"] = updated
+            extracted["text_overlays_resolved"] = True
+
+    return extracted
+
+
+def _regex_extract_fallback(
+    text: str,
+    current_state: Dict[str, Any],
+    urls: List[str],
+) -> Dict[str, Any]:
+    """Regex-based extraction used when no LLM provider is available."""
     extracted = {}
     phase = current_state.get("phase", "awaiting_reference")
-    urls = extract_urls(text)
 
-    # 0. Generation mode detection — must run before URL classification
-    #    so the phase logic below can branch on it.
-    generation_mode = extract_generation_mode(text, current_state)
-    if generation_mode:
-        extracted["generation_mode"] = generation_mode
-
-    # 1. URL classification based on phase
     if urls:
         if not current_state.get("primary_url") and phase == "awaiting_reference":
-            # The first video URL is the reference / donor video
             video_urls = [url for url in urls if classify_url(url) in ["youtube", "tiktok", "direct_video"]]
             if video_urls:
                 extracted["primary_url"] = video_urls[0]
-        elif phase == "awaiting_custom_music" or (phase == "awaiting_audio" and any(k in text.lower() for k in ["custom", "track", "music"])):
-            # If awaiting custom music, the first URL is the custom music URL
+        elif phase == "awaiting_custom_music" or (
+            phase == "awaiting_audio" and any(k in text.lower() for k in ["custom", "track", "music"])
+        ):
             music_urls = [url for url in urls if classify_url(url) in ["youtube", "direct_video", "unknown"]]
             if music_urls:
                 extracted["custom_music_url"] = music_urls[0]
                 extracted["music_mode"] = "custom"
         else:
-            # Treat them as replacement / content sources
-            existing_urls = {src.get("url") if isinstance(src, dict) else src for src in current_state.get("sources", [])}
+            existing_urls = {
+                src.get("url") if isinstance(src, dict) else src
+                for src in current_state.get("sources", [])
+            }
             new_sources = []
             for url in urls:
                 cls = classify_url(url)
@@ -282,19 +417,16 @@ def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
             if new_sources:
                 extracted["sources"] = current_state.get("sources", []) + new_sources
 
-    # 2. Output Settings Extraction
     output_settings = extract_output_settings(text)
     extracted.update(output_settings)
 
-    # 3. Audio Settings Extraction
     audio_settings = extract_audio_settings(text)
     for k, v in audio_settings.items():
         if k == "custom_music_url" and "custom_music_url" in extracted:
             continue
         extracted[k] = v
 
-    # 4. Slot Mapping Extraction (skipped for neural style transfer — no slots needed)
-    if current_state.get("reference_slots") and generation_mode != "neural_style_transfer":
+    if current_state.get("reference_slots"):
         slot_mapping = extract_slot_mapping(text, current_state["reference_slots"])
         if slot_mapping:
             existing_mapping = {item["slot_id"]: item for item in current_state.get("slot_mapping", [])}
@@ -302,9 +434,19 @@ def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
                 existing_mapping[new_item["slot_id"]] = new_item
             extracted["slot_mapping"] = list(existing_mapping.values())
 
-    # 5. Text overlay preferences
     if current_state.get("text_overlays"):
         text_prefs = extract_text_overlay_preferences(text, current_state["text_overlays"])
         extracted.update(text_prefs)
 
     return extracted
+
+
+def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
+    urls = extract_urls(text)
+    classified_urls = [{"url": url, "type": classify_url(url)} for url in urls]
+
+    llm_result = _llm_extract(text, current_state, classified_urls)
+    if llm_result is not None:
+        return _apply_llm_result(llm_result, current_state)
+
+    return _regex_extract_fallback(text, current_state, urls)
