@@ -894,22 +894,52 @@ class PipelineExecutor:
         from ai_editor.vision_template.neural_style_pipeline import run_neural_style_transfer
 
         donor_artifact = ctx.artifacts.get("primary.video")
-        content_artifact = (
-            ctx.artifacts.get("sources.aligned.1")
-            or ctx.artifacts.get("sources.raw.1")
-            or ctx.artifacts.get("sources.fetch.1")
-        )
         if donor_artifact is None:
             raise RuntimeError(
                 "neural_style_transfer requires a primary (donor) video artifact."
             )
-        if content_artifact is None:
+
+        # Collect all source artifacts in sorted index order.
+        # Priority per index: aligned > raw > fetch (same as every other stage).
+        raw_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.raw.")
+        fetch_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.fetch.")
+        aligned_keys = _sorted_indexed_artifact_keys(ctx.artifacts.items, "sources.aligned.")
+
+        max_index = max(len(raw_keys), len(fetch_keys), len(aligned_keys), 1)
+
+        content_paths = []
+        for i in range(1, max_index + 1):
+            art = (
+                ctx.artifacts.get(f"sources.aligned.{i}")
+                or ctx.artifacts.get(f"sources.raw.{i}")
+                or ctx.artifacts.get(f"sources.fetch.{i}")
+            )
+            if art is not None:
+                content_paths.append(art.path_or_url)
+
+        if not content_paths:
             raise RuntimeError(
                 "neural_style_transfer requires at least one source (content) video artifact."
             )
 
+        # Get scene durations from analysis — same source used by reference timeline.
+        analysis = ctx.state.analysis or {}
+        scenes = analysis.get("scenes") or []
+        scene_durations = [float(s.get("duration", 0.0)) for s in scenes]
+
+        # If analysis has no scenes, fall back to one zero-duration entry per clip
+        # so render_video_with_style uses max_frames=None (no trimming).
+        if not scene_durations:
+            scene_durations = [0.0] * len(content_paths)
+
+        # Align lengths: pad or trim scene_durations to match content_paths.
+        if len(scene_durations) != len(content_paths):
+            if len(scene_durations) > len(content_paths):
+                scene_durations = scene_durations[:len(content_paths)]
+            else:
+                scene_durations += [0.0] * (len(content_paths) - len(scene_durations))
+
         donor_path = donor_artifact.path_or_url
-        content_path = content_artifact.path_or_url
         out_dir = os.path.join(ctx.dirs["job"], "neural_style")
         epochs = int(ctx.requirements.get("style_epochs", 80))
         size = int(ctx.requirements.get("processing_size", 360))
@@ -923,7 +953,8 @@ class PipelineExecutor:
 
         result = run_neural_style_transfer(
             donor_video_path=donor_path,
-            content_video_path=content_path,
+            content_video_paths=content_paths,
+            scene_durations=scene_durations,
             out_dir=out_dir,
             epochs=epochs,
             processing_size=size,

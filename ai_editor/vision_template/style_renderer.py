@@ -268,6 +268,7 @@ def render_video_with_style(
     out_path: str,
     processing_size: int = 360,
     device: str = "cpu",
+    max_frames: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Apply learned style to every frame of the content video.
 
@@ -297,12 +298,16 @@ def render_video_with_style(
     writer = cv2.VideoWriter(out_path, fourcc, orig_fps, (orig_w, orig_h))
 
     prev_frame: Optional[np.ndarray] = None
+    read_count = 0
     frame_count = 0
 
     with torch.no_grad():
         while True:
             ok, bgr = cap.read()
             if not ok:
+                break
+            read_count += 1
+            if max_frames is not None and read_count > max_frames:
                 break
 
             # Resize to processing size for inference
