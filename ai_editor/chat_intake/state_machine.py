@@ -16,12 +16,20 @@ from ai_editor.chat_intake.schemas import (
 from ai_editor.chat_intake.extractors import extract_all
 from ai_editor.llm_client import get_active_model_name
 
+# Phase used when waiting for the content video in neural style transfer mode.
+PHASE_AWAITING_CONTENT_VIDEO = "awaiting_content_video"
+
+
 def auto_assign_slots(state: dict):
     slots = state.get("reference_slots") or []
     sources = state.get("sources") or []
     google_drive = state.get("google_drive_link") or ""
 
     if google_drive:
+        return
+
+    # Neural style transfer uses sources directly — no slot mapping needed.
+    if state.get("generation_mode") == "neural_style_transfer":
         return
 
     if not slots or not sources:
@@ -38,11 +46,36 @@ def auto_assign_slots(state: dict):
             })
     state["slot_mapping"] = mapping
 
+
 def build_reply_for_phase(state: dict) -> str:
     phase = state.get("phase", PHASE_AWAITING_REFERENCE)
+    generation_mode = state.get("generation_mode")
     ref_slots = state.get("reference_slots") or []
     sources = state.get("sources") or []
-    
+
+    # ── Neural style transfer phases ────────────────────────────────────────
+    if generation_mode == "neural_style_transfer":
+        if phase == PHASE_AWAITING_REFERENCE:
+            return (
+                "Neural style transfer mode activated. "
+                "Send the donor video URL — this is the video whose visual style will be learned."
+            )
+        if phase == PHASE_AWAITING_CONTENT_VIDEO:
+            return (
+                "Donor video received. Now send the content video URL — "
+                "this is the video that will be repainted in the donor's style."
+            )
+        if phase == PHASE_AWAITING_AUDIO:
+            return "Audio settings next. Keep the donor audio or provide a custom music URL?"
+        if phase == PHASE_AWAITING_OUTPUT:
+            return "Choose output aspect ratio and refit mode."
+        if phase == PHASE_AWAITING_FINAL_CONFIRMATION:
+            return (
+                "Ready. The style renderer will train on the donor video (~15-25 min on CPU) "
+                "then rerender the content video in that style. Confirm to start."
+            )
+
+    # ── Standard phases ──────────────────────────────────────────────────────
     if phase == PHASE_AWAITING_REFERENCE:
         return "Send the reference video URL to begin the analysis."
 
@@ -77,7 +110,6 @@ def build_reply_for_phase(state: dict) -> str:
         overlays = state.get("text_overlays") or []
         if overlays:
             from ai_editor.chat_intake.text_overlays import summarize_text_overlays_for_chat
-
             return summarize_text_overlays_for_chat(overlays)
         return (
             "Detected text moments are ready for review. Use the text replacement form below to remove, keep, or replace them."
@@ -87,6 +119,34 @@ def build_reply_for_phase(state: dict) -> str:
         return "The edit plan is ready. Review the cards below and confirm when everything looks correct."
 
     return "Continuing the guided intake."
+
+
+def _advance_phase_neural(state: dict) -> None:
+    """Drive phase transitions for the neural_style_transfer flow.
+
+    Simpler than the standard flow: donor URL → content URL → audio → output → confirm.
+    """
+    primary_url = state.get("primary_url")
+    sources = state.get("sources") or []
+    music_mode = state.get("music_mode")
+    custom_music_url = state.get("custom_music_url")
+    aspect_ratio = state.get("aspect_ratio")
+    refit_mode = state.get("refit_mode")
+
+    if not primary_url:
+        state["phase"] = PHASE_AWAITING_REFERENCE
+    elif not sources:
+        state["phase"] = PHASE_AWAITING_CONTENT_VIDEO
+    elif not music_mode:
+        state["phase"] = PHASE_AWAITING_AUDIO
+    elif music_mode == "custom" and not custom_music_url:
+        state["phase"] = PHASE_AWAITING_CUSTOM_MUSIC
+    elif not aspect_ratio or not refit_mode:
+        state["phase"] = PHASE_AWAITING_OUTPUT
+    else:
+        state["phase"] = PHASE_AWAITING_FINAL_CONFIRMATION
+        state["ready_to_submit"] = True
+
 
 def process_guided_turn(user_input: str, current_state: dict, analyzer_output: str = "") -> dict:
     state = dict(DEFAULT_INTAKE_STATE)
@@ -148,39 +208,43 @@ def process_guided_turn(user_input: str, current_state: dict, analyzer_output: s
         except Exception:
             pass
 
-    # Guided state machine transition checks
-    primary_url = state.get("primary_url")
-    ref_slots = state.get("reference_slots")
-    sources = state.get("sources") or []
-    google_drive = state.get("google_drive_link")
-    slot_mapping = state.get("slot_mapping") or []
-    music_mode = state.get("music_mode")
-    custom_music_url = state.get("custom_music_url")
-    aspect_ratio = state.get("aspect_ratio")
-    refit_mode = state.get("refit_mode")
-    text_overlays = state.get("text_overlays") or []
-    text_overlays_resolved = bool(state.get("text_overlays_resolved"))
-
-    if not primary_url:
-        state["phase"] = PHASE_AWAITING_REFERENCE
-    elif not ref_slots:
-        state["phase"] = PHASE_REFERENCE_URL_RECEIVED
-    elif not sources and not google_drive:
-        state["phase"] = PHASE_AWAITING_SOURCES
-    elif not google_drive and len(slot_mapping) < len(ref_slots):
-        state["phase"] = PHASE_AWAITING_SLOT_MAPPING
-    elif not music_mode:
-        state["phase"] = PHASE_AWAITING_AUDIO
-    elif music_mode == "custom" and not custom_music_url:
-        state["phase"] = PHASE_AWAITING_CUSTOM_MUSIC
-    elif not aspect_ratio or not refit_mode:
-        state["phase"] = PHASE_AWAITING_OUTPUT
-    elif text_overlays and not text_overlays_resolved:
-        state["phase"] = PHASE_AWAITING_TEXT_OVERLAYS
-        state["ready_to_submit"] = False
+    # Phase transition — neural style transfer has its own simpler flow.
+    if state.get("generation_mode") == "neural_style_transfer":
+        _advance_phase_neural(state)
     else:
-        state["phase"] = PHASE_AWAITING_FINAL_CONFIRMATION
-        state["ready_to_submit"] = True
+        # Standard guided state machine transition checks
+        primary_url = state.get("primary_url")
+        ref_slots = state.get("reference_slots")
+        sources = state.get("sources") or []
+        google_drive = state.get("google_drive_link")
+        slot_mapping = state.get("slot_mapping") or []
+        music_mode = state.get("music_mode")
+        custom_music_url = state.get("custom_music_url")
+        aspect_ratio = state.get("aspect_ratio")
+        refit_mode = state.get("refit_mode")
+        text_overlays = state.get("text_overlays") or []
+        text_overlays_resolved = bool(state.get("text_overlays_resolved"))
+
+        if not primary_url:
+            state["phase"] = PHASE_AWAITING_REFERENCE
+        elif not ref_slots:
+            state["phase"] = PHASE_REFERENCE_URL_RECEIVED
+        elif not sources and not google_drive:
+            state["phase"] = PHASE_AWAITING_SOURCES
+        elif not google_drive and len(slot_mapping) < len(ref_slots):
+            state["phase"] = PHASE_AWAITING_SLOT_MAPPING
+        elif not music_mode:
+            state["phase"] = PHASE_AWAITING_AUDIO
+        elif music_mode == "custom" and not custom_music_url:
+            state["phase"] = PHASE_AWAITING_CUSTOM_MUSIC
+        elif not aspect_ratio or not refit_mode:
+            state["phase"] = PHASE_AWAITING_OUTPUT
+        elif text_overlays and not text_overlays_resolved:
+            state["phase"] = PHASE_AWAITING_TEXT_OVERLAYS
+            state["ready_to_submit"] = False
+        else:
+            state["phase"] = PHASE_AWAITING_FINAL_CONFIRMATION
+            state["ready_to_submit"] = True
 
     next_message = build_reply_for_phase(state)
 

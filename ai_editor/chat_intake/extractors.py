@@ -7,6 +7,25 @@ URL_REGEX = re.compile(
     r'(https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*))'
 )
 
+# Keywords that signal the user wants neural style transfer mode.
+_NEURAL_STYLE_KEYWORDS = [
+    "neural style",
+    "style transfer",
+    "copy the style",
+    "copy style",
+    "apply the style",
+    "apply style",
+    "transfer style",
+    "transfer the style",
+    "replicate the style",
+    "replicate style",
+    "make it look like",
+    "make it feel like",
+    "same visual style",
+    "same look",
+    "same vibe",
+]
+
 def extract_urls(text: str) -> List[str]:
     return [url.strip(".,()[]{}<>\"'") for url in URL_REGEX.findall(text)]
 
@@ -36,7 +55,7 @@ def extract_time_range(text: str) -> Optional[Tuple[float, float]]:
             pass
         return None
 
-    m1 = re.search(r'(\d+(?::\d+){0,2})\s*[-–—to]+\s*(\d+(?::\d+){0,2})', text.lower())
+    m1 = re.search(r'(\d+(?::\d+){0,2})\s*[-\u2013\u2014to]+\s*(\d+(?::\d+){0,2})', text.lower())
     if m1:
         s = to_seconds(m1.group(1))
         e = to_seconds(m1.group(2))
@@ -89,6 +108,23 @@ def extract_audio_settings(text: str) -> Dict[str, Any]:
         res["custom_music_segment"] = f"{int(time_range[0])}-{int(time_range[1])}"
 
     return res
+
+def extract_generation_mode(text: str, current_state: Dict[str, Any]) -> Optional[str]:
+    """Detect if the user is requesting neural style transfer mode.
+
+    Returns "neural_style_transfer" if detected, None otherwise.
+    Preserves any mode already set in state so a single message doesn't
+    accidentally override a previously confirmed mode.
+    """
+    existing = current_state.get("generation_mode")
+    if existing == "neural_style_transfer":
+        return existing
+
+    text_low = text.lower()
+    if any(kw in text_low for kw in _NEURAL_STYLE_KEYWORDS):
+        return "neural_style_transfer"
+
+    return existing or None
 
 def extract_slot_mapping(text: str, available_slots: List[Dict]) -> List[Dict]:
     mapping = []
@@ -160,7 +196,7 @@ def extract_text_overlay_preferences(
         return {"text_overlays": updated, "text_overlays_resolved": True}
 
     replace_match = re.search(
-        r"(?:slot\s*)?(\d+)\s*(?:text|caption)?\s*(?:with|=|:)\s*['\"]?([^'\"]+)['\"]?",
+        r"(?:slot\s*)?(\d+)\s*(?:text|caption)?\s*(?:with|=|:)\s*['\"]?([^'\"]+)['\"\s]?",
         text,
         flags=re.IGNORECASE,
     )
@@ -210,10 +246,16 @@ def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
     phase = current_state.get("phase", "awaiting_reference")
     urls = extract_urls(text)
 
+    # 0. Generation mode detection — must run before URL classification
+    #    so the phase logic below can branch on it.
+    generation_mode = extract_generation_mode(text, current_state)
+    if generation_mode:
+        extracted["generation_mode"] = generation_mode
+
     # 1. URL classification based on phase
     if urls:
         if not current_state.get("primary_url") and phase == "awaiting_reference":
-            # The first video URL is the reference video
+            # The first video URL is the reference / donor video
             video_urls = [url for url in urls if classify_url(url) in ["youtube", "tiktok", "direct_video"]]
             if video_urls:
                 extracted["primary_url"] = video_urls[0]
@@ -224,7 +266,7 @@ def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
                 extracted["custom_music_url"] = music_urls[0]
                 extracted["music_mode"] = "custom"
         else:
-            # Treat them as replacement sources
+            # Treat them as replacement / content sources
             existing_urls = {src.get("url") if isinstance(src, dict) else src for src in current_state.get("sources", [])}
             new_sources = []
             for url in urls:
@@ -251,8 +293,8 @@ def extract_all(text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
             continue
         extracted[k] = v
 
-    # 4. Slot Mapping Extraction
-    if current_state.get("reference_slots"):
+    # 4. Slot Mapping Extraction (skipped for neural style transfer — no slots needed)
+    if current_state.get("reference_slots") and generation_mode != "neural_style_transfer":
         slot_mapping = extract_slot_mapping(text, current_state["reference_slots"])
         if slot_mapping:
             existing_mapping = {item["slot_id"]: item for item in current_state.get("slot_mapping", [])}
