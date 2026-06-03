@@ -51,17 +51,14 @@ def auto_assign_slots(state: dict):
 def _advance_phase_neural(state: dict) -> None:
     """Drive phase transitions for the neural style transfer intake flow.
 
-    Uses PHASE_AWAITING_CONTENT_VIDEO instead of the standard slot-mapping phases.
-    The number of content clips required equals the number of detected reference_slots
-    (or 1 if the donor has not been analysed yet).
+    Only two things are collected from the user:
+      1. Donor (reference) video URL
+      2. N content clip URLs (N = number of scenes detected in the donor)
+
+    Everything else (audio, output format, aspect ratio) is handled automatically.
     """
     primary_url = state.get("primary_url")
     sources = state.get("sources") or []
-    music_mode = state.get("music_mode")
-    custom_music_url = state.get("custom_music_url")
-    aspect_ratio = state.get("aspect_ratio")
-    refit_mode = state.get("refit_mode")
-
     slots = state.get("reference_slots") or []
     needed = len(slots) if slots else 1
 
@@ -69,12 +66,6 @@ def _advance_phase_neural(state: dict) -> None:
         state["phase"] = PHASE_AWAITING_REFERENCE
     elif len(sources) < needed:
         state["phase"] = PHASE_AWAITING_CONTENT_VIDEO
-    elif not music_mode:
-        state["phase"] = PHASE_AWAITING_AUDIO
-    elif music_mode == "custom" and not custom_music_url:
-        state["phase"] = PHASE_AWAITING_CUSTOM_MUSIC
-    elif not aspect_ratio or not refit_mode:
-        state["phase"] = PHASE_AWAITING_OUTPUT
     else:
         state["phase"] = PHASE_AWAITING_FINAL_CONFIRMATION
         state["ready_to_submit"] = True
@@ -89,33 +80,22 @@ def build_reply_for_phase(state: dict) -> str:
     # ── Neural style transfer phases ────────────────────────────────────────
     if generation_mode == "neural_style_transfer":
         if phase == PHASE_AWAITING_REFERENCE:
-            return (
-                "Neural style transfer mode activated. "
-                "Send the donor video URL — this is the video whose visual style will be learned."
-            )
+            return "Send the donor video URL — the neural network will learn its visual style."
         if phase == PHASE_AWAITING_CONTENT_VIDEO:
             slots = state.get("reference_slots") or []
             needed = len(slots) if slots else 1
             have = len(state.get("sources") or [])
             if needed == 1:
                 return (
-                    "Donor video received. Now send the content video URL — "
-                    "this is the video whose footage will be repainted in the donor's style."
+                    "Got it. Now send the content clip URL — "
+                    "the footage that will be repainted in the donor's style."
                 )
             return (
-                f"Donor video received. {needed} scene(s) were detected. "
-                f"Send {needed} content clip URLs, one per scene. "
-                f"You have sent {have} so far."
+                f"{needed} scene(s) detected. Send {needed} content clip URL(s), one per scene. "
+                f"{have} received so far."
             )
-        if phase == PHASE_AWAITING_AUDIO:
-            return "Audio settings next. Keep the donor audio or provide a custom music URL?"
-        if phase == PHASE_AWAITING_OUTPUT:
-            return "Choose output aspect ratio and refit mode."
         if phase == PHASE_AWAITING_FINAL_CONFIRMATION:
-            return (
-                "Ready. The style renderer will train on the donor video (~15-25 min on CPU) "
-                "then rerender the content video in that style. Confirm to start."
-            )
+            return "All set. Confirm to start training and rendering."
 
     # ── Standard phases ──────────────────────────────────────────────────────
     if phase == PHASE_AWAITING_REFERENCE:

@@ -4,7 +4,7 @@ from typing import Dict, Any
 
 def build_pipeline_payload(state: Dict[str, Any]) -> Dict[str, Any]:
     primary_url = state.get("primary_url", "")
-    generation_mode = state.get("generation_mode") or "reference_style_transfer"
+    generation_mode = state.get("generation_mode") or "neural_style_transfer"
 
     sources = []
     for idx, src in enumerate(state.get("sources", [])):
