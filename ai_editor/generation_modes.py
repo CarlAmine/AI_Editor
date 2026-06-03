@@ -89,3 +89,6 @@ def is_reference_style_transfer_mode(value: Optional[str]) -> bool:
 def is_vision_mode(value: Optional[str]) -> bool:
     normalized = normalize_generation_mode(value, default="")
     return normalized in {REFERENCE_STYLE_TRANSFER_MODE, VISION_TEMPLATE_LEARNING_MODE, REFERENCE_EDIT_AGENT_MODE}
+
+
+NEURAL_STYLE_TRANSFER_MODE = "neural_style_transfer"

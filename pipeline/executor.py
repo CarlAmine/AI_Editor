@@ -44,6 +44,7 @@ from ai_editor.generation_modes import (
     REFERENCE_STYLE_TRANSFER_MODE,
     VISION_TEMPLATE_LEARNING_MODE,
     REFERENCE_EDIT_AGENT_MODE,
+    NEURAL_STYLE_TRANSFER_MODE,
     normalize_generation_mode,
 )
 from ai_editor.reference_learning import build_reference_edit_template
@@ -312,6 +313,14 @@ class PipelineExecutor:
                 StageName.VISION_TEMPLATE_TRANSFER,
                 lambda: self._stage_vision_template_transfer(ctx),
                 done_check=lambda: bool((ctx.state.render_spec or {}).get("canonical_timeline")),
+            )
+            return
+        if generation_mode == NEURAL_STYLE_TRANSFER_MODE:
+            self._run_stage(
+                ctx,
+                StageName.VISION_TEMPLATE_TRAIN,
+                lambda: self._stage_neural_style_transfer(ctx),
+                done_check=lambda: ctx.artifacts.exists("neural_style.final"),
             )
             return
         if not ctx.state.analysis_available:
@@ -872,6 +881,86 @@ class PipelineExecutor:
             add_warning(ctx.state, code, warning)
         self._maybe_attach_semantic_edit(ctx, result.template_path)
         update_stage(ctx.state, StageName.VISION_TEMPLATE_DECODE, StageStatus.SUCCEEDED, {"slot_count": len(result.template.slots)})
+        self._save(ctx)
+
+    def _stage_neural_style_transfer(self, ctx: ExecutionContext) -> None:
+        """Run the full two-track neural style transfer pipeline.
+
+        Track 1: train a U-Net on the donor (primary) video, then rerender content.
+        Track 2: detect donor overlays and composite them onto the Track-1 output.
+        The fully assembled video is registered as render.output and the job render
+        summary is set so the pipeline can route to finish without re-rendering.
+        """
+        from ai_editor.vision_template.neural_style_pipeline import run_neural_style_transfer
+
+        donor_artifact = ctx.artifacts.get("primary.video")
+        content_artifact = (
+            ctx.artifacts.get("sources.aligned.1")
+            or ctx.artifacts.get("sources.raw.1")
+            or ctx.artifacts.get("sources.fetch.1")
+        )
+        if donor_artifact is None:
+            raise RuntimeError(
+                "neural_style_transfer requires a primary (donor) video artifact."
+            )
+        if content_artifact is None:
+            raise RuntimeError(
+                "neural_style_transfer requires at least one source (content) video artifact."
+            )
+
+        donor_path = donor_artifact.path_or_url
+        content_path = content_artifact.path_or_url
+        out_dir = os.path.join(ctx.dirs["job"], "neural_style")
+        epochs = int(ctx.requirements.get("style_epochs", 80))
+        size = int(ctx.requirements.get("processing_size", 360))
+        device = str(ctx.requirements.get("style_device", "cpu"))
+
+        set_controller_status(
+            ctx.state,
+            ControllerStatus.RENDERING,
+            detail="Running neural style transfer (train + render + overlay).",
+        )
+
+        result = run_neural_style_transfer(
+            donor_video_path=donor_path,
+            content_video_path=content_path,
+            out_dir=out_dir,
+            epochs=epochs,
+            processing_size=size,
+            device=device,
+        )
+
+        final_path = result["final_output_path"]
+
+        ctx.artifacts.register_file(
+            "neural_style.final", final_path, {"neural_style": True}, "video/mp4"
+        )
+        ctx.artifacts.register_file(
+            "render.output", final_path, {"neural_style": True}, "video/mp4"
+        )
+
+        # Expose as render result so the pipeline can route directly to finish
+        url = f"/files/{ctx.job_id}/neural_style/final_stylized.mp4"
+        render_id = f"neural-style-{ctx.job_id}"
+        summary = {
+            "mode": "final",
+            "status": "rendered",
+            "url": url,
+            "render_id": render_id,
+            "neural_style": True,
+            "training_loss": result["training"].get("final_loss"),
+            "overlay_count": result["overlays"].get("overlay_count", 0),
+        }
+        set_render_summary(
+            ctx.state,
+            summary,
+            final_response={
+                "status": "rendered",
+                "url": url,
+                "render_id": render_id,
+                "output_path": final_path,
+            },
+        )
         self._save(ctx)
 
     def _maybe_attach_semantic_edit(self, ctx: ExecutionContext, template_path: str) -> None:
