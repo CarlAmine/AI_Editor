@@ -2470,6 +2470,33 @@ def _upload_assets_for_shotstack(job_id: str, local_paths: List[str]) -> List[Di
 
 
 def _probe_duration(path: str) -> float:
+    if not path:
+        return 0.0
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            output = (proc.stdout or "").strip()
+            if output:
+                duration = float(output)
+                if duration > 0:
+                    return duration
+    except (ValueError, FileNotFoundError):
+        pass
+    except Exception:
+        # NOTE: If FFprobe is unavailable or returns invalid output, fall back to OpenCV.
+        pass
+
     try:
         import cv2
 
@@ -2740,19 +2767,41 @@ def _apply_confirmed_text_overlays_to_timeline(
         position = str(overlay.get("position", "center")).strip().lower() or "center"
         style = overlay.get("style") or {"box": False, "stroke": True, "shadow": False}
 
+        bbox = overlay.get("bbox")
+        extracted_style = overlay.get("extracted_style")
+        transition_in = overlay.get("transition_in")
+        transition_out = overlay.get("transition_out")
+        src_width = int(overlay.get("src_width") or 0)
+        src_height = int(overlay.get("src_height") or 0)
+
         for row in timeline:
             row_start = float(row.get("start", 0.0))
             row_end = float(row.get("end", row_start + float(row.get("duration", 0.0) or 0.0)))
             if overlay_end <= row_start or overlay_start >= row_end:
+                continue
+            existing_action = (row.get("metadata") or {}).get("text_action", "")
+            if existing_action == "render" and action != "render":
                 continue
             row["text"] = _sanitize_overlay_text(render_text)
             row["text_start"] = max(overlay_start, row_start)
             row["text_end"] = min(overlay_end, row_end)
             row["position"] = position
             row["text_style"] = style
+            # Carry spatial and style metadata for exact 1:1 replication in FFmpeg
+            if bbox:
+                row["text_bbox"] = bbox
+            if extracted_style:
+                row["text_extracted_style"] = extracted_style
+            if transition_in:
+                row["text_transition_in"] = transition_in
+            if transition_out:
+                row["text_transition_out"] = transition_out
             row.setdefault("metadata", {})
             row["metadata"]["text_action"] = "render"
-            break
+            if src_width:
+                row["metadata"]["src_width"] = src_width
+            if src_height:
+                row["metadata"]["src_height"] = src_height
 
 
 def _write_render_filter_plan(debug_dir: str, plan: Dict[str, Any]) -> None:

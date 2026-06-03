@@ -73,7 +73,7 @@ export function TextReplacementForm({ rows, onChange, onContinue, onClear }: Pro
               <tr key={row.id}>
                 <td>{index + 1}</td>
                 <td>
-                  {row.start.toFixed(2)}s - {row.end.toFixed(2)}s
+                  {row.start.toFixed(2)}s – {row.end.toFixed(2)}s
                 </td>
                 <td>{row.detectedText || "No text detected"}</td>
                 <td>

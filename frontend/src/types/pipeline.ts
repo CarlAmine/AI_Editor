@@ -23,6 +23,14 @@ export type SlotMappingEntry = {
 
 export type TextReplacementAction = "keep" | "remove" | "replace";
 
+export type TextExtractedStyle = {
+  textColor: string;
+  bgColor: string;
+  hasBackground: boolean;
+  fontSizeEst: number;
+  isBold: boolean;
+};
+
 export type TextReplacementEntry = {
   id: string;
   start: number;
@@ -31,6 +39,12 @@ export type TextReplacementEntry = {
   action: TextReplacementAction;
   text: string;
   slotId?: number | null;
+  /** Normalised 4-point bbox [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in [0,1] range */
+  bbox?: number[][] | null;
+  /** Where in the frame the text appeared: "Top" | "Middle" | "Bottom" */
+  detectedPosition?: string | null;
+  /** Visual style sampled from the source frame */
+  extractedStyle?: TextExtractedStyle | null;
 };
 
 export type ReplacementSlot = {

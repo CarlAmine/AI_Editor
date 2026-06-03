@@ -44,13 +44,19 @@ class OCRSpan:
     timestamp: float
     frame_number: int
     text: str
+    # Last timestamp where this text was observed before it changed
+    span_end: Optional[float] = None
     source: str = "easyocr"
     confidence: Optional[float] = None
     position: Optional[str] = None
+    # Normalized bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] where coords are 0-1 fractions of frame dims
     bbox: Optional[List[List[float]]] = None
-    # span_end marks the last timestamp where this text was observed before it
-    # changed. Set by the change-detection post-processing step in OCRAnalyzer.
-    span_end: Optional[float] = None
+    # Style extracted from the bbox region in the source frame
+    extracted_style: Optional[Dict[str, Any]] = None
+    # Transition type detected at text appearance ("fade_in" | "cut")
+    transition_in: Optional[str] = None
+    # Transition type detected at text disappearance ("fade_out" | "cut")
+    transition_out: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

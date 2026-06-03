@@ -11,9 +11,45 @@ from typing import Any, Dict, List, Optional
 log = logging.getLogger(__name__)
 
 
-def _resolve_font_file() -> str | None:
-    """Return the first usable font file path for FFmpeg drawtext."""
-    candidates = [
+def _resolve_font_file(style_hint: str = "regular") -> Optional[str]:
+    """Return the first usable font file matching the requested style hint.
+
+    style_hint: "impact" | "bold" | "regular"
+    Falls back to a less-specific variant when the exact file is not found.
+    """
+    if style_hint == "impact":
+        impact_candidates = [
+            os.getenv("FFMPEG_FONT_FILE_IMPACT"),
+            r"C:\Windows\Fonts\impact.ttf",
+            r"C:\Windows\Fonts\ariblk.ttf",   # Arial Black
+            "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+            "/usr/share/fonts/truetype/impact.ttf",
+            "/Library/Fonts/Impact.ttf",
+        ]
+        for candidate in impact_candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        style_hint = "bold"  # fall through
+
+    if style_hint == "bold":
+        bold_candidates = [
+            os.getenv("FFMPEG_FONT_FILE_BOLD"),
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\ariblk.ttf",   # Arial Black
+            r"C:\Windows\Fonts\calibrib.ttf",
+            r"C:\Windows\Fonts\segoeuib.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+        for candidate in bold_candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        # Fall through to regular
+
+    regular_candidates = [
         os.getenv("FFMPEG_FONT_FILE"),
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
@@ -23,7 +59,7 @@ def _resolve_font_file() -> str | None:
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
     ]
-    for candidate in candidates:
+    for candidate in regular_candidates:
         if candidate and Path(candidate).exists():
             return candidate
     return None
@@ -51,19 +87,59 @@ def _escape_drawtext_text(text: str) -> str:
 DEFAULT_TEXT_STYLE = {"box": False, "stroke": True, "shadow": False, "font_size": 42}
 
 
-def _drawtext_style_parts(style: Dict[str, Any]) -> str:
-    """Build optional drawtext style fragments (no black box by default)."""
+def _drawtext_style_parts(style: Dict[str, Any], box_color: Optional[str] = None) -> str:
+    """Build optional drawtext style fragments."""
     box = bool(style.get("box", False))
     stroke = bool(style.get("stroke", True))
     shadow = bool(style.get("shadow", False))
     parts: List[str] = []
     if box:
-        parts.extend(["box=1", "boxcolor=black@0.45", "boxborderw=12"])
+        fill = box_color or "black"
+        parts.extend([f"box=1", f"boxcolor={fill}@0.5", "boxborderw=10"])
     if stroke:
-        parts.extend(["borderw=2", "bordercolor=black@0.45"])
+        parts.extend(["borderw=2", "bordercolor=black@0.6"])
     if shadow:
         parts.extend(["shadowcolor=black@0.45", "shadowx=2", "shadowy=2"])
     return ":".join(parts)
+
+
+def _map_coord_to_output(
+    cx_norm: float,
+    cy_norm: float,
+    src_w: int,
+    src_h: int,
+    out_w: int,
+    out_h: int,
+    refit_mode: str,
+) -> tuple:
+    """Map a normalised [0-1] source coordinate to the output frame pixel position.
+
+    Handles both crop_center (scale-up then crop) and pad (scale-down then letterbox).
+    Returns (out_cx, out_cy) as floats clamped to the output frame.
+    """
+    if src_w <= 0 or src_h <= 0:
+        return cx_norm * out_w, cy_norm * out_h
+
+    if refit_mode == "pad":
+        scale = min(out_w / src_w, out_h / src_h)
+        scaled_w = src_w * scale
+        scaled_h = src_h * scale
+        offset_x = (out_w - scaled_w) / 2
+        offset_y = (out_h - scaled_h) / 2
+        out_cx = cx_norm * src_w * scale + offset_x
+        out_cy = cy_norm * src_h * scale + offset_y
+    else:  # crop_center (default)
+        scale = max(out_w / src_w, out_h / src_h)
+        scaled_w = src_w * scale
+        scaled_h = src_h * scale
+        crop_x = (scaled_w - out_w) / 2
+        crop_y = (scaled_h - out_h) / 2
+        out_cx = cx_norm * src_w * scale - crop_x
+        out_cy = cy_norm * src_h * scale - crop_y
+
+    out_cx = max(0.0, min(float(out_w), out_cx))
+    out_cy = max(0.0, min(float(out_h), out_cy))
+    return out_cx, out_cy
 
 
 def _concat_demuxer_path(path: Path) -> str:
@@ -326,7 +402,9 @@ class FFmpegRenderer:
 
         had_text_overlay = False
         if include_text:
-            had_text_overlay = self._append_drawtext_filter(v_filters, row, duration)
+            had_text_overlay = self._append_drawtext_filter(
+                v_filters, row, duration, width, height, refit_mode
+            )
 
         v_filters.append("format=yuv420p")
         return v_filters, had_text_overlay
@@ -336,8 +414,18 @@ class FFmpegRenderer:
         v_filters: List[str],
         row: Dict[str, Any],
         duration: float,
+        out_width: int = 0,
+        out_height: int = 0,
+        refit_mode: str = "crop_center",
     ) -> bool:
-        """Append a drawtext filter when text and a font file are available."""
+        """Append a drawtext filter replicating the original text position and style.
+
+        When text_bbox (normalised 4-point coords) is present the text is placed at
+        the exact same position it occupied in the source video, mapped through the
+        same scale/crop transform applied to the video.  Extracted colour, font size,
+        and background are used when available.  Fade-in / fade-out transitions are
+        rendered via an alpha expression.
+        """
         metadata = row.get("metadata") or {}
         if str(metadata.get("text_action", "")).lower() in {"remove", "skip"}:
             return False
@@ -346,47 +434,118 @@ class FFmpegRenderer:
         if not text_overlay:
             return False
 
-        font_file = _resolve_font_file()
-        if not font_file:
-            log.warning(
-                "No usable font file found for FFmpeg drawtext; skipping text overlay."
-            )
-            return False
-
         row_start = float(row.get("start", 0.0))
         text_start = float(row.get("text_start", row_start))
         text_end = float(row.get("text_end", row_start + duration))
-
         rel_start = max(0.0, text_start - row_start)
         rel_end = min(duration, text_end - row_start)
 
         escaped_text = _escape_drawtext_text(text_overlay)
-        fontfile = _escape_drawtext_path(font_file)
 
-        position = str(row.get("position", "")).strip().lower()
-        if "top" in position:
-            y_expr = "h/6"
-        elif "bottom" in position:
-            y_expr = "h*5/6"
-        else:
-            y_expr = "(h-text_h)/2"
-
+        # ── Extracted style (read first so font resolution can use the hint) ──
+        ext = row.get("text_extracted_style") or {}
         style = row.get("text_style") or metadata.get("text_style") or DEFAULT_TEXT_STYLE
         if not isinstance(style, dict):
             style = DEFAULT_TEXT_STYLE
-        font_size = int(style.get("font_size", 42) or 42)
-        style_parts = _drawtext_style_parts(style)
+
+        font_color = ext.get("text_color") or "white"
+        bg_color = ext.get("bg_color") or "black"
+        font_style_hint = str(ext.get("font_style_hint") or "regular").lower()
+
+        font_file = _resolve_font_file(style_hint=font_style_hint)
+        if not font_file:
+            log.warning("No usable font file found for FFmpeg drawtext; skipping text overlay.")
+            return False
+        fontfile = _escape_drawtext_path(font_file)
+
+        # ── Position ──────────────────────────────────────────────────────────
+        bbox_norm = row.get("text_bbox")
+        src_w = int(metadata.get("src_width") or 0)
+        src_h = int(metadata.get("src_height") or 0)
+
+        if bbox_norm and len(bbox_norm) >= 4 and out_width > 0 and out_height > 0:
+            x_norms = [pt[0] for pt in bbox_norm]
+            y_norms = [pt[1] for pt in bbox_norm]
+            cx_norm = (min(x_norms) + max(x_norms)) / 2
+            cy_norm = (min(y_norms) + max(y_norms)) / 2
+            out_cx, out_cy = _map_coord_to_output(
+                cx_norm, cy_norm, src_w, src_h, out_width, out_height, refit_mode
+            )
+            x_expr = f"({out_cx:.1f}-text_w/2)"
+            y_expr = f"({out_cy:.1f}-text_h/2)"
+        else:
+            position = str(row.get("position", "")).strip().lower()
+            if "top" in position:
+                x_expr = "(w-text_w)/2"
+                y_expr = "h/6"
+            elif "bottom" in position:
+                x_expr = "(w-text_w)/2"
+                y_expr = "h*5/6"
+            else:
+                x_expr = "(w-text_w)/2"
+                y_expr = "(h-text_h)/2"
+
+        # ── Font size: map bbox height through the same scale transform ───────
+        # This ensures the text occupies the same fraction of the output frame
+        # as it did in the source, regardless of resolution change or refit mode.
+        if bbox_norm and len(bbox_norm) >= 4 and src_w > 0 and src_h > 0 and out_width > 0 and out_height > 0:
+            y_norms = [pt[1] for pt in bbox_norm]
+            bbox_height_norm = max(y_norms) - min(y_norms)
+            if refit_mode == "pad":
+                scale = min(out_width / src_w, out_height / src_h)
+            else:  # crop_center
+                scale = max(out_width / src_w, out_height / src_h)
+            font_size = max(10, int(bbox_height_norm * src_h * scale * 0.85))
+        else:
+            font_size = int(ext.get("font_size_est") or style.get("font_size", 42) or 42)
+
+        # Merge extracted has_background into style so box is drawn when present
+        if ext.get("has_background") and not style.get("box"):
+            style = {**style, "box": True}
+
+        style_parts = _drawtext_style_parts(style, box_color=bg_color)
         style_suffix = f":{style_parts}" if style_parts else ""
 
+        # ── Transitions ───────────────────────────────────────────────────────
+        transition_in = str(row.get("text_transition_in") or "cut").strip().lower()
+        transition_out = str(row.get("text_transition_out") or "cut").strip().lower()
+        fade_dur = 0.25  # seconds for each fade ramp
+
+        do_fade_in = transition_in == "fade_in" and (rel_end - rel_start) > fade_dur * 2
+        do_fade_out = transition_out == "fade_out" and (rel_end - rel_start) > fade_dur * 2
+
+        if do_fade_in and do_fade_out:
+            alpha_expr = (
+                f"if(lt(t-{rel_start:.3f},{fade_dur}),"
+                f"(t-{rel_start:.3f})/{fade_dur},"
+                f"if(gt(t,{rel_end:.3f}-{fade_dur}),"
+                f"({rel_end:.3f}-t)/{fade_dur},1))"
+            )
+        elif do_fade_in:
+            alpha_expr = (
+                f"if(lt(t-{rel_start:.3f},{fade_dur}),"
+                f"(t-{rel_start:.3f})/{fade_dur},1)"
+            )
+        elif do_fade_out:
+            alpha_expr = (
+                f"if(gt(t,{rel_end:.3f}-{fade_dur}),"
+                f"({rel_end:.3f}-t)/{fade_dur},1)"
+            )
+        else:
+            alpha_expr = None
+
         enable_expr = f":enable='between(t,{rel_start:.3f},{rel_end:.3f})'"
+        alpha_part = f":alpha='{alpha_expr}'" if alpha_expr else ""
+
         drawtext = (
             f"drawtext=fontfile='{fontfile}':"
             f"text='{escaped_text}':"
-            "fontcolor=white:"
+            f"fontcolor={font_color}:"
             f"fontsize={font_size}:"
-            "x=(w-text_w)/2:"
+            f"x={x_expr}:"
             f"y={y_expr}"
             f"{style_suffix}"
+            f"{alpha_part}"
             f"{enable_expr}"
         )
         v_filters.append(drawtext)
