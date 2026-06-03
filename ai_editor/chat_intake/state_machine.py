@@ -55,7 +55,10 @@ def _advance_phase_neural(state: dict) -> None:
       1. Donor (reference) video URL
       2. N content clip URLs (N = number of scenes detected in the donor)
 
-    Everything else (audio, output format, aspect ratio) is handled automatically.
+    Phase PHASE_REFERENCE_URL_RECEIVED is used as an intermediate step when the
+    donor URL is received but analysis has not yet populated reference_slots.
+    This triggers the frontend's triggerReferenceAnalysis flow so the scene count
+    is known before asking for content clips.
     """
     primary_url = state.get("primary_url")
     sources = state.get("sources") or []
@@ -64,6 +67,9 @@ def _advance_phase_neural(state: dict) -> None:
 
     if not primary_url:
         state["phase"] = PHASE_AWAITING_REFERENCE
+    elif not slots:
+        # Donor URL received but donor not analysed yet — trigger frontend analysis
+        state["phase"] = PHASE_REFERENCE_URL_RECEIVED
     elif len(sources) < needed:
         state["phase"] = PHASE_AWAITING_CONTENT_VIDEO
     else:
@@ -81,6 +87,8 @@ def build_reply_for_phase(state: dict) -> str:
     if generation_mode == "neural_style_transfer":
         if phase == PHASE_AWAITING_REFERENCE:
             return "Send the donor video URL — the neural network will learn its visual style."
+        if phase == PHASE_REFERENCE_URL_RECEIVED:
+            return "Got it — analysing the donor video to count scenes now."
         if phase == PHASE_AWAITING_CONTENT_VIDEO:
             slots = state.get("reference_slots") or []
             needed = len(slots) if slots else 1

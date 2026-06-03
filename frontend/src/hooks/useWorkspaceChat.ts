@@ -253,7 +253,10 @@ export function useWorkspaceChat({
             slots: normalized.slots,
             text_moments: normalized.textMoments,
           },
-          phase: normalized.textMoments.length > 0 ? "awaiting_slot_mapping" : "awaiting_slot_mapping",
+          phase:
+            currentState.generation_mode === "neural_style_transfer"
+              ? "awaiting_content_video"
+              : "awaiting_slot_mapping",
         };
 
         updateState(nextState);

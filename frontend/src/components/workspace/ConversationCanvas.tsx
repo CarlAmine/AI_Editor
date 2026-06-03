@@ -69,6 +69,7 @@ export function ConversationCanvas({
   const sameTargetVideo = Boolean(chatState.use_same_target_video_for_all_slots);
   const sharedTargetVideoUrl = String(chatState.shared_target_video_url || "");
   const hasReference = Boolean(summary && slots.length > 0);
+  const isNeuralMode = chatState.generation_mode === "neural_style_transfer";
 
   const updateSlotRows = (nextRows: SlotMappingEntry[]) => {
     updateState({
@@ -189,7 +190,7 @@ export function ConversationCanvas({
             />
           )}
 
-          {hasReference && (
+          {hasReference && !isNeuralMode && (
             <SlotReplacementForm
               slots={slots.map((slot) => ({
                 slotId: Number(slot.slotId ?? slot.slot_id),
@@ -247,8 +248,9 @@ export function ConversationCanvas({
             <RenderStatusCard
               state={currentState}
               onConfirm={handleConfirmAndRender}
-              onEdit={handleEditPlan}
+              onEdit={isNeuralMode ? undefined : handleEditPlan}
               isSubmitting={isPipelineSubmitting}
+              generationMode={String(chatState.generation_mode || "")}
             />
           )}
 
