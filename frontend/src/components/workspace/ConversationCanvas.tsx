@@ -235,7 +235,7 @@ export function ConversationCanvas({
             />
           )}
 
-          {hasReference && textMoments.length > 0 && (
+          {hasReference && textMoments.length > 0 && !isNeuralMode && (
             <TextReplacementForm
               rows={textReplacements}
               onChange={updateTextRows}

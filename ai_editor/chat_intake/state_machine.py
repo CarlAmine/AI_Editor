@@ -63,7 +63,11 @@ def _advance_phase_neural(state: dict) -> None:
     primary_url = state.get("primary_url")
     sources = state.get("sources") or []
     slots = state.get("reference_slots") or []
-    needed = len(slots) if slots else 1
+
+    # Neural style transfer learns from the entire donor video and applies the
+    # learned style to a single content clip.  The donor's scene count is
+    # irrelevant here — always ask for exactly 1 content clip.
+    needed = 1
 
     if not primary_url:
         state["phase"] = PHASE_AWAITING_REFERENCE
@@ -90,17 +94,9 @@ def build_reply_for_phase(state: dict) -> str:
         if phase == PHASE_REFERENCE_URL_RECEIVED:
             return "Got it — analysing the donor video to count scenes now."
         if phase == PHASE_AWAITING_CONTENT_VIDEO:
-            slots = state.get("reference_slots") or []
-            needed = len(slots) if slots else 1
-            have = len(state.get("sources") or [])
-            if needed == 1:
-                return (
-                    "Got it. Now send the content clip URL — "
-                    "the footage that will be repainted in the donor's style."
-                )
             return (
-                f"{needed} scene(s) detected. Send {needed} content clip URL(s), one per scene. "
-                f"{have} received so far."
+                "Got it. Now send your content clip URL — "
+                "this is the footage that will be repainted in the donor's visual style."
             )
         if phase == PHASE_AWAITING_FINAL_CONFIRMATION:
             return "All set. Confirm to start training and rendering."
